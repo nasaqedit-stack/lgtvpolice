@@ -1,0 +1,42 @@
+name: Production pairing E2E
+
+# Manual end-to-end verification of the TV pairing flow against the live
+# production deployment (lgtvpolice.vercel.app + the production Supabase DB).
+# Runs on demand only; never triggered by pushes.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'probe = credential-free endpoint diagnosis; full = complete pairing flow A-H'
+        type: choice
+        options:
+          - probe
+          - full
+        default: full
+      origin:
+        description: 'Production app origin'
+        type: string
+        default: 'https://lgtvpolice.vercel.app'
+
+jobs:
+  pairing-e2e:
+    runs-on: ubuntu-latest
+    # Pulls environment-scoped secrets from the "Production" environment as well
+    # as repository secrets; all are handed to the script via SECRETS_JSON.
+    environment: Production
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        if: inputs.mode == 'full'
+        run: npm ci --no-audit --no-fund
+      - name: Run production pairing E2E
+        env:
+          E2E_MODE: ${{ inputs.mode }}
+          APP_ORIGIN: ${{ inputs.origin }}
+          SECRETS_JSON: ${{ toJSON(secrets) }}
+        run: node scripts/prod-pairing-e2e.mjs
