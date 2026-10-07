@@ -1,8 +1,19 @@
 name: Production pairing E2E
 
-# Manual end-to-end verification of the TV pairing flow against the live
-# production deployment (lgtvpolice.vercel.app + the production Supabase DB).
-# Runs on demand only; never triggered by pushes.
+# End-to-end verification of the TV pairing flow against the live production
+# deployment (lgtvpolice.vercel.app + the production Supabase database).
+#
+# Triggers:
+#  - workflow_dispatch (manual; choose probe or full)
+#  - push to main touching app code: waits until the Vercel production
+#    deployment of that commit succeeds, then runs the full flow. This makes
+#    every production deploy self-verify pairing.
+#
+# Modes:
+#  - probe : credential-free diagnosis of POST /api/player/pair
+#  - full  : complete pairing flow A-H (generate → submit → paired → reuse
+#            rejected → expired rejected), with production-DB checks when the
+#            service key is available as a secret.
 on:
   workflow_dispatch:
     inputs:
@@ -17,6 +28,20 @@ on:
         description: 'Production app origin'
         type: string
         default: 'https://lgtvpolice.vercel.app'
+  push:
+    branches: [main]
+    paths:
+      - 'app/**'
+      - 'lib/**'
+      - 'components/**'
+      - 'scripts/**'
+      - 'supabase/**'
+      - 'package*.json'
+      - '.github/workflows/prod-e2e.yml'
+
+concurrency:
+  group: production-pairing-e2e
+  cancel-in-progress: false
 
 jobs:
   pairing-e2e:
@@ -31,12 +56,24 @@ jobs:
         with:
           node-version: 22
           cache: npm
+      - name: Wait for Vercel production deployment of this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for i in $(seq 1 48); do
+            state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/status" --jq '.state' 2>/dev/null || echo pending)
+            echo "deployment status: ${state} (attempt ${i})"
+            if [ "$state" = "success" ]; then exit 0; fi
+            if [ "$state" = "failure" ] || [ "$state" = "error" ]; then exit 1; fi
+            sleep 15
+          done
+          echo "timed out waiting for the production deployment"; exit 1
       - name: Install dependencies
-        if: inputs.mode == 'full'
+        if: inputs.mode != 'probe'
         run: npm ci --no-audit --no-fund
       - name: Run production pairing E2E
         env:
-          E2E_MODE: ${{ inputs.mode }}
-          APP_ORIGIN: ${{ inputs.origin }}
+          E2E_MODE: ${{ inputs.mode || 'full' }}
+          APP_ORIGIN: ${{ inputs.origin || 'https://lgtvpolice.vercel.app' }}
           SECRETS_JSON: ${{ toJSON(secrets) }}
         run: node scripts/prod-pairing-e2e.mjs
