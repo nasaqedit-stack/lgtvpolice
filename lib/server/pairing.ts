@@ -1,5 +1,22 @@
 import { createHash, randomInt } from 'node:crypto';
 import type { SupabaseClient } from '@supabase/supabase-js';
+import { z } from 'zod';
+
+// Shared between the pairing and heartbeat endpoints. Unknown keys are stripped (not rejected)
+// so new client-side device metadata can never invalidate a pairing request; the request body
+// itself stays strict. This previously rejected the player's `language` field and made every
+// fresh pairing code fail with `invalid_pairing_code` before it ever reached the database.
+export const deviceInfoSchema = z.object({
+  userAgent: z.string().max(500).optional(),
+  platform: z.string().max(120).optional(),
+  screenWidth: z.number().int().min(0).max(20000).optional(),
+  screenHeight: z.number().int().min(0).max(20000).optional(),
+  language: z.string().max(30).optional(),
+});
+export const pairRequestSchema = z.object({
+  code: z.string().min(6).max(16),
+  deviceInfo: deviceInfoSchema.optional(),
+}).strict();
 
 const ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 export function normalizedPairingCode(value: string) {

@@ -140,17 +140,38 @@ async function discoverPublicConfig() {
     } catch (error) { diag.pages.push({ page, error: String(error) }); }
   }
   const publishableKeys = new Set();
-  for (const url of [...jsUrls].slice(0, 40)) {
+  const contexts = [];
+  const discovered = [...jsUrls];
+  const fetched = new Set();
+  while (discovered.length > 0 && fetched.size < 80) {
+    const url = discovered.shift();
+    if (fetched.has(url)) continue;
+    fetched.add(url);
     let js = '';
     try { js = await (await fetch(url)).text(); } catch { continue; }
-    if (diag.sampleChunks.length < 5) diag.sampleChunks.push(url.replace(APP, ''));
+    if (diag.sampleChunks.length < 8) diag.sampleChunks.push(url.replace(APP, ''));
+    // Second pass: lazy chunks referenced from within fetched chunks (Turbopack).
+    for (const match of js.matchAll(/\/_next\/static\/[A-Za-z0-9_./-]+\.js/g)) {
+      const next = `${APP}${match[0]}`;
+      if (!fetched.has(next)) discovered.push(next);
+    }
     for (const match of js.matchAll(/https:\/\/[a-z0-9]{16,}\.supabase\.co/g)) supabaseUrls.add(match[0]);
     for (const match of js.matchAll(/eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g)) keys.add(match[0]);
     // Newer Supabase projects issue non-JWT publishable keys for the browser.
     for (const match of js.matchAll(/sb_publishable_[A-Za-z0-9]{20,}/g)) publishableKeys.add(match[0]);
+    if (js.includes('.supabase') && contexts.length < 6) {
+      let at = 0;
+      while (at !== -1 && contexts.length < 6) {
+        at = js.indexOf('.supabase', at);
+        if (at === -1) break;
+        contexts.push(js.slice(Math.max(0, at - 160), at + 80).replace(/\s+/g, ' '));
+        at += 9;
+      }
+    }
     if (js.includes('.supabase')) diag.sawSupabase = true;
   }
-  diag.chunkCount = jsUrls.size;
+  diag.chunkCount = fetched.size;
+  diag.supabaseContexts = contexts;
   diag.publishableFound = publishableKeys.size > 0;
   return { supabaseUrl: [...supabaseUrls][0], anonKey: [...keys][0] || [...publishableKeys][0], diag };
 }
@@ -237,10 +258,11 @@ async function runFull() {
   emitAnnotation('notice', 'E2E config', [
     `wired secrets: ${wiredStatus}`,
     `public discovery: pages=${JSON.stringify(config.diag.pages)} chunks=${config.diag.chunkCount} sample=${JSON.stringify(config.diag.sampleChunks)} sawSupabase=${config.diag.sawSupabase} url=${config.supabaseUrl ? 'found' : 'none'} anonKey=${config.anonKey ? 'found' : 'none'}`,
+    `supabase contexts in bundle: ${JSON.stringify(config.diag.supabaseContexts || []).slice(0, 1500)}`,
     `resolved: url=${supabaseUrl ? 'yes' : 'no'} anon=${anonKey ? 'yes' : 'no'} serviceKey=${serviceKey ? 'yes' : 'no'} adminCreds=${adminEmailSecret && adminPasswordSecret ? 'yes' : 'no'}`,
   ].join('\n'));
-  if (!supabaseUrl || !anonKey) {
-    throw new Error('Cannot resolve Supabase URL/anon key (secrets or public bundle).');
+  if (!supabaseUrl || (!anonKey && !serviceKey)) {
+    throw new Error('Cannot resolve Supabase URL and apikey (secrets or public bundle).');
   }
   console.log(`supabase: ${supabaseUrl}`);
 
@@ -280,7 +302,8 @@ async function runFull() {
   // Real sign-in through Supabase Auth, stored in the exact @supabase/ssr cookie
   // format production reads (same code path as the login page).
   const jar = new Map();
-  const authClient = createServerClient(supabaseUrl, anonKey, {
+  const authApiKey = anonKey || serviceKey;
+  const authClient = createServerClient(supabaseUrl, authApiKey, {
     cookies: {
       getAll: () => [...jar].map(([name, value]) => ({ name, value })),
       setAll: (items) => items.forEach(({ name, value }) => jar.set(name, value)),
