@@ -359,7 +359,7 @@ language sql security definer set search_path = public as $$
     join requested r on r.media_id = pi.media_id
     group by pi.playlist_id, pi.media_id
   ), published_usage as (
-    select p.id as playlist_id, (item->>'mediaId')::uuid as media_id, count(*)::bigint as item_count
+    select p.id as playlist_id, (entries.value->>'mediaId')::uuid as media_id, count(*)::bigint as item_count
     from public.playlists p
     join public.playlist_versions pv on pv.playlist_id = p.id and pv.version = p.published_version
     cross join lateral jsonb_array_elements(coalesce(pv.manifest->'items', '[]'::jsonb)) as entries(value)
