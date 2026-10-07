@@ -1,7 +1,8 @@
 import { S3Client } from '@aws-sdk/client-s3';
+import { ConfigError } from '@/lib/server/config-error';
 function env(name: string): string {
   const value = process.env[name];
-  if (!value) throw new Error(`Missing server configuration: ${name}`);
+  if (!value) throw new ConfigError(name);
   return value;
 }
 

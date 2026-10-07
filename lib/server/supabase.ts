@@ -1,10 +1,11 @@
 import { createServerClient } from '@supabase/ssr';
 import { createClient } from '@supabase/supabase-js';
 import { cookies } from 'next/headers';
+import { ConfigError } from '@/lib/server/config-error';
 
 function required(name: string): string {
   const value = process.env[name];
-  if (!value) throw new Error(`Missing server configuration: ${name}`);
+  if (!value) throw new ConfigError(name);
   return value;
 }
 
