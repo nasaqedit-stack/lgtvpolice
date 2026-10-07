@@ -74,6 +74,24 @@ async function downloadRange(url: string, start: number, end: number): Promise<R
   }
 }
 
+// Same-origin fallback for TVs that cannot use the cross-origin signed storage URL (restricted
+// CORS, an old webOS network stack, an expired signature or a blocked host). The server re-checks
+// the screen credential and the published manifest on every range request, so the private bucket
+// stays private. Returns null when the fallback itself is unreachable.
+async function downloadFallback(token: string, mediaId: string, start: number, end: number): Promise<Response | null> {
+  try {
+    return await fetch(`/api/player/media/${mediaId}`, {
+      headers: { Range: `bytes=${start}-${end}`, Authorization: `Bearer ${token}` }, cache: 'no-store',
+    });
+  } catch { return null; }
+}
+
+// Statuses that mean "this URL cannot serve the range for this client" rather than a transient
+// failure: the caller retries through the same-origin fallback instead of giving up.
+function unusableUrl(status: number) {
+  return status === 400 || status === 401 || status === 403 || status === 404 || status === 405 || status === 501;
+}
+
 async function storeStream(response: Response, asset: ScreenManifest['assets'][number], startIndex: number, onBytes: (count: number) => void) {
   const reader = response.body?.getReader();
   if (!reader) {
@@ -165,24 +183,42 @@ async function downloadAsset(token: string, asset: ScreenManifest['assets'][numb
     try {
       response = await downloadRange(url, offset, end);
     } catch (error) {
-      failures += 1;
-      if (failures >= MAX_RETRIES) throw error;
-      await new Promise(resolve => setTimeout(resolve, 500 * (2 ** (failures - 1))));
-      continue;
+      // A network-level failure (unreachable storage host, CORS block, offline moment) gets one
+      // same-origin attempt before it counts as a retry.
+      const fallback = await downloadFallback(token, asset.mediaId, offset, end);
+      if (!fallback) {
+        failures += 1;
+        if (failures >= MAX_RETRIES) throw error;
+        await new Promise(resolve => setTimeout(resolve, 500 * (2 ** (failures - 1))));
+        continue;
+      }
+      response = fallback;
     }
     if ((response.status === 401 || response.status === 403) && !refreshedUrl) {
       url = await getFreshUrl(token, asset.mediaId);
       refreshedUrl = true;
-      response = await downloadRange(url, offset, end);
+      try { response = await downloadRange(url, offset, end); } catch { /* handled by the same-origin fallback below */ }
+    }
+    if (unusableUrl(response.status)) {
+      const fallback = await downloadFallback(token, asset.mediaId, offset, end);
+      if (!fallback) throw new PlayerSyncError('تعذر الوصول إلى الوسيط من الخادم أو من التخزين.', 'download_rejected');
+      response = fallback;
+    }
+    if (unusableUrl(response.status)) {
+      throw new PlayerSyncError(`رفض خادم الملفات طلب التنزيل (${response.status}).`, 'download_rejected');
     }
     if (response.status === 206) {
       const chunk = await response.blob();
       const expected = end - offset + 1;
-      if (chunk.size !== expected) throw new PlayerSyncError('حجم جزء التنزيل غير مطابق.', 'range_size_mismatch');
-      await saveChunk(asset.hash, index, chunk, asset.size, asset.mimeType, CHUNK_SIZE);
-      offset += chunk.size;
+      // Some S3-compatible gateways ignore the requested end bound and return the rest of the
+      // object. Keep only the requested window so the part bookkeeping stays exact: the final
+      // SHA-256 verification still covers the complete file before it is activated.
+      const part = chunk.size > expected ? chunk.slice(0, expected) : chunk;
+      if (part.size !== expected) throw new PlayerSyncError('حجم جزء التنزيل غير مطابق.', 'range_size_mismatch');
+      await saveChunk(asset.hash, index, part, asset.size, asset.mimeType, CHUNK_SIZE);
+      offset += part.size;
       index += 1;
-      onProgress(chunk.size);
+      onProgress(part.size);
       failures = 0;
       continue;
     }

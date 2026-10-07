@@ -19,7 +19,21 @@ export async function buildManifestBase(db: any, screen: any) {
     .eq('screen_id', screen.id).eq('enabled', true).order('priority', { ascending: false }).order('start_time', { ascending: true }).order('id', { ascending: true });
   if (scheduleError) throw scheduleError;
   const schedules = (scheduleRows ?? []) as any[];
-  const ids = [...new Set([screen.assigned_playlist_id, ...schedules.map(row => row.playlist_id)].filter(Boolean))];
+  const scheduledPlaylistIds = schedules.map(row => row.playlist_id).filter(Boolean) as string[];
+  const ids = [...new Set([screen.assigned_playlist_id, ...scheduledPlaylistIds].filter(Boolean))];
+  // A screen that has neither an explicit assignment nor an enabled schedule follows the most
+  // recently published playlist. Publishing is therefore enough for content to reach a paired TV
+  // (the target flow: upload -> add to playlist -> publish -> /player), while an explicit
+  // assignment or a schedule always wins over this fallback.
+  let fallbackPlaylistId: string | null = null;
+  if (!screen.assigned_playlist_id && scheduledPlaylistIds.length === 0) {
+    const { data: latestPublished, error: latestError } = await db.from('playlists')
+      .select('id').eq('enabled', true).not('published_version', 'is', null)
+      .order('updated_at', { ascending: false }).limit(1);
+    if (latestError) throw latestError;
+    fallbackPlaylistId = latestPublished?.[0]?.id ?? null;
+    if (fallbackPlaylistId) ids.push(fallbackPlaylistId);
+  }
   let playlistRows: any[] = [];
   let revisionRows: any[] = [];
   if (ids.length) {
@@ -60,7 +74,8 @@ export async function buildManifestBase(db: any, screen: any) {
       timezone: row.timezone || screen.timezone || 'Asia/Riyadh',
       enabled: Boolean(row.enabled),
     }));
-  const defaultPlaylistId = screen.assigned_playlist_id && readyIds.has(screen.assigned_playlist_id) ? screen.assigned_playlist_id : null;
+  const assignedPlaylistId = screen.assigned_playlist_id && readyIds.has(screen.assigned_playlist_id) ? screen.assigned_playlist_id : null;
+  const defaultPlaylistId = assignedPlaylistId ?? (fallbackPlaylistId && readyIds.has(fallbackPlaylistId) ? fallbackPlaylistId : null);
   const byMedia = new Map<string, { mediaId: string; hash: string; size: number; mimeType: string; name: string }>();
   for (const playlist of playlists) {
     for (const item of playlist.items) {

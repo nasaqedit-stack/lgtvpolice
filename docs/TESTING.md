@@ -6,16 +6,30 @@ Environment: Node.js 22.22.3, npm, fake IndexedDB. No Supabase project, object-s
 
 - `npm run lint` — passed.
 - `npm run typecheck` — passed.
-- `npm test` — 7 tests passed.
+- `npm test` — 19 tests passed.
   - Persistent IndexedDB credential/media metadata and Blob reconstruction.
   - Atomic manifest activation rejects incomplete assets and old manifest remains active.
   - Mocked player sync downloads an image/video pair once; an image-only manifest update requests only the new image; old video remains locally cached.
   - Mocked total network loss rejects sync without changing the active manifest; locally stored content remains readable.
   - Mocked corrupted download fails SHA-256 and does not replace the previous manifest.
   - Local time schedule selection and cross-midnight/week-day rollover.
+  - Manifest routing: a screen with no assignment and no schedule follows the most recently published playlist; an explicit assignment wins over a newer one; an unpublished draft is never routed; an enabled schedule keeps its own playlist.
+  - A 206 response whose body is longer than the requested window is trimmed to the window; a TV that cannot use the signed storage URL completes the download through the same-origin `/api/player/media/<mediaId>` stream.
 - `npm audit` — 0 vulnerabilities reported at test time.
 - `npm run build` — passed; `/player` is generated as a static route and API routes are server-rendered.
 - Local HTTP smoke check — `/player`, `/sw.js`, and `/login` returned HTTP 200. This did not exercise a configured login or storage API.
+
+## Production harness (needs credentials)
+
+`node scripts/presign-inspect.mjs` prints the presigned query parameters the server would send for a GetObject/UploadPart (no network, offline presigning only) so a change in AWS SDK defaults is visible in review.
+
+`scripts/prod-media-e2e.mjs --self-test` validates the generated PNG fixture offline (no network). The
+full production run (`node scripts/prod-media-e2e.mjs` with app+admin credentials, or the
+`Production pairing E2E` workflow with `mode=media`) executes A–I: admin upload through the real API,
+object presence in the private `signage-media` bucket, playlist creation and publish, pairing, manifest
+delivery, signed URL issuance, and a 4 MiB Range download verified against SHA-256. Without
+`ADMIN_EMAIL`/`ADMIN_PASSWORD` or `SUPABASE_SERVICE_ROLE_KEY` it reports SKIP with the missing
+capability instead of failing.
 
 ## Not executed; required before production acceptance
 
