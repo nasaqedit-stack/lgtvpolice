@@ -25,16 +25,21 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'probe = credential-free endpoint diagnosis; full = complete pairing flow A-H'
+        description: 'probe = credential-free diagnosis; full = pairing A-H + media pipeline A-I; media = media pipeline only'
         type: choice
         options:
           - probe
           - full
+          - media
         default: full
       origin:
         description: 'Production app origin'
         type: string
         default: 'https://lgtvpolice.vercel.app'
+      keep_test_media:
+        description: 'Keep the media/screen/playlist the media stage creates so it can be confirmed on the TV'
+        type: boolean
+        default: false
   push:
     branches: [main]
     paths:
@@ -86,6 +91,7 @@ jobs:
           env_secrets=$(gh api "repos/${GITHUB_REPOSITORY}/environments/Production/secrets" --jq '[.[].name] | join(", ")' 2>&1 | head -c 2000)
           echo "::notice title=Available secrets::repository: ${repo_secrets} | environment Production: ${env_secrets}"
       - name: Run production pairing E2E
+        if: inputs.mode != 'media'
         env:
           E2E_MODE: ${{ inputs.mode || 'full' }}
           APP_ORIGIN: ${{ inputs.origin || 'https://lgtvpolice.vercel.app' }}
@@ -102,3 +108,28 @@ jobs:
           TEST_ADMIN_EMAIL: ${{ secrets.TEST_ADMIN_EMAIL }}
           TEST_ADMIN_PASSWORD: ${{ secrets.TEST_ADMIN_PASSWORD }}
         run: node scripts/prod-pairing-e2e.mjs
+
+      # Media delivery: upload -> storage -> media row -> playlist -> publish -> manifest ->
+      # signed URL -> byte download. Needs the same admin credentials as the pairing stage; without
+      # them it reports SKIP with the exact missing capability instead of failing the job.
+      - name: Verify the media test fixture
+        if: inputs.mode != 'probe'
+        run: node scripts/prod-media-e2e.mjs --self-test
+      - name: Run production media E2E
+        if: inputs.mode != 'probe'
+        env:
+          APP_ORIGIN: ${{ inputs.origin || 'https://lgtvpolice.vercel.app' }}
+          E2E_KEEP: ${{ inputs.keep_test_media && '1' || '' }}
+          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          ADMIN_EMAIL: ${{ secrets.ADMIN_EMAIL }}
+          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+          E2E_ADMIN_EMAIL: ${{ secrets.E2E_ADMIN_EMAIL }}
+          E2E_ADMIN_PASSWORD: ${{ secrets.E2E_ADMIN_PASSWORD }}
+          TEST_ADMIN_EMAIL: ${{ secrets.TEST_ADMIN_EMAIL }}
+          TEST_ADMIN_PASSWORD: ${{ secrets.TEST_ADMIN_PASSWORD }}
+        run: node scripts/prod-media-e2e.mjs

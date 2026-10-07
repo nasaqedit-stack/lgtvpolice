@@ -99,6 +99,73 @@ describe('player synchronization and offline retention', () => {
     expect(await (await getAssetBlob(digest(imageB)))?.text()).toBe('offline-image-version-b');
   });
 
+  it('keeps the requested window when a gateway returns a longer 206 body', async () => {
+    // Larger than the 4 MiB range chunk, so at least one request is a partial window.
+    const bigImage = new Uint8Array(4 * 1024 * 1024 + 4096).map((_, index) => index % 251);
+    // Revision 9 so the synthetic manifest hash stays distinct from the manifests of the other
+    // cases in this file (the shared fake IndexedDB keeps the previously activated manifest).
+    const manifest = buildManifest(bigImage, 9);
+    const files = new Map([[imageId, bigImage], [videoId, video]]);
+    const requested: string[] = [];
+    installServer(manifest, files, requested);
+    // Simulate an S3-compatible gateway that ignores the requested end bound and returns the rest
+    // of the object with every 206 response. The player must store exactly the requested window and
+    // still verify SHA-256 over the whole file.
+    const inner = vi.mocked(globalThis.fetch).getMockImplementation()!;
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.startsWith('https://objects.test/')) {
+        const bytes = files.get(url.split('/').pop()!)!;
+        const match = /^bytes=(\d+)-(\d+)$/.exec(new Headers(init?.headers).get('Range') ?? 'bytes=0-');
+        const start = Number(match?.[1] ?? 0);
+        return new Response(bytes.slice(start), { status: 206, headers: { 'Content-Range': `bytes ${start}-${bytes.length - 1}/${bytes.length}` } });
+      }
+      return inner(input, init);
+    }));
+    const result = await synchronizePlayer('screen-token', () => undefined);
+    expect(result.manifest.manifestHash).toBe(manifest.manifestHash);
+    expect((await getAssetBlob(digest(bigImage)))?.size).toBe(bigImage.length);
+  });
+
+  it('falls back to the same-origin stream when the signed storage URL is unusable', async () => {
+    // Unique bytes for both assets so this case always downloads (and never reuses the local
+    // cache entries created by the earlier cases).
+    const freshImage = new TextEncoder().encode('same-origin-fallback-image');
+    const freshVideo = new TextEncoder().encode('same-origin-fallback-video');
+    const base = buildManifest(freshImage, 21);
+    const freshVideoHash = digest(freshVideo);
+    const manifest: ScreenManifest = {
+      ...base,
+      playlists: [{ ...base.playlists[0], items: [base.playlists[0].items[0], { ...base.playlists[0].items[1], hash: freshVideoHash, size: freshVideo.length }] }],
+      assets: [base.assets[0], { ...base.assets[1], hash: freshVideoHash, size: freshVideo.length }],
+    };
+    const files = new Map([[imageId, freshImage], [videoId, freshVideo]]);
+    const requested: string[] = [];
+    installServer(manifest, files, requested);
+    const proxied: string[] = [];
+    const inner = vi.mocked(globalThis.fetch).getMockImplementation()!;
+    // The direct object-storage URL behaves like a TV that cannot use it: the browser throws
+    // (CORS/blocked host) and an expired signature answers 403. Both must reach the app stream.
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.startsWith('https://objects.test/')) throw new TypeError('Failed to fetch');
+      if (url.startsWith('/api/player/media/')) {
+        const id = url.split('/').pop()!;
+        proxied.push(id);
+        const bytes = files.get(id)!;
+        const match = /^bytes=(\d+)-(\d+)$/.exec(new Headers(init?.headers).get('Range') ?? 'bytes=0-');
+        const start = Number(match?.[1] ?? 0);
+        const end = Math.min(Number(match?.[2] ?? bytes.length - 1), bytes.length - 1);
+        return new Response(bytes.slice(start, end + 1), { status: 206, headers: { 'Content-Range': `bytes ${start}-${end}/${bytes.length}` } });
+      }
+      return inner(input, init);
+    }));
+    const result = await synchronizePlayer('screen-token', () => undefined);
+    expect(result.manifest.manifestHash).toBe(manifest.manifestHash);
+    expect([...new Set(proxied)].sort()).toEqual([imageId, videoId].sort());
+    expect(await (await getAssetBlob(digest(freshImage)))?.text()).toBe('same-origin-fallback-image');
+  });
+
   it('does not activate a corrupted download and retains the previous working manifest', async () => {
     const first = buildManifest(imageA, 1);
     const ids: string[] = [];

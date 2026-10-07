@@ -1,0 +1,60 @@
+name: Production media probe
+
+# Media-only complement to "Production pairing E2E": exercises the media delivery path
+# (upload -> storage -> playlist -> publish -> manifest -> signed URL -> Range download) and always
+# runs the credential-free storage reachability/CORS probes. It does not wait for a Vercel
+# deployment, so it can be run at any time to check the live deployment.
+on:
+  workflow_dispatch:
+    inputs:
+      origin:
+        description: 'Production app origin'
+        type: string
+        default: 'https://lgtvpolice.vercel.app'
+      keep_test_media:
+        description: 'Keep the media/screen/playlist the run creates so it can be confirmed on the TV'
+        type: boolean
+        default: false
+  push:
+    branches: ['arena/**']
+    paths:
+      - 'scripts/prod-media-e2e.mjs'
+      - '.github/workflows/media-probe.yml'
+
+concurrency:
+  group: production-media-probe
+  cancel-in-progress: false
+
+jobs:
+  media-e2e:
+    runs-on: ubuntu-latest
+    # Pulls environment-scoped secrets from the "Production" environment as well as repository
+    # secrets, matching the pairing E2E workflow.
+    environment: Production
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - name: Verify the media test fixture
+        run: node scripts/prod-media-e2e.mjs --self-test
+      - name: Run production media E2E
+        env:
+          APP_ORIGIN: ${{ inputs.origin || 'https://lgtvpolice.vercel.app' }}
+          E2E_KEEP: ${{ inputs.keep_test_media && '1' || '' }}
+          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          ADMIN_EMAIL: ${{ secrets.ADMIN_EMAIL }}
+          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+          E2E_ADMIN_EMAIL: ${{ secrets.E2E_ADMIN_EMAIL }}
+          E2E_ADMIN_PASSWORD: ${{ secrets.E2E_ADMIN_PASSWORD }}
+          TEST_ADMIN_EMAIL: ${{ secrets.TEST_ADMIN_EMAIL }}
+          TEST_ADMIN_PASSWORD: ${{ secrets.TEST_ADMIN_PASSWORD }}
+        run: node scripts/prod-media-e2e.mjs
