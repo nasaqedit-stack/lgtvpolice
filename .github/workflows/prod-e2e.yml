@@ -78,6 +78,13 @@ jobs:
       - name: Install dependencies
         if: inputs.mode != 'probe'
         run: npm ci --no-audit --no-fund
+      - name: List available secret names (best-effort)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          repo_secrets=$(gh secret list --json name --jq '[.[].name] | join(", ")' 2>&1 | head -c 2000)
+          env_secrets=$(gh api "repos/${GITHUB_REPOSITORY}/environments/Production/secrets" --jq '[.[].name] | join(", ")' 2>&1 | head -c 2000)
+          echo "::notice title=Available secrets::repository: ${repo_secrets} | environment Production: ${env_secrets}"
       - name: Run production pairing E2E
         env:
           E2E_MODE: ${{ inputs.mode || 'full' }}
