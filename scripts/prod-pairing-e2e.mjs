@@ -19,6 +19,7 @@
  *  - SUPABASE_SERVICE_ROLE_KEY / SUPABASE_SERVICE_KEY   (optional, enables DB checks)
  *  - ADMIN_EMAIL + ADMIN_PASSWORD                       (optional if service key set)
  */
+import { appendFileSync } from 'node:fs';
 import { createHash, randomBytes } from 'node:crypto';
 
 const MODE = process.env.E2E_MODE || 'full';
@@ -49,11 +50,29 @@ function skip(name, detail) {
   results.push({ name, pass: null, detail });
   console.log(`SKIP | ${name} — ${detail}`);
 }
+/** Workflow-command annotation: readable via the checks API and the run page,
+ *  even when the raw log blob storage is unreachable. */
+function emitAnnotation(kind, title, text) {
+  const escaped = text.replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A');
+  console.log(`::${kind} title=${title}::${escaped}`);
+}
 function summary() {
   const failed = results.filter((r) => r.pass === false);
-  console.log('\n===== E2E SUMMARY =====');
-  for (const r of results) console.log(`${r.pass === null ? 'SKIP' : r.pass ? 'PASS' : 'FAIL'} | ${r.name}${r.detail ? ` — ${r.detail}` : ''}`);
-  console.log(failed.length === 0 ? 'RESULT: ALL CHECKS PASSED' : `RESULT: ${failed.length} CHECK(S) FAILED`);
+  const block = [
+    '===== E2E SUMMARY =====',
+    ...results.map((r) => `${r.pass === null ? 'SKIP' : r.pass ? 'PASS' : 'FAIL'} | ${r.name}${r.detail ? ` — ${r.detail}` : ''}`),
+    failed.length === 0 ? 'RESULT: ALL CHECKS PASSED' : `RESULT: ${failed.length} CHECK(S) FAILED`,
+  ].join('\n');
+  console.log(block);
+  emitAnnotation(failed.length === 0 ? 'notice' : 'error', 'Production pairing E2E results', block);
+  if (process.env.GITHUB_STEP_SUMMARY) {
+    try {
+      const table = ['### Production pairing E2E', '', '| result | check | detail |', '| --- | --- | --- |',
+        ...results.map((r) => `| ${r.pass === null ? 'SKIP' : r.pass ? 'PASS' : 'FAIL'} | ${r.name} | ${String(r.detail).replace(/\|/g, '\\|')} |`),
+        '', failed.length === 0 ? '**RESULT: ALL CHECKS PASSED**' : `**RESULT: ${failed.length} CHECK(S) FAILED**`, ''];
+      appendFileSync(process.env.GITHUB_STEP_SUMMARY, table.join('\n'));
+    } catch { /* summary is best-effort */ }
+  }
   return failed.length === 0;
 }
 
@@ -100,22 +119,22 @@ async function pairWithRetry(code) {
 /* ------------------------------------------------------------------ probe */
 
 async function discoverPublicConfig() {
-  const urls = new Set();
+  const jsUrls = new Set();
+  const supabaseUrls = new Set();
   const keys = new Set();
   const pages = [`${APP}/login`, `${APP}/player`];
   for (const page of pages) {
     let html = '';
     try { html = await (await fetch(page)).text(); } catch { continue; }
-    for (const match of html.matchAll(/\/_next\/static\/[^"'\\ ]+\.js/g)) urls.add(`${APP}${match[0]}`);
+    for (const match of html.matchAll(/\/_next\/static\/[^"'\\ ]+\.js/g)) jsUrls.add(`${APP}${match[0]}`);
   }
-  for (const url of [...urls].slice(0, 40)) {
+  for (const url of [...jsUrls].slice(0, 40)) {
     let js = '';
     try { js = await (await fetch(url)).text(); } catch { continue; }
-    for (const match of js.matchAll(/https:\/\/[a-z0-9]{16,}\.supabase\.co/g)) urls.add(match[0]);
+    for (const match of js.matchAll(/https:\/\/[a-z0-9]{16,}\.supabase\.co/g)) supabaseUrls.add(match[0]);
     for (const match of js.matchAll(/eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g)) keys.add(match[0]);
   }
-  const supabaseUrl = [...urls].find((u) => u.includes('.supabase.co')) || undefined;
-  return { supabaseUrl, anonKey: [...keys][0] };
+  return { supabaseUrl: [...supabaseUrls][0], anonKey: [...keys][0] };
 }
 
 async function runProbe() {
@@ -165,12 +184,15 @@ async function runFull() {
   const supabaseUrl = secret('^NEXT_PUBLIC_SUPABASE_URL$', '^SUPABASE_URL$') || process.env.NEXT_PUBLIC_SUPABASE_URL || config.supabaseUrl;
   const anonKey = secret('^NEXT_PUBLIC_SUPABASE_ANON_KEY$', '^SUPABASE_ANON_KEY$') || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || config.anonKey;
   const serviceKey = secret('^SUPABASE_SERVICE_ROLE_KEY$', '^SUPABASE_SERVICE_KEY$') || process.env.SUPABASE_SERVICE_ROLE_KEY;
+  const adminEmailSecret = secret('^ADMIN_EMAIL$', '^E2E_ADMIN_EMAIL$', '^TEST_ADMIN_EMAIL$');
+  const adminPasswordSecret = secret('^ADMIN_PASSWORD$', '^E2E_ADMIN_PASSWORD$', '^TEST_ADMIN_PASSWORD$');
+  console.log(`config: supabase-url=${supabaseUrl ? 'resolved' : 'MISSING'} (secret/env=${Boolean(supabaseUrl && supabaseUrl !== config.supabaseUrl)}, bundle=${Boolean(config.supabaseUrl)})`);
+  console.log(`config: anon-key=${anonKey ? 'resolved' : 'MISSING'} (secret/env=${Boolean(anonKey && anonKey !== config.anonKey)}, bundle=${Boolean(config.anonKey)})`);
+  console.log(`config: service-key=${serviceKey ? 'yes' : 'no'} admin-creds=${adminEmailSecret && adminPasswordSecret ? 'yes' : 'no'}`);
   if (!supabaseUrl || !anonKey) {
     throw new Error('Cannot resolve Supabase URL/anon key (secrets or public bundle).');
   }
   console.log(`supabase: ${supabaseUrl}`);
-  const adminCreds = Boolean(secret('^ADMIN_EMAIL$', '^E2E_ADMIN_EMAIL$', '^TEST_ADMIN_EMAIL$') && secret('^ADMIN_PASSWORD$', '^E2E_ADMIN_PASSWORD$', '^TEST_ADMIN_PASSWORD$'));
-  console.log(`credentials: service-key=${serviceKey ? 'yes' : 'no'} admin-creds=${adminCreds ? 'yes' : 'no'}`);
 
   const supaHeaders = (key) => ({ apikey: key, Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' });
 
