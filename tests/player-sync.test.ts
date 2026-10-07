@@ -1,0 +1,114 @@
+import 'fake-indexeddb/auto';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { sha256 } from '@noble/hashes/sha2.js';
+import { bytesToHex } from '@noble/hashes/utils.js';
+import type { ScreenManifest } from '../lib/shared';
+import { getActiveManifest, getAssetBlob } from '../lib/player/storage';
+import { synchronizePlayer } from '../lib/player/sync';
+
+const screenId = '00000000-0000-4000-8000-000000000001';
+const playlistId = '00000000-0000-4000-8000-000000000002';
+const imageId = '00000000-0000-4000-8000-000000000003';
+const videoId = '00000000-0000-4000-8000-000000000004';
+const imageItemId = '00000000-0000-4000-8000-000000000005';
+const videoItemId = '00000000-0000-4000-8000-000000000006';
+const imageMime = 'image/png';
+const videoMime = 'video/mp4';
+const imageA = new TextEncoder().encode('offline-image-version-a');
+const imageB = new TextEncoder().encode('offline-image-version-b');
+const video = new TextEncoder().encode('local-video-bytes-no-streaming');
+const digest = (value: Uint8Array) => bytesToHex(sha256(value));
+
+function buildManifest(imageBytes: Uint8Array, version: number): ScreenManifest {
+  const imageHash = digest(imageBytes);
+  const videoHash = digest(video);
+  return {
+    schemaVersion: 1,
+    screen: { id: screenId, name: 'Test screen', timezone: 'Asia/Riyadh' },
+    manifestVersion: version, manifestHash: String(version).padStart(64, '0'), generatedAt: '2026-10-07T00:00:00.000Z',
+    defaultPlaylistId: playlistId,
+    playlists: [{ id: playlistId, name: 'Test', version, enabled: true, items: [
+      { id: imageItemId, mediaId: imageId, name: 'notice.png', hash: imageHash, size: imageBytes.length, mimeType: imageMime, kind: 'image', durationMs: 10000, loop: false, position: 0 },
+      { id: videoItemId, mediaId: videoId, name: 'welcome.mp4', hash: videoHash, size: video.length, mimeType: videoMime, kind: 'video', durationMs: null, loop: false, position: 1 },
+    ] }],
+    schedules: [],
+    assets: [
+      { mediaId: imageId, hash: imageHash, size: imageBytes.length, mimeType: imageMime, name: 'notice.png' },
+      { mediaId: videoId, hash: videoHash, size: video.length, mimeType: videoMime, name: 'welcome.mp4' },
+    ],
+    commands: { syncVersion: 0, reloadVersion: 0 },
+  };
+}
+
+function installServer(manifest: ScreenManifest, files: Map<string, Uint8Array>, downloadIds: string[], corruptFor = new Set<string>()) {
+  vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url === '/api/player/manifest') {
+      const headers = new Headers(init?.headers);
+      if (headers.get('If-None-Match') === `"${manifest.manifestHash}"`) return new Response(null, { status: 304 });
+      return Response.json(manifest);
+    }
+    if (url === '/api/player/media-urls') {
+      const request = JSON.parse(String(init?.body ?? '{}')) as { mediaIds: string[] };
+      downloadIds.push(...request.mediaIds);
+      const urls = Object.fromEntries(request.mediaIds.map(id => [id, `https://objects.test/${id}`]));
+      return Response.json({ urls });
+    }
+    if (url.startsWith('https://objects.test/')) {
+      const id = url.split('/').pop()!;
+      const bytes = files.get(id);
+      if (!bytes) return new Response(null, { status: 404 });
+      const range = new Headers(init?.headers).get('Range') ?? 'bytes=0-';
+      const match = /^bytes=(\d+)-(\d+)$/.exec(range);
+      const start = Number(match?.[1] ?? 0);
+      const end = Math.min(Number(match?.[2] ?? bytes.length - 1), bytes.length - 1);
+      let chunk = bytes.slice(start, end + 1);
+      if (corruptFor.has(id) && chunk.length) {
+        chunk = chunk.slice();
+        chunk[0] ^= 0xff;
+      }
+      return new Response(chunk, { status: 206, headers: { 'Content-Range': `bytes ${start}-${end}/${bytes.length}` } });
+    }
+    throw new Error(`Unexpected request ${url}`);
+  }));
+}
+
+afterEach(() => vi.unstubAllGlobals());
+
+describe('player synchronization and offline retention', () => {
+  it('downloads once, skips unchanged video on an image-only update, and keeps active media when offline', async () => {
+    const first = buildManifest(imageA, 1);
+    const requested: string[] = [];
+    const files = new Map([[imageId, imageA], [videoId, video]]);
+    installServer(first, files, requested);
+    const initial = await synchronizePlayer('screen-token', () => undefined);
+    expect(initial.manifest.manifestHash).toBe(first.manifestHash);
+    expect(requested.sort()).toEqual([imageId, videoId].sort());
+    expect(await (await getAssetBlob(digest(video)))?.text()).toBe('local-video-bytes-no-streaming');
+
+    const second = buildManifest(imageB, 2);
+    installServer(second, new Map([[imageId, imageB], [videoId, video]]), requested);
+    await synchronizePlayer('screen-token', () => undefined);
+    expect(requested.slice(2)).toEqual([imageId]);
+    expect((await getActiveManifest())?.manifestHash).toBe(second.manifestHash);
+    expect(await (await getAssetBlob(digest(video)))?.text()).toBe('local-video-bytes-no-streaming');
+
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new TypeError('network disconnected'); }));
+    await expect(synchronizePlayer('screen-token', () => undefined)).rejects.toMatchObject({ code: 'network_offline' });
+    expect((await getActiveManifest())?.manifestHash).toBe(second.manifestHash);
+    expect(await (await getAssetBlob(digest(imageB)))?.text()).toBe('offline-image-version-b');
+  });
+
+  it('does not activate a corrupted download and retains the previous working manifest', async () => {
+    const first = buildManifest(imageA, 1);
+    const ids: string[] = [];
+    installServer(first, new Map([[imageId, imageA], [videoId, video]]), ids);
+    await synchronizePlayer('screen-token', () => undefined);
+
+    const third = buildManifest(imageB, 3);
+    installServer(third, new Map([[imageId, imageB], [videoId, video]]), [], new Set([imageId]));
+    await expect(synchronizePlayer('screen-token', () => undefined)).rejects.toMatchObject({ code: 'hash_mismatch' });
+    expect((await getActiveManifest())?.manifestHash).toBe(first.manifestHash);
+    expect(await (await getAssetBlob(digest(imageA)))?.text()).toBe('offline-image-version-a');
+  });
+});

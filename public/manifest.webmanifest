@@ -1,0 +1,13 @@
+{
+  "id": "/player",
+  "name": "شاشات — مشغل العرض المحلي",
+  "short_name": "شاشات",
+  "description": "مشغل عرض رقمي يعمل من الوسائط المحفوظة محلياً.",
+  "start_url": "/player",
+  "scope": "/",
+  "display": "fullscreen",
+  "orientation": "any",
+  "background_color": "#050a12",
+  "theme_color": "#101e33",
+  "icons": [{ "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }]
+}
