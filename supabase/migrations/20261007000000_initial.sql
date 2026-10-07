@@ -419,6 +419,7 @@ end;
 $$;
 
 -- Least privilege for exposed Postgres roles. These RPCs are called only by the server service role.
+revoke all on function public.handle_new_user() from public, anon, authenticated;
 revoke all on function public.consume_pairing_code(text, text, jsonb, timestamptz) from public, anon, authenticated;
 revoke all on function public.consume_pairing_rate_limit(text, timestamptz) from public, anon, authenticated;
 revoke all on function public.save_sync_manifest(uuid, text, jsonb) from public, anon, authenticated;
