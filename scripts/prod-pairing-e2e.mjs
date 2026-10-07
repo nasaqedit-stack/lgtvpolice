@@ -76,6 +76,10 @@ function summary() {
   return failed.length === 0;
 }
 
+function finishAndReport() {
+  if (!summary()) process.exitCode = 1;
+}
+
 async function postJson(url, body, headers = {}) {
   const response = await fetch(url, {
     method: 'POST',
@@ -135,16 +139,20 @@ async function discoverPublicConfig() {
       if (html.includes('.supabase')) diag.sawSupabase = true;
     } catch (error) { diag.pages.push({ page, error: String(error) }); }
   }
+  const publishableKeys = new Set();
   for (const url of [...jsUrls].slice(0, 40)) {
     let js = '';
     try { js = await (await fetch(url)).text(); } catch { continue; }
     if (diag.sampleChunks.length < 5) diag.sampleChunks.push(url.replace(APP, ''));
     for (const match of js.matchAll(/https:\/\/[a-z0-9]{16,}\.supabase\.co/g)) supabaseUrls.add(match[0]);
     for (const match of js.matchAll(/eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g)) keys.add(match[0]);
+    // Newer Supabase projects issue non-JWT publishable keys for the browser.
+    for (const match of js.matchAll(/sb_publishable_[A-Za-z0-9]{20,}/g)) publishableKeys.add(match[0]);
     if (js.includes('.supabase')) diag.sawSupabase = true;
   }
   diag.chunkCount = jsUrls.size;
-  return { supabaseUrl: [...supabaseUrls][0], anonKey: [...keys][0], diag };
+  diag.publishableFound = publishableKeys.size > 0;
+  return { supabaseUrl: [...supabaseUrls][0], anonKey: [...keys][0] || [...publishableKeys][0], diag };
 }
 
 async function runProbe() {
@@ -186,19 +194,45 @@ async function runProbe() {
 
 /* ------------------------------------------------------------------- full */
 
+const ADMIN_EMAIL_PATTERNS = ['^ADMIN_EMAIL$', '^E2E_ADMIN_EMAIL$', '^TEST_ADMIN_EMAIL$', '^PROD_ADMIN_EMAIL$', '^SUPABASE_ADMIN_EMAIL$'];
+const ADMIN_PASSWORD_PATTERNS = ['^ADMIN_PASSWORD$', '^E2E_ADMIN_PASSWORD$', '^TEST_ADMIN_PASSWORD$', '^PROD_ADMIN_PASSWORD$', '^SUPABASE_ADMIN_PASSWORD$'];
+const SKIPPABLE_STEPS = [
+  'A. /player page served', 'B. generate fresh pairing code', 'C. displayed expiry recorded',
+  'D/E. fresh code accepted by backend', 'E. response binds the intended screen',
+  'F. screen shows as paired (admin)', 'F. credential unlocks player endpoints',
+  'G. same code rejected on reuse', 'H. expired code rejected',
+];
+
 async function runFull() {
   console.log(`== full E2E against ${APP} ==`);
+
+  // Credential-free live diagnosis FIRST: this is the exact request the TV
+  // player sends, so it works before any secrets are configured. Before the
+  // fix, the strict deviceInfo schema rejects it with a schema error before
+  // the code ever reaches the database; after the fix it reaches the code
+  // lookup (a not-found error for this deliberately invalid probe code).
+  try {
+    const withLang = await playerPair('E2EPROBE');
+    const noLangDevice = playerDeviceInfo();
+    delete noLangDevice.language;
+    const withoutLang = await playerPair('E2EPROBE', noLangDevice);
+    const schemaRejected = withLang.data.error === 'أدخل رمز ربط صالحاً.';
+    record('0. player payload accepted by request schema', !schemaRejected,
+      `with language -> ${withLang.status} ${JSON.stringify(withLang.data).slice(0, 160)} | without -> ${withoutLang.status} ${JSON.stringify(withoutLang.data).slice(0, 160)}`);
+  } catch (error) {
+    record('0. player payload accepted by request schema', false, `pair endpoint unreachable: ${error.message}`);
+  }
+
   const { createServerClient } = await import('@supabase/ssr');
 
   const config = await discoverPublicConfig();
   const supabaseUrl = secret('^NEXT_PUBLIC_SUPABASE_URL$', '^SUPABASE_URL$') || process.env.NEXT_PUBLIC_SUPABASE_URL || config.supabaseUrl;
   const anonKey = secret('^NEXT_PUBLIC_SUPABASE_ANON_KEY$', '^SUPABASE_ANON_KEY$') || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || config.anonKey;
   const serviceKey = secret('^SUPABASE_SERVICE_ROLE_KEY$', '^SUPABASE_SERVICE_KEY$') || process.env.SUPABASE_SERVICE_ROLE_KEY;
-  const adminEmailSecret = secret('^ADMIN_EMAIL$', '^E2E_ADMIN_EMAIL$', '^TEST_ADMIN_EMAIL$');
-  const adminPasswordSecret = secret('^ADMIN_PASSWORD$', '^E2E_ADMIN_PASSWORD$', '^TEST_ADMIN_PASSWORD$');
+  const adminEmailSecret = secret(...ADMIN_EMAIL_PATTERNS);
+  const adminPasswordSecret = secret(...ADMIN_PASSWORD_PATTERNS);
   const wired = ['NEXT_PUBLIC_SUPABASE_URL', 'SUPABASE_URL', 'NEXT_PUBLIC_SUPABASE_ANON_KEY', 'SUPABASE_ANON_KEY',
-    'SUPABASE_SERVICE_ROLE_KEY', 'SUPABASE_SERVICE_KEY', 'ADMIN_EMAIL', 'ADMIN_PASSWORD',
-    'E2E_ADMIN_EMAIL', 'E2E_ADMIN_PASSWORD', 'TEST_ADMIN_EMAIL', 'TEST_ADMIN_PASSWORD'];
+    'SUPABASE_SERVICE_ROLE_KEY', 'SUPABASE_SERVICE_KEY', ...ADMIN_EMAIL_PATTERNS.map((p) => p.slice(1, -1)), ...ADMIN_PASSWORD_PATTERNS.map((p) => p.slice(1, -1))];
   const wiredStatus = wired.map((name) => `${name}=${process.env[name] ? 'set' : 'empty'}`).join(' ');
   emitAnnotation('notice', 'E2E config', [
     `wired secrets: ${wiredStatus}`,
@@ -213,9 +247,16 @@ async function runFull() {
   const supaHeaders = (key) => ({ apikey: key, Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' });
 
   // -- resolve an admin session -------------------------------------------------
-  let adminEmail = secret('^ADMIN_EMAIL$', '^E2E_ADMIN_EMAIL$', '^TEST_ADMIN_EMAIL$');
-  let adminPassword = secret('^ADMIN_PASSWORD$', '^E2E_ADMIN_PASSWORD$', '^TEST_ADMIN_PASSWORD$');
+  let adminEmail = adminEmailSecret;
+  let adminPassword = adminPasswordSecret;
   let tempUserId = null;
+
+  if ((!adminEmail || !adminPassword) && !serviceKey) {
+    record('admin session (credentials)', false, 'ADMIN_EMAIL/ADMIN_PASSWORD and SUPABASE_SERVICE_ROLE_KEY secrets are not configured; cannot generate a real pairing code. Add one of them as a GitHub Actions secret.');
+    for (const step of SKIPPABLE_STEPS) skip(step, 'requires admin credentials');
+    finishAndReport();
+    return;
+  }
 
   if ((!adminEmail || !adminPassword) && serviceKey) {
     tempUserId = `e2e-${Date.now()}`;
