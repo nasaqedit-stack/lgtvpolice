@@ -122,19 +122,29 @@ async function discoverPublicConfig() {
   const jsUrls = new Set();
   const supabaseUrls = new Set();
   const keys = new Set();
+  const diag = { pages: [], sampleChunks: [], sawSupabase: false, chunkCount: 0 };
   const pages = [`${APP}/login`, `${APP}/player`];
   for (const page of pages) {
-    let html = '';
-    try { html = await (await fetch(page)).text(); } catch { continue; }
-    for (const match of html.matchAll(/\/_next\/static\/[^"'\\ ]+\.js/g)) jsUrls.add(`${APP}${match[0]}`);
+    try {
+      const response = await fetch(page);
+      const html = await response.text();
+      diag.pages.push({ page, status: response.status, htmlBytes: html.length });
+      // Loose extraction: quote/backtick-delimited and bare /_next/static JS paths.
+      for (const match of html.matchAll(/(?:["'`]|\\u0022)(\/_next\/static\/[^"'`\\ ]+?\.js)(?:["'`]|\\u0022)/g)) jsUrls.add(`${APP}${match[1]}`);
+      for (const match of html.matchAll(/\/_next\/static\/[A-Za-z0-9_./-]+\.js/g)) jsUrls.add(`${APP}${match[0]}`);
+      if (html.includes('.supabase')) diag.sawSupabase = true;
+    } catch (error) { diag.pages.push({ page, error: String(error) }); }
   }
   for (const url of [...jsUrls].slice(0, 40)) {
     let js = '';
     try { js = await (await fetch(url)).text(); } catch { continue; }
+    if (diag.sampleChunks.length < 5) diag.sampleChunks.push(url.replace(APP, ''));
     for (const match of js.matchAll(/https:\/\/[a-z0-9]{16,}\.supabase\.co/g)) supabaseUrls.add(match[0]);
     for (const match of js.matchAll(/eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g)) keys.add(match[0]);
+    if (js.includes('.supabase')) diag.sawSupabase = true;
   }
-  return { supabaseUrl: [...supabaseUrls][0], anonKey: [...keys][0] };
+  diag.chunkCount = jsUrls.size;
+  return { supabaseUrl: [...supabaseUrls][0], anonKey: [...keys][0], diag };
 }
 
 async function runProbe() {
@@ -186,9 +196,15 @@ async function runFull() {
   const serviceKey = secret('^SUPABASE_SERVICE_ROLE_KEY$', '^SUPABASE_SERVICE_KEY$') || process.env.SUPABASE_SERVICE_ROLE_KEY;
   const adminEmailSecret = secret('^ADMIN_EMAIL$', '^E2E_ADMIN_EMAIL$', '^TEST_ADMIN_EMAIL$');
   const adminPasswordSecret = secret('^ADMIN_PASSWORD$', '^E2E_ADMIN_PASSWORD$', '^TEST_ADMIN_PASSWORD$');
-  console.log(`config: supabase-url=${supabaseUrl ? 'resolved' : 'MISSING'} (secret/env=${Boolean(supabaseUrl && supabaseUrl !== config.supabaseUrl)}, bundle=${Boolean(config.supabaseUrl)})`);
-  console.log(`config: anon-key=${anonKey ? 'resolved' : 'MISSING'} (secret/env=${Boolean(anonKey && anonKey !== config.anonKey)}, bundle=${Boolean(config.anonKey)})`);
-  console.log(`config: service-key=${serviceKey ? 'yes' : 'no'} admin-creds=${adminEmailSecret && adminPasswordSecret ? 'yes' : 'no'}`);
+  const wired = ['NEXT_PUBLIC_SUPABASE_URL', 'SUPABASE_URL', 'NEXT_PUBLIC_SUPABASE_ANON_KEY', 'SUPABASE_ANON_KEY',
+    'SUPABASE_SERVICE_ROLE_KEY', 'SUPABASE_SERVICE_KEY', 'ADMIN_EMAIL', 'ADMIN_PASSWORD',
+    'E2E_ADMIN_EMAIL', 'E2E_ADMIN_PASSWORD', 'TEST_ADMIN_EMAIL', 'TEST_ADMIN_PASSWORD'];
+  const wiredStatus = wired.map((name) => `${name}=${process.env[name] ? 'set' : 'empty'}`).join(' ');
+  emitAnnotation('notice', 'E2E config', [
+    `wired secrets: ${wiredStatus}`,
+    `public discovery: pages=${JSON.stringify(config.diag.pages)} chunks=${config.diag.chunkCount} sample=${JSON.stringify(config.diag.sampleChunks)} sawSupabase=${config.diag.sawSupabase} url=${config.supabaseUrl ? 'found' : 'none'} anonKey=${config.anonKey ? 'found' : 'none'}`,
+    `resolved: url=${supabaseUrl ? 'yes' : 'no'} anon=${anonKey ? 'yes' : 'no'} serviceKey=${serviceKey ? 'yes' : 'no'} adminCreds=${adminEmailSecret && adminPasswordSecret ? 'yes' : 'no'}`,
+  ].join('\n'));
   if (!supabaseUrl || !anonKey) {
     throw new Error('Cannot resolve Supabase URL/anon key (secrets or public bundle).');
   }
