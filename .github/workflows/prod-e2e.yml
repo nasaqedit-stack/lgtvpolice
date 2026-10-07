@@ -11,9 +11,16 @@ name: Production pairing E2E
 #
 # Modes:
 #  - probe : credential-free diagnosis of POST /api/player/pair
-#  - full  : complete pairing flow A-H (generate → submit → paired → reuse
-#            rejected → expired rejected), with production-DB checks when the
+#  - full  : complete pairing flow A-H (generate -> submit -> paired -> reuse
+#            rejected -> expired rejected), with production-DB checks when the
 #            service key is available as a secret.
+#
+# Required secrets (repository or "Production" environment); missing ones are
+# simply empty and the script degrades or fails with a clear message:
+#   NEXT_PUBLIC_SUPABASE_URL, NEXT_PUBLIC_SUPABASE_ANON_KEY (optional; usually
+#   discovered from the public bundle), SUPABASE_SERVICE_ROLE_KEY (optional;
+#   enables DB source-of-truth checks and temporary-admin creation),
+#   ADMIN_EMAIL + ADMIN_PASSWORD (optional if the service key is set).
 on:
   workflow_dispatch:
     inputs:
@@ -47,7 +54,7 @@ jobs:
   pairing-e2e:
     runs-on: ubuntu-latest
     # Pulls environment-scoped secrets from the "Production" environment as well
-    # as repository secrets; all are handed to the script via SECRETS_JSON.
+    # as repository secrets.
     environment: Production
     timeout-minutes: 45
     steps:
@@ -75,5 +82,16 @@ jobs:
         env:
           E2E_MODE: ${{ inputs.mode || 'full' }}
           APP_ORIGIN: ${{ inputs.origin || 'https://lgtvpolice.vercel.app' }}
-          SECRETS_JSON: ${{ toJSON(secrets) }}
+          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          ADMIN_EMAIL: ${{ secrets.ADMIN_EMAIL }}
+          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+          E2E_ADMIN_EMAIL: ${{ secrets.E2E_ADMIN_EMAIL }}
+          E2E_ADMIN_PASSWORD: ${{ secrets.E2E_ADMIN_PASSWORD }}
+          TEST_ADMIN_EMAIL: ${{ secrets.TEST_ADMIN_EMAIL }}
+          TEST_ADMIN_PASSWORD: ${{ secrets.TEST_ADMIN_PASSWORD }}
         run: node scripts/prod-pairing-e2e.mjs

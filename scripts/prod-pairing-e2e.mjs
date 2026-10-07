@@ -29,9 +29,13 @@ const sha256 = (value) => createHash('sha256').update(value).digest('hex');
 let secrets = {};
 try { secrets = JSON.parse(process.env.SECRETS_JSON || '{}'); } catch { secrets = {}; }
 function secret(...patterns) {
-  for (const [key, value] of Object.entries(secrets)) {
-    if (!value || typeof value !== 'string') continue;
-    if (patterns.some((pattern) => new RegExp(pattern, 'i').test(key))) return value;
+  // Prefer explicit environment variables (how the workflow passes GitHub
+  // secrets); fall back to a JSON blob for local runs.
+  for (const source of [process.env, secrets]) {
+    for (const [key, value] of Object.entries(source)) {
+      if (!value || typeof value !== 'string') continue;
+      if (patterns.some((pattern) => new RegExp(pattern, 'i').test(key))) return value;
+    }
   }
   return undefined;
 }
@@ -116,7 +120,6 @@ async function discoverPublicConfig() {
 
 async function runProbe() {
   console.log(`== probe mode against ${APP} ==`);
-  console.log(`available secret names: ${Object.keys(secrets).sort().join(', ') || '(none)'}`);
 
   let pageOk = false;
   try {
@@ -126,17 +129,23 @@ async function runProbe() {
   } catch (error) { console.log(`GET /player -> network error: ${error.message}`); }
 
   // Payload the TV actually sends (includes `language`).
-  const withLanguage = await playerPair('E2EPROBE');
-  console.log(`POST /api/player/pair WITH language -> ${withLanguage.status} ${JSON.stringify(withLanguage.data)}`);
-  // Byte-identical payload minus only the `language` key, to see how far the request gets.
-  const withoutLanguageDevice = playerDeviceInfo();
-  delete withoutLanguageDevice.language;
-  const withoutLanguage = await playerPair('E2EPROBE', withoutLanguageDevice);
-  console.log(`POST /api/player/pair WITHOUT language -> ${withoutLanguage.status} ${JSON.stringify(withoutLanguage.data)}`);
+  let withLanguage;
+  let withoutLanguage;
+  try {
+    withLanguage = await playerPair('E2EPROBE');
+    console.log(`POST /api/player/pair WITH language -> ${withLanguage.status} ${JSON.stringify(withLanguage.data)}`);
+    // Byte-identical payload minus only the `language` key, to see how far the request gets.
+    const withoutLanguageDevice = playerDeviceInfo();
+    delete withoutLanguageDevice.language;
+    withoutLanguage = await playerPair('E2EPROBE', withoutLanguageDevice);
+    console.log(`POST /api/player/pair WITHOUT language -> ${withoutLanguage.status} ${JSON.stringify(withoutLanguage.data)}`);
+  } catch (error) {
+    console.log(`pair endpoint unreachable: ${error.message}`);
+  }
 
-  const schemaReject = withLanguage.data.code === 'invalid_pairing_code' && withLanguage.data.error === 'أدخل رمز ربط صالحاً.';
+  const schemaReject = withLanguage && withLanguage.data.code === 'invalid_pairing_code' && withLanguage.data.error === 'أدخل رمز ربط صالحاً.';
   console.log(`diagnosis: schema-rejects-player-payload = ${schemaReject ? 'YES (root cause: strict deviceInfo schema)' : 'no'}`);
-  console.log(`diagnosis: db-path-without-language = ${withoutLanguage.status === 400 ? 'reached lookup' : `status ${withoutLanguage.status}`}`);
+  console.log(`diagnosis: db-path-without-language = ${withoutLanguage ? (withoutLanguage.status === 400 ? 'reached lookup' : `status ${withoutLanguage.status}`) : 'unreachable'}`);
 
   const config = await discoverPublicConfig();
   console.log(`discovered public supabase url: ${config.supabaseUrl || '(not found)'}`);
@@ -154,20 +163,20 @@ async function runFull() {
 
   const config = await discoverPublicConfig();
   const supabaseUrl = secret('^NEXT_PUBLIC_SUPABASE_URL$', '^SUPABASE_URL$') || process.env.NEXT_PUBLIC_SUPABASE_URL || config.supabaseUrl;
-  const anonKey = secret('NEXT_PUBLIC_SUPABASE_ANON_KEY', '^SUPABASE_ANON_KEY$') || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || config.anonKey;
-  const serviceKey = secret('SUPABASE_SERVICE_ROLE_KEY', 'SUPABASE_SERVICE_KEY') || process.env.SUPABASE_SERVICE_ROLE_KEY;
+  const anonKey = secret('^NEXT_PUBLIC_SUPABASE_ANON_KEY$', '^SUPABASE_ANON_KEY$') || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || config.anonKey;
+  const serviceKey = secret('^SUPABASE_SERVICE_ROLE_KEY$', '^SUPABASE_SERVICE_KEY$') || process.env.SUPABASE_SERVICE_ROLE_KEY;
   if (!supabaseUrl || !anonKey) {
-    console.log('available secret names: ' + Object.keys(secrets).sort().join(', '));
     throw new Error('Cannot resolve Supabase URL/anon key (secrets or public bundle).');
   }
   console.log(`supabase: ${supabaseUrl}`);
-  console.log(`service key available: ${serviceKey ? 'yes' : 'no'} | secret names: ${Object.keys(secrets).sort().join(', ') || '(none)'}`);
+  const adminCreds = Boolean(secret('^ADMIN_EMAIL$', '^E2E_ADMIN_EMAIL$', '^TEST_ADMIN_EMAIL$') && secret('^ADMIN_PASSWORD$', '^E2E_ADMIN_PASSWORD$', '^TEST_ADMIN_PASSWORD$'));
+  console.log(`credentials: service-key=${serviceKey ? 'yes' : 'no'} admin-creds=${adminCreds ? 'yes' : 'no'}`);
 
   const supaHeaders = (key) => ({ apikey: key, Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' });
 
   // -- resolve an admin session -------------------------------------------------
-  let adminEmail = secret('ADMIN_EMAIL', 'E2E_ADMIN_EMAIL', 'TEST_ADMIN_EMAIL');
-  let adminPassword = secret('ADMIN_PASSWORD', 'E2E_ADMIN_PASSWORD', 'TEST_ADMIN_PASSWORD');
+  let adminEmail = secret('^ADMIN_EMAIL$', '^E2E_ADMIN_EMAIL$', '^TEST_ADMIN_EMAIL$');
+  let adminPassword = secret('^ADMIN_PASSWORD$', '^E2E_ADMIN_PASSWORD$', '^TEST_ADMIN_PASSWORD$');
   let tempUserId = null;
 
   if ((!adminEmail || !adminPassword) && serviceKey) {
