@@ -218,7 +218,7 @@ async function discoverPublicConfig() {
 
 /* ------------------------------------------------- credential-free probes */
 
-async function probeObjectStorage(supabaseUrl) {
+async function probeObjectStorage(supabaseUrl, anonKey) {
   if (!supabaseUrl) {
     skip('storage endpoint reachable', 'Supabase URL not discovered from the public bundle; set NEXT_PUBLIC_SUPABASE_URL');
     return;
@@ -232,7 +232,9 @@ async function probeObjectStorage(supabaseUrl) {
     // message means S3 access was never switched on for the project, which breaks every upload.
     const served = /<Code>|SignatureDoesNotMatch|AccessDenied|AuthorizationHeaderMalformed/i.test(body)
       || ([400, 401, 403].includes(response.status) && !/not enabled|disabled/i.test(body));
-    record('storage endpoint reachable (S3 protocol served)', served, `GET object probe -> ${response.status} ${body.replace(/\s+/g, ' ').slice(0, 160)}`);
+    const code = /<Code>([^<]*)<\/Code>/.exec(body)?.[1];
+    record('storage endpoint reachable (S3 protocol served)', served,
+      `GET object probe -> ${response.status}${code ? ` ${code}` : ''} ${body.replace(/\s+/g, ' ').slice(0, 140)}`);
   } catch (error) {
     record('storage endpoint reachable (S3 protocol served)', false, `probe failed: ${error.message}`);
   }
@@ -329,7 +331,7 @@ async function run() {
   ].join('\n'));
 
   // Always available: the storage endpoint must serve the S3 protocol and allow the app origin.
-  await probeObjectStorage(supabaseUrl);
+  await probeObjectStorage(supabaseUrl, anonKey);
 
   if (!serviceKey && !(adminEmailSecret && adminPasswordSecret)) {
     const missing = 'No admin session is available to this run: set ADMIN_EMAIL + ADMIN_PASSWORD, or SUPABASE_SERVICE_ROLE_KEY (which lets the harness create a temporary admin), as GitHub Actions secrets. Until then the checks that need an authenticated admin (A-G) cannot be executed from CI.';
