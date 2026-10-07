@@ -19,6 +19,20 @@ Environment: Node.js 22.22.3, npm, fake IndexedDB. No Supabase project, object-s
 - `npm run build` — passed; `/player` is generated as a static route and API routes are server-rendered.
 - Local HTTP smoke check — `/player`, `/sw.js`, and `/login` returned HTTP 200. This did not exercise a configured login or storage API.
 
+## Production probe (2026-10-07, credential-free)
+
+Run on the deployed production origin by the `Production media probe` workflow:
+
+- The project serves the object-storage S3 protocol: an unsigned `GET /storage/v1/s3/signage-media/media/<key>`
+  answers `403 AccessDenied` with an S3 XML error body (not a gateway/feature error), so uploads and
+  downloads are not blocked by a disabled S3 endpoint.
+- CORS preflight for `GET` and `PUT` from the production origin returns
+  `access-control-allow-origin: *`, so browser multipart upload and cross-origin range download are
+  permitted by the storage endpoint.
+- No GitHub Actions secrets are configured (`url=yes anon=no serviceKey=no adminCreds=no`), so the
+  authenticated A–I checks below report SKIP. The production Supabase URL is discoverable from the
+  public bundle; the anon/service keys are not.
+
 ## Production harness (needs credentials)
 
 `node scripts/presign-inspect.mjs` prints the presigned query parameters the server would send for a GetObject/UploadPart (no network, offline presigning only) so a change in AWS SDK defaults is visible in review.
