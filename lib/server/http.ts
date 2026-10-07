@@ -1,5 +1,6 @@
 import { NextResponse, type NextRequest } from 'next/server';
 import { createSupabaseAdmin, createSupabaseServer } from '@/lib/server/supabase';
+import { ConfigError } from '@/lib/server/config-error';
 
 export class HttpError extends Error {
   constructor(public status: number, message: string, public code = 'request_failed') {
@@ -11,6 +12,19 @@ export class HttpError extends Error {
 export function errorResponse(error: unknown) {
   if (error instanceof HttpError) {
     return NextResponse.json({ error: error.message, code: error.code }, { status: error.status });
+  }
+  if (error instanceof ConfigError) {
+    // A required environment variable is missing/empty on this deployment. This is an operator
+    // configuration problem, not a transient failure, so it must never be masked as a generic
+    // "internal_error" 500 that just tells an admin to "try again" forever. The variable name is
+    // not sensitive (it is already public in this repository's source and .env.example); only its
+    // value would be, and that is never included here.
+    console.error('Server configuration error:', error.message);
+    return NextResponse.json({
+      error: `الخادم غير مهيأ: المتغيّر البيئي "${error.variable}" غير مضبوط في بيئة الإنتاج. راجع إعدادات متغيرات البيئة في Vercel.`,
+      code: 'server_misconfigured',
+      missingVariable: error.variable,
+    }, { status: 503 });
   }
   console.error('Unhandled API error:', error);
   return NextResponse.json({ error: 'تعذر إكمال الطلب. حاول مرة أخرى.', code: 'internal_error' }, { status: 500 });
