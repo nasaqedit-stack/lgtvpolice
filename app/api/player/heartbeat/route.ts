@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
 import { errorResponse, HttpError, readJson, requireScreen } from '@/lib/server/http';
+import { deviceInfoSchema } from '@/lib/server/pairing';
 
 export const runtime = 'nodejs';
 const schema = z.object({
@@ -13,13 +14,7 @@ const schema = z.object({
   storageUsageBytes: z.number().int().nonnegative().nullable().optional(),
   storageQuotaBytes: z.number().int().nonnegative().nullable().optional(),
   lastSyncAt: z.string().datetime().nullable().optional(),
-  deviceInfo: z.object({
-    userAgent: z.string().max(500).optional(),
-    platform: z.string().max(120).optional(),
-    screenWidth: z.number().int().min(0).max(20000).optional(),
-    screenHeight: z.number().int().min(0).max(20000).optional(),
-    language: z.string().max(30).optional(),
-  }).strict().optional(),
+  deviceInfo: deviceInfoSchema.optional(),
 }).strict();
 
 export async function POST(request: NextRequest) {

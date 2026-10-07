@@ -1,20 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { randomBytes, createHash } from 'node:crypto';
-import { z } from 'zod';
 import { errorResponse, HttpError, readJson } from '@/lib/server/http';
 import { createSupabaseAdmin } from '@/lib/server/supabase';
-import { hashHex, normalizedPairingCode } from '@/lib/server/pairing';
+import { hashHex, normalizedPairingCode, pairRequestSchema } from '@/lib/server/pairing';
 
 export const runtime = 'nodejs';
-const schema = z.object({
-  code: z.string().min(6).max(16),
-  deviceInfo: z.object({
-    userAgent: z.string().max(500).optional(),
-    platform: z.string().max(120).optional(),
-    screenWidth: z.number().int().min(0).max(20000).optional(),
-    screenHeight: z.number().int().min(0).max(20000).optional(),
-  }).strict().optional(),
-}).strict();
+const schema = pairRequestSchema;
 
 export async function POST(request: NextRequest) {
   try {
