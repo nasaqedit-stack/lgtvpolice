@@ -51,6 +51,57 @@ export type CachedManifest = Omit<ScreenManifest, 'manifestHash' | 'generatedAt'
 
 export type StorageStats = { usage: number | null; quota: number | null; persisted: boolean | null };
 
+/* ---------------------------------------------------------------------------
+ * Multipart upload partitioning.
+ *
+ * ONE implementation of the byte-range maths, imported by the browser (which
+ * slices the File) and by the API routes (which presign parts, report session
+ * state and validate finalization). Client and server can therefore not drift
+ * apart about how large a part is supposed to be: `uploadPartRange()` is the
+ * only place a part boundary is ever computed.
+ * ------------------------------------------------------------------------ */
+
+/** Configured length of every part except the last one. */
+export const UPLOAD_PART_SIZE = 8 * 1024 * 1024;
+/** Per-file ceiling enforced by the upload session and the media page. */
+export const MAX_UPLOAD_FILE_SIZE = 2 * 1024 * 1024 * 1024;
+
+export type UploadPartRange = { partNumber: number; start: number; end: number; size: number };
+
+/** How many parts a file of `fileSize` bytes is split into (0 for an empty/invalid size). */
+export function uploadPartCount(fileSize: number): number {
+  if (!Number.isFinite(fileSize) || fileSize <= 0) return 0;
+  return Math.ceil(fileSize / UPLOAD_PART_SIZE);
+}
+
+/**
+ * Slice bounds of one part, 1-based.
+ *
+ * `start` is inclusive and `end` is exclusive, exactly like `Blob.slice(start, end)`,
+ * so `end - start` is the byte length of the part. The final part is whatever bytes
+ * remain, i.e. it is smaller than `UPLOAD_PART_SIZE` unless the file is an exact
+ * multiple of it.
+ */
+export function uploadPartRange(fileSize: number, partNumber: number): UploadPartRange {
+  const totalParts = uploadPartCount(fileSize);
+  if (!Number.isInteger(partNumber) || partNumber < 1 || partNumber > totalParts) {
+    throw new RangeError(`partNumber ${partNumber} is outside the valid range 1..${totalParts}`);
+  }
+  const start = (partNumber - 1) * UPLOAD_PART_SIZE;
+  const end = Math.min(start + UPLOAD_PART_SIZE, fileSize);
+  return { partNumber, start, end, size: end - start };
+}
+
+/** Expected byte length of one part. */
+export function uploadPartSize(fileSize: number, partNumber: number): number {
+  return uploadPartRange(fileSize, partNumber).size;
+}
+
+/** The complete ordered partition of a file: `[{ partNumber, start, end, size }, …]`. */
+export function uploadPartRanges(fileSize: number): UploadPartRange[] {
+  return Array.from({ length: uploadPartCount(fileSize) }, (_unused, index) => uploadPartRange(fileSize, index + 1));
+}
+
 export function formatBytes(value: number): string {
   if (!Number.isFinite(value) || value < 0) return '—';
   if (value < 1024) return `${value} بايت`;

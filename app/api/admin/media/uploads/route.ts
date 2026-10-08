@@ -4,10 +4,11 @@ import { CreateMultipartUploadCommand, AbortMultipartUploadCommand } from '@aws-
 import { z } from 'zod';
 import { errorResponse, HttpError, requireAdmin, readJson } from '@/lib/server/http';
 import { getS3Client, storageConfig, storageRequestOptions } from '@/lib/server/storage';
+import { MAX_UPLOAD_FILE_SIZE, UPLOAD_PART_SIZE, uploadPartCount } from '@/lib/shared';
 
 export const runtime = 'nodejs';
 export const maxDuration = 60;
-const maxFileSize = 2 * 1024 * 1024 * 1024;
+const maxFileSize = MAX_UPLOAD_FILE_SIZE;
 const mimeMap = { 'image/jpeg': 'image', 'image/png': 'image', 'image/webp': 'image', 'video/mp4': 'video' } as const;
 const schema = z.object({
   fileName: z.string().trim().min(1).max(240),
@@ -48,8 +49,8 @@ export async function POST(request: NextRequest) {
     }
     return NextResponse.json({
       uploadId: upload.id,
-      partSize: 8 * 1024 * 1024,
-      totalParts: Math.ceil(parsed.data.fileSize / (8 * 1024 * 1024)),
+      partSize: UPLOAD_PART_SIZE,
+      totalParts: uploadPartCount(parsed.data.fileSize),
       expiresAt,
       kind: mimeMap[parsed.data.mimeType],
     }, { status: 201, headers: { 'Cache-Control': 'no-store' } });

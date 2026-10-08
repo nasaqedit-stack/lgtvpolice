@@ -3,13 +3,12 @@
 import { ChangeEvent, DragEvent, useCallback, useEffect, useRef, useState } from 'react';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
-import { api, ApiError, jsonBody, RequestTimeoutError, withRequestTimeout } from '@/lib/client/api';
+import { api, ApiError, jsonBody, withRequestTimeout } from '@/lib/client/api';
+import { buildPartManifest, uploadParts } from '@/lib/client/media-upload';
 import { runUploadTask, type UploadProgress, type UploadUiState } from '@/lib/client/upload-state';
 import { formatBytes } from '@/lib/shared';
 import { EmptyState, ErrorState, LoadingState, PageHeader } from '@/components/admin-common';
 
-const PART_SIZE = 8 * 1024 * 1024;
-const PART_UPLOAD_TIMEOUT_MS = 120_000;
 const COMPLETE_TIMEOUT_MS = 55_000;
 type FileInfo = { mimeType: string; kind: 'image' | 'video'; width: number | null; height: number | null; durationMs: number | null; thumbnailData: string | null; compatibility: 'candidate' | 'warning' | 'unknown' };
 
@@ -92,7 +91,7 @@ export default function MediaPage() {
     let completedBytes = [...existingParts.values()].reduce((sum, size) => sum + size, 0);
     report('رفع أجزاء الملف إلى تخزين الكائنات…', completedBytes);
     const partNumbers = Array.from({ length: status.totalParts }, (_, index) => index + 1).filter(partNumber => !existingParts.has(partNumber));
-    await uploadParts(file, uploadId, partNumbers, completed => {
+    const uploadedParts = await uploadParts(file, uploadId, partNumbers, completed => {
       completedBytes += completed;
       report('رفع أجزاء الملف إلى تخزين الكائنات…', completedBytes);
     });
@@ -106,6 +105,9 @@ export default function MediaPage() {
         durationMs: details.durationMs,
         thumbnailData: details.thumbnailData,
         compatibility: details.compatibility,
+        // One entry per part: the byte length read off the Blob that was actually PUT, so the
+        // server validates the sizes that were really sent instead of re-deriving them itself.
+        parts: buildPartManifest(file.size, uploadedParts),
       }),
     }, COMPLETE_TIMEOUT_MS);
     if (!result?.media || typeof result.media.id !== 'string') {
@@ -291,50 +293,6 @@ async function inspectVideo(file: File, mimeType: string): Promise<FileInfo> {
     URL.revokeObjectURL(url);
   }
   return { mimeType, kind: 'video', width, height, durationMs, thumbnailData, compatibility };
-}
-async function uploadParts(file: File, uploadId: string, partNumbers: number[], onPartComplete: (bytes: number) => void) {
-  const queue = [...partNumbers];
-  const run = async () => {
-    while (queue.length) {
-      const partNumber = queue.shift()!;
-      const start = (partNumber - 1) * PART_SIZE;
-      const blob = file.slice(start, Math.min(start + PART_SIZE, file.size));
-      let done = false;
-      for (let attempt = 0; attempt < 3 && !done; attempt += 1) {
-        const startedAt = Date.now();
-        if (process.env.NODE_ENV !== 'production') console.debug(`[media-upload] Storage PUT part ${partNumber} started`);
-        try {
-          const ticket = await api(`/api/admin/media/uploads/${uploadId}/parts`, { method: 'POST', body: jsonBody({ partNumbers: [partNumber] }) });
-          const partUrl = ticket.urls?.[partNumber];
-          if (typeof partUrl !== 'string' || !partUrl) throw new Error(`لم يُرجع الخادم رابط رفع للجزء ${partNumber}.`);
-          const response = await withRequestTimeout(`رفع جزء التخزين ${partNumber}`, PART_UPLOAD_TIMEOUT_MS, async signal => {
-            // File bytes go directly to the signed Supabase S3 URL; they are not sent through the
-            // Next/Vercel API (and this is a Blob PUT, not a FormData request).
-            const storageResponse = await fetch(partUrl, { method: 'PUT', body: blob, signal });
-            if (!storageResponse.ok) {
-              const detail = process.env.NODE_ENV !== 'production'
-                ? (await storageResponse.text().catch(() => ''))
-                    .replace(/https?:\/\/[^\s"'<>]+/gi, '[URL redacted]')
-                    .replace(/(authorization|access[_ -]?key|secret|token|signature|password)(\s*[:=]\s*|\s+)[^\s,;<>"']+/gi, '$1$2[redacted]')
-                    .slice(0, 500)
-                : '';
-              throw new Error(`رفض تخزين الجزء ${partNumber} (HTTP ${storageResponse.status})${detail ? `: ${detail}` : ''}`);
-            }
-            return storageResponse;
-          });
-          done = true;
-          onPartComplete(blob.size);
-          if (process.env.NODE_ENV !== 'production') console.debug(`[media-upload] Storage PUT part ${partNumber} finished`, { status: response.status, elapsedMs: Date.now() - startedAt });
-        } catch (error) {
-          // A timed-out PUT has an unknown outcome; don't retry blindly. The upload session is
-          // retained and the next attempt first asks Storage which part numbers actually landed.
-          if (error instanceof RequestTimeoutError || attempt === 2) throw error;
-          await new Promise(resolve => setTimeout(resolve, 700 * (attempt + 1)));
-        }
-      }
-    }
-  };
-  await Promise.all(Array.from({ length: Math.min(3, queue.length) }, () => run()));
 }
 function formatDuration(value: number) {
   const total = Math.floor(value / 1000);

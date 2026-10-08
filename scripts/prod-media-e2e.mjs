@@ -7,7 +7,9 @@
  *   published revision -> player manifest -> signed private URL -> byte download (Range) -> SHA-256
  *
  * Checks (A-I):
- *   A. media row exists in the production database (admin API + direct DB when the service key is set)
+ *   A. media row exists in the production database (admin API + direct DB when the service key is set);
+ *      every part is PUT as a Blob to its signed URL and finalization declares the real byte length
+ *      of each part, including a two-part upload whose last part is a single byte (E2E_MULTIPART=0 skips it)
  *   B. the object exists in the private `signage-media` bucket (storage REST list + signed-URL byte read)
  *   C. the media is part of a playlist
  *   D. the playlist is published (immutable revision + published_version)
@@ -314,6 +316,91 @@ async function downloadWithRanges(url) {
   return { hash: digest.digest('hex'), size: offset, declaredSize: total, corsAllowOrigin, bytes: Buffer.concat(bytes) };
 }
 
+/* ------------------------------- multipart upload through the real admin API */
+
+/**
+ * Must match `lib/shared.ts` (`UPLOAD_PART_SIZE` / `uploadPartRange()`): `start` inclusive,
+ * `end` exclusive, so the final part is whatever bytes remain.
+ */
+const UPLOAD_PART_SIZE = 8 * 1024 * 1024;
+function partRanges(fileSize) {
+  const ranges = [];
+  for (let start = 0, partNumber = 1; start < fileSize; start += UPLOAD_PART_SIZE, partNumber += 1) {
+    const end = Math.min(start + UPLOAD_PART_SIZE, fileSize);
+    ranges.push({ partNumber, start, end, size: end - start });
+  }
+  return ranges;
+}
+
+/**
+ * Uploads `bytes` to the live deployment exactly the way the admin browser does: one session,
+ * one signed Blob PUT per part (never FormData, never through Vercel), then finalization with the
+ * byte length that was really sent for each part. Resolves with the created media id.
+ */
+async function uploadThroughAdminApi(adminApi, bytes, fileName, mimeType, meta = {}) {
+  const hash = sha256(bytes);
+  const ranges = partRanges(bytes.length);
+  const session = await adminApi('/api/admin/media/uploads', {
+    method: 'POST',
+    body: JSON.stringify({ fileName, fileSize: bytes.length, mimeType }),
+  });
+  if (session.status !== 201) throw new Error(`upload session failed: ${session.status} ${JSON.stringify(session.data)}`);
+  const uploadId = session.data.uploadId;
+  const serverPartition = { partSize: session.data.partSize, totalParts: session.data.totalParts };
+  if (serverPartition.partSize !== UPLOAD_PART_SIZE || serverPartition.totalParts !== ranges.length) {
+    throw new Error(`server partition ${JSON.stringify(serverPartition)} disagrees with the client partition partSize=${UPLOAD_PART_SIZE} totalParts=${ranges.length}`);
+  }
+
+  const uploaded = [];
+  for (const range of ranges) {
+    const ticket = await adminApi(`/api/admin/media/uploads/${uploadId}/parts`, {
+      method: 'POST',
+      body: JSON.stringify({ partNumbers: [range.partNumber] }),
+    });
+    if (ticket.status !== 200 || !ticket.data.urls?.[range.partNumber]) {
+      throw new Error(`part ${range.partNumber} presign failed: ${ticket.status} ${JSON.stringify(ticket.data)}`);
+    }
+    // The declared size is the length of the exact bytes handed to fetch, not a recomputed value.
+    const body = bytes.subarray(range.start, range.end);
+    const put = await fetch(ticket.data.urls[range.partNumber], {
+      method: 'PUT',
+      body,
+      headers: { 'Content-Type': mimeType, Origin: APP },
+    });
+    const putDetail = put.ok ? '' : (await put.text()).slice(0, 200);
+    uploaded.push({ partNumber: range.partNumber, expected: range.size, size: body.length, status: put.status, detail: putDetail });
+    if (!put.ok) throw new Error(`part ${range.partNumber} PUT failed: ${put.status} ${putDetail}`);
+  }
+
+  const status = await adminApi(`/api/admin/media/uploads/${uploadId}/status`);
+  const complete = await adminApi(`/api/admin/media/uploads/${uploadId}/complete`, {
+    method: 'POST',
+    body: JSON.stringify({
+      sha256: hash,
+      width: null,
+      height: null,
+      durationMs: null,
+      thumbnailData: null,
+      compatibility: 'candidate',
+      ...meta,
+      parts: uploaded.map(({ partNumber, size }) => ({ partNumber, size })),
+    }),
+  });
+  if (complete.status !== 201 || !complete.data.media?.id) {
+    throw new Error(`upload complete failed: ${complete.status} ${JSON.stringify(complete.data)}`);
+  }
+  return {
+    uploadId,
+    mediaId: complete.data.media.id,
+    duplicate: complete.data.duplicate === true,
+    hash,
+    uploaded,
+    serverPartition,
+    listedParts: status.data?.parts ?? [],
+    storagePath: complete.data.media.storage_path,
+  };
+}
+
 /* ------------------------------------------------------------------- main */
 
 async function run() {
@@ -389,7 +476,7 @@ async function run() {
     return response.json().catch(() => []);
   };
 
-  const cleanup = { playlistId: null, screenId: null, mediaId: null };
+  const cleanup = { playlistId: null, screenId: null, mediaId: null, extraMediaIds: [] };
   try {
     // 0. storage configuration must be present in the deployment -------------------
     const settings = await adminApi('/api/admin/settings');
@@ -404,28 +491,41 @@ async function run() {
     const image = makeTestPng();
     const mediaHash = sha256(image);
     const fileName = `e2e-media-${Date.now()}.png`;
-    const session = await adminApi('/api/admin/media/uploads', { method: 'POST', body: JSON.stringify({ fileName, fileSize: image.length, mimeType: 'image/png' }) });
-    if (session.status !== 201) throw new Error(`upload session failed: ${session.status} ${JSON.stringify(session.data)}`);
-    const uploadId = session.data.uploadId;
-    const ticket = await adminApi(`/api/admin/media/uploads/${uploadId}/parts`, { method: 'POST', body: JSON.stringify({ partNumbers: [1] }) });
-    if (ticket.status !== 200 || !ticket.data.urls?.[1]) throw new Error(`part presign failed: ${ticket.status} ${JSON.stringify(ticket.data)}`);
-    const putUrl = ticket.data.urls[1];
-    const putResponse = await fetch(putUrl, {
-      method: 'PUT', body: image,
-      headers: { 'Content-Type': 'image/png', Origin: APP },
-    });
-    const putBody = putResponse.ok ? '' : (await putResponse.text()).slice(0, 200);
-    record('A. multipart part upload to signage-media accepted', putResponse.ok,
-      `PUT part -> ${putResponse.status}${putBody ? ` ${putBody}` : ''} access-control-allow-origin=${putResponse.headers.get('access-control-allow-origin') ?? '(none)'}`);
-    const complete = await adminApi(`/api/admin/media/uploads/${uploadId}/complete`, {
-      method: 'POST',
-      body: JSON.stringify({ sha256: mediaHash, width: 64, height: 64, durationMs: null, thumbnailData: null, compatibility: 'candidate' }),
-    });
-    if (complete.status !== 201 || !complete.data.media?.id) throw new Error(`upload complete failed: ${complete.status} ${JSON.stringify(complete.data)}`);
-    const mediaId = complete.data.media.id;
+    const small = await uploadThroughAdminApi(adminApi, image, fileName, 'image/png', { width: 64, height: 64 });
+    const mediaId = small.mediaId;
     cleanup.mediaId = mediaId;
-    record('A. media row created in production DB', complete.data.duplicate !== true && complete.data.media.sha256 === mediaHash,
-      `media=${mediaId} sha256=${String(complete.data.media.sha256).slice(0, 12)}… kind=${complete.data.media.kind}`);
+    record('A. every part PUT was accepted by Storage',
+      small.uploaded.every((part) => part.status === 200 && part.size === part.expected),
+      `file=${image.length}B parts=${small.uploaded.map((part) => `#${part.partNumber}:${part.size}B->${part.status}`).join(', ')} partition=${JSON.stringify(small.serverPartition)}`);
+    record('A. session status reports the uploaded part sizes',
+      small.listedParts.length === small.uploaded.length
+        && small.listedParts.every((part) => part.size === small.uploaded.find((uploaded) => uploaded.partNumber === part.partNumber)?.size),
+      `GET …/status parts=${JSON.stringify(small.listedParts)}`);
+    record('A. finalization accepted the declared part sizes', !small.duplicate && small.storagePath?.startsWith('media/'),
+      `POST …/complete -> 201 media=${mediaId} path=${small.storagePath}`);
+    record('A. media row created in production DB', !small.duplicate && small.hash === mediaHash,
+      `media=${mediaId} sha256=${mediaHash.slice(0, 12)}… size=${image.length}B`);
+
+    // 1b. a file one byte larger than a single part: two parts, the last one only 1 byte.
+    // This is the shape that used to fail finalization with "حجم أحد أجزاء الرفع غير صحيح".
+    if (process.env.E2E_MULTIPART === '0') {
+      skip('A2. two-part upload with a short final part', 'E2E_MULTIPART=0');
+    } else {
+      const png = makeTestPng();
+      const big = Buffer.alloc(UPLOAD_PART_SIZE + 1, 0x5a);
+      png.copy(big, 0);
+      const bigName = `e2e-multipart-${Date.now()}.png`;
+      try {
+        const large = await uploadThroughAdminApi(adminApi, big, bigName, 'image/png');
+        cleanup.extraMediaIds.push(large.mediaId);
+        record('A2. two-part upload with a 1-byte final part finalizes',
+          !large.duplicate && large.uploaded.length === 2
+            && large.uploaded[0].size === UPLOAD_PART_SIZE && large.uploaded[1].size === 1,
+          `file=${big.length}B parts=${large.uploaded.map((part) => `#${part.partNumber}:${part.size}B->${part.status}`).join(', ')} media=${large.mediaId}`);
+      } catch (error) {
+        record('A2. two-part upload with a 1-byte final part finalizes', false, String(error?.message || error).slice(0, 300));
+      }
+    }
 
     // 2. the object really exists in the private bucket ---------------------------
     if (serviceKey) {
@@ -537,6 +637,7 @@ async function run() {
       if (cleanup.screenId) await adminApi(`/api/admin/screens/${cleanup.screenId}`, { method: 'PATCH', body: JSON.stringify({ assignedPlaylistId: null }) }).catch(() => undefined);
       if (cleanup.playlistId) await adminApi(`/api/admin/playlists/${cleanup.playlistId}`, { method: 'DELETE' }).catch(() => undefined);
       if (cleanup.mediaId) await adminApi(`/api/admin/media/${cleanup.mediaId}`, { method: 'DELETE' }).catch(() => undefined);
+      for (const extraId of cleanup.extraMediaIds) await adminApi(`/api/admin/media/${extraId}`, { method: 'DELETE' }).catch(() => undefined);
       if (cleanup.screenId) await adminApi(`/api/admin/screens/${cleanup.screenId}`, { method: 'DELETE' }).catch(() => undefined);
       console.log(`cleanup requested for screen=${cleanup.screenId} playlist=${cleanup.playlistId} media=${cleanup.mediaId}`);
     }

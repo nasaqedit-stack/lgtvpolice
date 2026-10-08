@@ -6,7 +6,7 @@ Environment: Node.js 22.22.3, npm, fake IndexedDB. No Supabase project, object-s
 
 - `npm run lint` — passed.
 - `npm run typecheck` — passed.
-- `npm test` — 19 tests passed.
+- `npm test` — 58 tests passed.
   - Persistent IndexedDB credential/media metadata and Blob reconstruction.
   - Atomic manifest activation rejects incomplete assets and old manifest remains active.
   - Mocked player sync downloads an image/video pair once; an image-only manifest update requests only the new image; old video remains locally cached.
@@ -18,6 +18,65 @@ Environment: Node.js 22.22.3, npm, fake IndexedDB. No Supabase project, object-s
 - `npm audit` — 0 vulnerabilities reported at test time.
 - `npm run build` — passed; `/player` is generated as a static route and API routes are server-rendered.
 - Local HTTP smoke check — `/player`, `/sw.js`, and `/login` returned HTTP 200. This did not exercise a configured login or storage API.
+
+## Multipart part-size defect (2026-10-08)
+
+Production finalization failed for every upload with `409 upload_part_size_invalid`
+(«حجم أحد أجزاء الرفع غير صحيح»).
+
+Root cause — not the client slicing:
+
+- `POST /api/admin/media/uploads/[uploadId]/complete` compared `ListParts().Parts[i].Size`
+  with `Math.min(partSize, fileSize - i * partSize)`.
+- Supabase Storage's S3 protocol handler (`supabase/storage` →
+  `src/storage/protocols/s3/s3-handler.ts#listParts`) serialises only `PartNumber`,
+  `LastModified` and `ETag` per part; it never emits `<Size>`. Its `uploadPart` also never
+  writes `s3_multipart_uploads_parts.size`, so that column keeps its `DEFAULT 0`.
+- Through the AWS SDK the field therefore arrives as `Size === undefined`, so
+  `Number(undefined)` is `NaN` and `NaN !== expected` is always true: the check failed on
+  part number 1 for every file size, including a 2 KiB image (expected 2048, "actual" NaN).
+- The browser side was already correct: `Blob.slice(start, end)` with an exclusive `end` and
+  `Math.min(start + PART_SIZE, file.size)` produced exactly the right bytes for the last,
+  short part.
+
+Fix (validation kept, not removed):
+
+- `lib/shared.ts` now owns the only copy of the partition maths (`UPLOAD_PART_SIZE`,
+  `uploadPartCount`, `uploadPartRange`, `uploadPartSize`); the page, the client uploader and
+  all four upload API routes import it, so the two sides cannot diverge.
+- `lib/client/media-upload.ts` (extracted from the media page) slices through that helper,
+  verifies the Blob length it got back, and reports the length read off the Blob it actually
+  PUT. The page sends that manifest as `parts` on finalization. Bytes still go straight to the
+  signed Storage URL as a Blob PUT — no FormData, nothing routed through Vercel.
+- `verifyUploadParts()` in `lib/server/uploads.ts` requires parts 1..N with an ETag, validates
+  any byte length a store *does* report, validates the declared manifest part by part and its
+  sum against the file size, and the route then re-measures the assembled object with
+  `HeadObject.ContentLength`, which is the store's own count of the bytes that landed.
+  A missing manifest (an admin tab left open across the deploy) falls back to those layers
+  instead of failing.
+- `GET …/status` no longer reports `0` for every landed part (Supabase gives no length), so a
+  resumed upload shows real progress.
+
+Coverage — `tests/media-upload-parts.test.ts` (30 tests):
+
+- The partition for files smaller than one chunk, one byte under, exactly one chunk, one byte
+  over, exactly two chunks, a short final chunk, a three-chunk MP4 and the 2 GiB cap:
+  contiguous, exclusive-end, no gaps or overlaps, sizes summing to the file size.
+- The regression itself: the pre-fix comparison is replayed against a real Supabase-shaped
+  `ListParts` payload and asserted to fail part 1 with expected 2048 / actual NaN, while
+  `verifyUploadParts` accepts the same payload.
+- Validation still bites: a part one byte short, a short final part declared as a full chunk,
+  a missing/duplicated/out-of-range part number, a manifest that does not sum to the file
+  size, a store that reports a wrong size, and a part that never landed.
+- `uploadParts()` driven by real `File`/`Blob` objects with a stubbed `fetch`: the bodies
+  Storage received, reassembled in part order, are byte-for-byte the original image and MP4;
+  a retried part re-derives its offsets instead of reusing a stale range.
+
+`scripts/prod-media-e2e.mjs` now uploads through a shared driver that walks every part and
+declares the real byte length of each one, and adds a two-part upload whose final part is a
+single byte (`UPLOAD_PART_SIZE + 1` bytes, skipped with `E2E_MULTIPART=0`). The workflow runs
+that media stage even when the pairing stage fails, so the media evidence is no longer hidden
+behind an unrelated failure.
 
 ## Production probe (2026-10-07, credential-free)
 
