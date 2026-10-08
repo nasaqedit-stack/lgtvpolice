@@ -18,9 +18,10 @@ export type ListedUploadPart = { PartNumber?: number; Size?: number | null; ETag
 export type DeclaredUploadPart = { partNumber: number; size: number };
 
 function partSizeError(partNumber: number, expected: number, actual: number, source: string) {
+  const reported = Number.isFinite(actual) ? `${actual} بايت` : 'غير مُبلَّغ';
   return new HttpError(
     409,
-    `حجم أحد أجزاء الرفع غير صحيح: الجزء ${partNumber} المتوقع ${expected} بايت، ${source} ${Number.isFinite(actual) ? actual : 'غير مُبلَّغ'} بايت.`,
+    `حجم أحد أجزاء الرفع غير صحيح: الجزء ${partNumber}، المتوقع ${expected} بايت، ${source} ${reported}.`,
     'upload_part_size_invalid',
   );
 }

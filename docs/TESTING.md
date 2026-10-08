@@ -6,7 +6,7 @@ Environment: Node.js 22.22.3, npm, fake IndexedDB. No Supabase project, object-s
 
 - `npm run lint` — passed.
 - `npm run typecheck` — passed.
-- `npm test` — 58 tests passed.
+- `npm test` — 66 tests passed.
   - Persistent IndexedDB credential/media metadata and Blob reconstruction.
   - Atomic manifest activation rejects incomplete assets and old manifest remains active.
   - Mocked player sync downloads an image/video pair once; an image-only manifest update requests only the new image; old video remains locally cached.
@@ -72,6 +72,24 @@ Coverage — `tests/media-upload-parts.test.ts` (30 tests):
   Storage received, reassembled in part order, are byte-for-byte the original image and MP4;
   a retried part re-derives its offsets instead of reusing a stale range.
 
+Integration coverage — `tests/media-upload-finalize.test.ts` (8 tests): the real browser uploader,
+the real Next.js route handlers and the real AWS SDK v3 commands are wired to a fake object store
+that answers exactly like Supabase Storage's S3 protocol (its `ListParts` reply carries
+`PartNumber`/`LastModified`/`ETag` and **no** `<Size>` element). Restoring the pre-fix comparison
+in this harness reproduces the production failure verbatim — `409 upload_part_size_invalid`,
+«حجم أحد أجزاء الرفع غير صحيح», part number 1, expected 2048 for a small PNG and 8388608 for a
+multi-part file — and the fix turns all eight green:
+
+- a 2 KiB image (single part) finalizes, returns a media id, and the assembled bytes equal the file;
+- a 20 MB MP4 (three parts, short final part) finalizes and stores the exact bytes;
+- a file of `UPLOAD_PART_SIZE + 1` bytes finalizes with a 1-byte final part;
+- a resumed session reports real per-part progress instead of zeros;
+- a declared size one byte short is still rejected (`upload_part_size_invalid`, naming part 3);
+- finalizing while a part never landed is still rejected (`upload_incomplete`);
+- a client that sends no manifest still finalizes (backward compatible across the deploy);
+- parts that are the right declared size but the wrong bytes are caught by `HeadObject`
+  (`stored_file_mismatch`), i.e. the store's own measurement of what landed.
+
 `scripts/prod-media-e2e.mjs` now uploads through a shared driver that walks every part and
 declares the real byte length of each one, and adds a two-part upload whose final part is a
 single byte (`UPLOAD_PART_SIZE + 1` bytes, skipped with `E2E_MULTIPART=0`). The workflow runs
@@ -91,6 +109,25 @@ Run on the deployed production origin by the `Production media probe` workflow:
 - No GitHub Actions secrets are configured (`url=yes anon=no serviceKey=no adminCreds=no`), so the
   authenticated A–I checks below report SKIP. The production Supabase URL is discoverable from the
   public bundle; the anon/service keys are not.
+
+## Production run after the fix (2026-10-08)
+
+Merged as `6b0d7c5`; the Vercel Production deployment of that commit reports
+`Deployment has completed` (state `success`). The `Production pairing E2E` workflow then ran
+against that deployment. Its media stage is no longer skipped when the pairing stage fails, and it
+confirmed from a GitHub runner:
+
+- `https://lgtvpolice.vercel.app/login` and `/player` answer HTTP 200 (the deployment is live);
+- the storage endpoint serves the S3 protocol (`403 AccessDenied` with an S3 XML body for an
+  unsigned object read);
+- CORS preflight from the app origin allows `PUT` (`access-control-allow-origin: *`), so a browser
+  Blob PUT of each part is permitted.
+
+The authenticated checks (A–G), which include the real image upload, still report `SKIP`:
+`resolved: url=yes anon=no serviceKey=no adminCreds=no`. Neither `ADMIN_EMAIL`/`ADMIN_PASSWORD`
+nor `SUPABASE_SERVICE_ROLE_KEY` exists as a repository or "Production" environment secret, so no CI
+run can log in as an admin. A real production upload therefore still has to be performed either by
+an administrator in the browser at `/media`, or by a workflow run after those secrets are added.
 
 ## Production harness (needs credentials)
 
