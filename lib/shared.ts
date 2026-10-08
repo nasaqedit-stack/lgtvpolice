@@ -41,7 +41,16 @@ export type ScreenManifest = {
   playlists: PlaylistSnapshot[];
   schedules: ScheduleRule[];
   assets: Array<{ mediaId: string; hash: string; size: number; mimeType: string; name: string }>;
-  commands: { syncVersion: number; reloadVersion: number };
+  commands: {
+    syncVersion: number;
+    reloadVersion: number;
+    /**
+     * The versions the server has already seen ACKnowledged by this screen. Echoed on every
+     * manifest so a television that lost its local store cannot re-execute a command it already
+     * ran. Absent on manifests generated before the field existed.
+     */
+    applied?: { syncVersion: number; reloadVersion: number };
+  };
 };
 
 export type CachedManifest = Omit<ScreenManifest, 'manifestHash' | 'generatedAt'> & {

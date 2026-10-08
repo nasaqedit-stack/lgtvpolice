@@ -2,7 +2,7 @@
  * Standalone player shell for /player.
  *
  * This module is the entire server-side contribution to the TV player: one static HTML document
- * with inline compatibility-safe CSS, an inline ES5 boot guard and three classic script tags.
+ * with inline compatibility-safe CSS, an inline ES5 boot guard and four classic script tags.
  * It deliberately pulls in NO React, NO Next.js client runtime, NO module script, NO nomodule
  * script and NO modern CSS (no grid, no gap, no CSS variables, no min()/max()/clamp()).
  *
@@ -15,9 +15,9 @@
  *   2. `window.__signageGuard` shows a diagnostic and retries missing assets automatically without
  *      requiring a remote-control action or reloading the page.
  */
-export const PLAYER_VERSION = '2.2.0-5';
+export const PLAYER_VERSION = '3.0.0-1';
 
-export const PLAYER_ASSETS = ['/player/sha256.js', '/player/runtime.js', '/player/player.js'] as const;
+export const PLAYER_ASSETS = ['/player/sha256.js', '/player/runtime.js', '/player/watchdog.js', '/player/player.js'] as const;
 
 const STYLES = `
 * { box-sizing: border-box; }
@@ -106,6 +106,7 @@ const GUARD_SCRIPT = `
   function nextMissingScript() {
     if (!w.SignageSha256) return '/player/sha256.js';
     if (!w.SignagePlayerRuntime) return '/player/runtime.js';
+    if (!w.SignageWatchdog) return '/player/watchdog.js';
     if (!w.SignagePlayerUI) return '/player/player.js';
     return '/player/player.js';
   }
@@ -140,6 +141,7 @@ const GUARD_SCRIPT = `
       details.push('Chromium: ' + chromiumVersion());
       details.push('sha256.js: ' + (w.SignageSha256 ? 'loaded' : 'missing'));
       details.push('runtime.js: ' + (w.SignagePlayerRuntime ? 'loaded' : 'missing'));
+      details.push('watchdog.js: ' + (w.SignageWatchdog ? 'loaded' : 'missing'));
       details.push('player.js: ' + (w.SignagePlayerUI ? 'loaded' : 'missing'));
       details.push('indexedDB: ' + (w.indexedDB ? 'yes' : 'no') + ' / fetch: ' + (w.fetch ? 'yes' : 'no') +
         ' / XMLHttpRequest: ' + (w.XMLHttpRequest ? 'yes' : 'no') + ' / Promise: ' + (w.Promise ? 'yes' : 'no'));
@@ -230,6 +232,7 @@ export function renderPlayerShell(): string {
 <script>${GUARD_SCRIPT}</script>
 ${onErrorTag('/player/sha256.js', 'sha256.js')}
 ${onErrorTag('/player/runtime.js', 'runtime.js')}
+${onErrorTag('/player/watchdog.js', 'watchdog.js')}
 ${onErrorTag('/player/player.js', 'player.js')}
 </body>
 </html>

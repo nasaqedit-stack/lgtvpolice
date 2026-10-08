@@ -44,9 +44,18 @@ export type VirtualClock = {
 };
 
 export function installClock(win: any): VirtualClock {
+  const origin = Date.now();
   let now = 0;
   let sequence = 1;
   const timers = new Map<number, { at: number; fn: () => void; interval?: number }>();
+  // The player (and its watchdog) schedule with Date.now() as well as with timers. `advance()` must
+  // therefore move BOTH clocks, otherwise absolute deadlines would stay in the real-time future and
+  // the television would appear frozen for the whole virtual run.
+  try {
+    win.Date.now = () => origin + now;
+  } catch {
+    /* some windows refuse to redefine Date.now; the timer queue still drives the player */
+  }
 
   win.setTimeout = (fn: () => void, ms?: number) => {
     const id = sequence;
@@ -508,6 +517,7 @@ export function createPage(options: PageOptions = {}): FakePage {
   if (!options.skipScripts) {
     win.eval(readPlayerScript('sha256.js'));
     win.eval(readPlayerScript('runtime.js'));
+    win.eval(readPlayerScript('watchdog.js'));
     win.eval(readPlayerScript('player.js'));
     runtime = win.SignagePlayerRuntime;
     ui = win.SignagePlayerUI;

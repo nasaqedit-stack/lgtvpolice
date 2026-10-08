@@ -3,10 +3,10 @@ import { GetObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { errorResponse, HttpError, requireAdmin } from '@/lib/server/http';
 import { getS3Client, storageConfig } from '@/lib/server/storage';
+import { deriveScreenHealth, isScreenOnline } from '@/lib/server/screen-health';
 
 export const runtime = 'nodejs';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const ONLINE_WINDOW_MS = 5 * 60_000;
 
 export async function GET(request: NextRequest) {
   try {
@@ -15,7 +15,7 @@ export async function GET(request: NextRequest) {
     if (!UUID.test(screenId)) throw new HttpError(400, 'معرّف الشاشة غير صالح.', 'validation_error');
 
     const { data: screen, error } = await db.from('screens')
-      .select('id,name,enabled,last_seen_at,last_sync_at,last_sync_status,last_sync_error,current_playlist_id,current_playlist_version,current_item_id,cached_media_count')
+      .select('*')
       .eq('id', screenId).maybeSingle();
     if (error) throw error;
     if (!screen) throw new HttpError(404, 'الشاشة غير موجودة.', 'not_found');
@@ -49,13 +49,16 @@ export async function GET(request: NextRequest) {
       const config = storageConfig();
       previewUrl = await getSignedUrl(getS3Client(), new GetObjectCommand({ Bucket: config.bucket, Key: media.storage_path }), { expiresIn: 5 * 60 });
     }
-    const lastSeenAt = screen.last_seen_at as string | null;
-    const online = Boolean(screen.enabled && lastSeenAt && Date.now() - new Date(lastSeenAt).getTime() < ONLINE_WINDOW_MS);
+    const health = deriveScreenHealth(screen, Date.now());
+    const lastSeenAt = health.lastHeartbeatAt;
+    // Online only when the screen is enabled AND its last authenticated heartbeat is recent.
+    const online = Boolean(screen.enabled) && isScreenOnline(health);
     return NextResponse.json({
       screen: { id: screen.id, name: screen.name, enabled: screen.enabled },
       online,
+      health,
       lastSeenAt,
-      lastSyncAt: screen.last_sync_at,
+      lastSyncAt: health.lastSyncAt,
       syncStatus: online && screen.last_sync_status === 'syncing' ? 'syncing' : (screen.last_sync_status ?? 'never'),
       syncError: screen.last_sync_error,
       currentItemId: screen.current_item_id,

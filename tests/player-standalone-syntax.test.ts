@@ -13,7 +13,7 @@ import { GET as getPlayerRoute } from '../app/player/route';
 import { PLAYER_ASSETS, PLAYER_VERSION, renderPlayerShell } from '../lib/player/standalone/shell';
 
 const PLAYER_DIR = path.join(process.cwd(), 'public', 'player');
-const SCRIPT_FILES = ['sha256.js', 'runtime.js', 'player.js'] as const;
+const SCRIPT_FILES = ['sha256.js', 'runtime.js', 'watchdog.js', 'player.js'] as const;
 
 function readScript(name: string): string {
   return readFileSync(path.join(PLAYER_DIR, name), 'utf8');
@@ -245,7 +245,7 @@ describe('the optional offline shell (service worker)', () => {
   const sw = readFileSync(path.join(process.cwd(), 'public', 'sw.js'), 'utf8');
 
   it('never touches APIs, storage URLs or older shell caches', () => {
-    expect(sw).toContain("signage-player-shell-v6");
+    expect(sw).toContain("signage-player-shell-v7");
     expect(sw).toContain("name.startsWith('signage-player-shell-')");
     expect(sw).toContain("url.pathname.startsWith('/api/')");
     expect(sw).toContain("url.pathname.startsWith('/storage/')");
