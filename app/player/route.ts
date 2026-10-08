@@ -19,7 +19,11 @@ export function GET() {
     status: 200,
     headers: {
       'Content-Type': 'text/html; charset=utf-8',
-      'Cache-Control': 'public, max-age=0, must-revalidate',
+      // A fresh deployment must reach the television quickly (max-age is short and the browser
+      // revalidates), but a television that reboots while offline must still be able to load the
+      // player: webOS 3.5 has no service worker, so `stale-if-error` is what keeps the shell
+      // available and lets the cached media in IndexedDB keep playing.
+      'Cache-Control': 'public, max-age=300, stale-if-error=604800',
     },
   });
 }

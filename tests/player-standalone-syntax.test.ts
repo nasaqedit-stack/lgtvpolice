@@ -9,6 +9,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import * as acorn from 'acorn';
 import { describe, expect, it } from 'vitest';
+import { GET as getPlayerRoute } from '../app/player/route';
 import { PLAYER_ASSETS, PLAYER_VERSION, renderPlayerShell } from '../lib/player/standalone/shell';
 
 const PLAYER_DIR = path.join(process.cwd(), 'public', 'player');
@@ -243,5 +244,28 @@ describe('the optional offline shell (service worker)', () => {
     expect(html).toContain("serviceWorker.register('/sw.js'");
     expect(html).toContain('} catch (e) { }');
     expect(html).not.toContain('navigator.serviceWorker.register(/sw.js'); // never unconditional
+  });
+});
+
+describe('the /player route response', () => {
+  it('serves the shell document as HTML with a TV-friendly cache policy', async () => {
+    const response = getPlayerRoute();
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toBe('text/html; charset=utf-8');
+    const cacheControl = response.headers.get('cache-control') || '';
+    expect(cacheControl).toContain('max-age=300');
+    expect(cacheControl).toContain('stale-if-error=604800');
+    const body = await response.text();
+    expect(body).toContain('/player/runtime.js?v=' + PLAYER_VERSION);
+    expect(body).toContain('مشغل الشاشة غير متوافق مع إصدار المتصفح الحالي');
+  });
+
+  it('never removes the security headers the rest of the site relies on', () => {
+    // The route only sets content type and cache policy: next.config.ts keeps adding the global
+    // security headers (HSTS, nosniff, frame options) to every response including this one.
+    const config = readFileSync(path.join(process.cwd(), 'next.config.ts'), 'utf8');
+    expect(config).toContain("key: 'X-Content-Type-Options'");
+    expect(config).toContain("key: 'Strict-Transport-Security'");
+    expect(config).toContain("source: '/:path*'");
   });
 });
