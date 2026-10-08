@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
 import { errorResponse, HttpError, requireAdmin, readJson } from '@/lib/server/http';
 import { issuePairingCode } from '@/lib/server/pairing';
+import { deriveScreenHealth, isScreenOnline } from '@/lib/server/screen-health';
 
 export const runtime = 'nodejs';
 
@@ -24,11 +25,14 @@ export async function GET(request: NextRequest) {
     const credentialSet = new Set((credentials ?? []).map((c: any) => c.screen_id));
     const now = Date.now();
     return NextResponse.json({ screens: (screens ?? []).map((screen: any) => {
-      const seenAt = screen.last_seen_at ? new Date(screen.last_seen_at).getTime() : 0;
+      const health = deriveScreenHealth(screen, now);
       const playlist = screen.assigned_playlist_id ? playlistMap.get(screen.assigned_playlist_id) : null;
       return {
         ...screen,
-        online: Boolean(screen.enabled) && seenAt > 0 && now - seenAt < 5 * 60_000,
+        // Online is derived from a recent AUTHENTICATED heartbeat, never from the row existing or
+        // from a client claim. A disabled screen is never reported online.
+        online: Boolean(screen.enabled) && isScreenOnline(health),
+        health,
         pairingStatus: credentialSet.has(screen.id) ? 'paired' : 'not_paired',
         assignedPlaylist: playlist ?? null,
       };

@@ -1,15 +1,15 @@
 /* Optional offline shell for the signage player.
  *
- * The player NEVER depends on this worker: media lives in IndexedDB, the runtime is three classic
+ * The player NEVER depends on this worker: media lives in IndexedDB, the runtime is four classic
  * scripts, and everything works when no service worker exists (webOS 3.5 has none at all).
  *
  * When a modern browser does register it, it only ever caches the /player shell document and the
  * three player scripts, and navigations are network-first so a new deployment always reaches the
  * television. APIs, storage URLs and signed media URLs are never cached here.
  */
-const CACHE_NAME = 'signage-player-shell-v6';
+const CACHE_NAME = 'signage-player-shell-v7';
 const SHELL_PATH = '/player';
-const PLAYER_ASSETS = ['/player/sha256.js', '/player/runtime.js', '/player/player.js'];
+const PLAYER_ASSETS = ['/player/sha256.js', '/player/runtime.js', '/player/watchdog.js', '/player/player.js'];
 
 self.addEventListener('install', event => {
   event.waitUntil((async () => {

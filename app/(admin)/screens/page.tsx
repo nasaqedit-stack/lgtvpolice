@@ -86,7 +86,7 @@ export default function ScreensPage() {
       <table><thead><tr><th>الشاشة</th><th>الاتصال / الاقتران</th><th>القائمة الحالية</th><th>المزامنة</th><th>إجراءات</th></tr></thead><tbody>
         {screens.map(screen => <tr key={screen.id}>
           <td><span className="table-name">{screen.name}</span><span className="table-sub">{screen.id.slice(0, 8)} · {screen.device_info?.platform ?? 'متصفح'}</span></td>
-          <td><Badge tone={screen.online ? 'online' : 'offline'}>{screen.online ? 'متصلة' : 'غير متصلة'}</Badge><span className="table-sub">{screen.pairingStatus === 'paired' ? 'مقترنة' : 'بانتظار الاقتران'} · {screen.last_seen_at ? new Date(screen.last_seen_at).toLocaleString('ar-SA') : 'لم تتصل بعد'}</span></td>
+          <td><Badge tone={healthTone(screen)}>{healthLabel(screen)}</Badge><span className="table-sub">{screen.pairingStatus === 'paired' ? 'مقترنة' : 'بانتظار الاقتران'} · {heartbeatLabel(screen)}</span>{screen.health?.pendingCommands > 0 && <span className="table-sub">{screen.health.pendingCommands} أمر بانتظار التنفيذ</span>}{screen.health?.recovery?.count > 0 && <span className="table-sub">تعافٍ تلقائي ×{screen.health.recovery.count}{screen.health.recovery.reason ? ` · ${screen.health.recovery.reason}` : ''}</span>}</td>
           <td><select aria-label={`قائمة تشغيل ${screen.name}`} value={screen.assigned_playlist_id ?? ''} disabled={busyId === screen.id} onChange={e => void update(screen, { assignedPlaylistId: e.target.value || null })} style={{ minWidth: 150, minHeight: 34, border: '1px solid var(--line)', borderRadius: 8, padding: '4px 7px' }}>
             <option value="">غير معيّنة</option>{playlists.filter((p: any) => p.enabled && p.published_version).map((playlist: any) => <option key={playlist.id} value={playlist.id}>{playlist.name}</option>)}
           </select><span className="table-sub">{screen.assigned_playlist_id ? '' : 'بدون تعيين: تُعرض الجدولة أو أحدث قائمة منشورة · '}{screen.current_playlist_version ? `الإصدار ${screen.current_playlist_version}` : '—'} · {screen.cached_media_count ?? 0} ملف محلي</span></td>
@@ -119,3 +119,40 @@ export default function ScreensPage() {
   </div>;
 }
 function syncLabel(status: string) { return status === 'ready' ? 'جاهزة' : status === 'syncing' ? 'تزامن' : status === 'failed' ? 'تعذر' : 'لم تتم'; }
+
+/*
+ * The dashboard shows the state the SERVER derived from the last authenticated heartbeat — never a
+ * value the television claimed for itself. Anything worse than ONLINE is named, because
+ * "connected" and "healthy" stopped being the same thing the moment the player stopped answering.
+ */
+const HEALTH_LABELS: Record<string, string> = {
+  online: 'متصلة',
+  degraded: 'اتصال ضعيف',
+  reconnecting: 'إعادة اتصال',
+  recovering: 'تعافٍ تلقائي',
+  stale: 'لم تؤكد اتصالها',
+  offline: 'غير متصلة',
+  auth_error: 'خطأ اعتماد',
+  config_error: 'خطأ إعداد',
+};
+function healthLabel(screen: any) {
+  if (!screen.enabled) return 'معطّلة';
+  const status = screen.health?.status || 'offline';
+  return HEALTH_LABELS[status] ?? HEALTH_LABELS.offline;
+}
+function healthTone(screen: any): 'online' | 'offline' | 'pending' | 'failed' | 'neutral' {
+  if (!screen.enabled) return 'neutral';
+  const status = screen.health?.status || 'offline';
+  if (status === 'online') return 'online';
+  if (status === 'auth_error' || status === 'config_error' || status === 'offline') return 'failed';
+  return 'pending';
+}
+function heartbeatLabel(screen: any) {
+  if (screen.health?.neverConnected) return 'لم تتصل بعد';
+  const age = screen.health?.heartbeatAgeMs;
+  if (typeof age !== 'number') return 'لم تتصل بعد';
+  if (age < 60_000) return `أكدت اتصالها قبل ${Math.max(1, Math.round(age / 1000))} ثانية`;
+  if (age < 3_600_000) return `أكدت اتصالها قبل ${Math.round(age / 60_000)} دقيقة`;
+  if (age < 86_400_000) return `أكدت اتصالها قبل ${Math.round(age / 3_600_000)} ساعة`;
+  return `أكدت اتصالها قبل ${Math.round(age / 86_400_000)} يوم`;
+}

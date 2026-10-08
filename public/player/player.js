@@ -53,6 +53,14 @@
     supported: 'متوفر',
     unsupported: 'غير متوفر',
     statusLabel: 'الحالة',
+    connectionLabel: 'الاتصال والاستعادة التلقائية',
+    watchdogLabel: 'حالة المشغل',
+    lastHeartbeatLabel: 'آخر نبضة مؤكدة',
+    lastApiLabel: 'آخر اتصال ناجح',
+    appliedCommandLabel: 'الأوامر المطبقة',
+    recoveryLabel: 'الاستعادة',
+    healthLabel: 'فحص الحالة',
+    neverLabel: 'لم يحدث',
     storageLabel: 'التخزين',
     cachedLabel: 'وسائط محفوظة محلياً',
     lastSyncLabel: 'آخر مزامنة',
@@ -71,7 +79,6 @@
     playbackLabel: 'العرض',
     playbackFromCache: 'يعرض من التخزين المحلي',
     playbackIdle: 'لا يوجد وسيط معروض الآن',
-    recoveryLabel: 'الاستعادة'
   };
 
   function createElement(doc, tag, className, text) {
@@ -124,6 +131,7 @@
     var storageFactory = options.createStorage || runtime.createStorage;
     var syncFactory = options.createSync || runtime.createSync;
     var engineFactory = options.createEngine || runtime.createEngine;
+    var watchdogFactory = options.watchdog || root.SignageWatchdog || null;
     var P = runtime.resolvePromise(options.Promise, win);
 
     var caps = runtime.detectCapabilities(win);
@@ -163,31 +171,42 @@
     var http = null;
     var sync = null;
     var engine = null;
+    var watchdog = null;
     var syncLock = false;
     var heartbeatLock = false;
-    var syncTimer = null;
-    var heartbeatTimer = null;
-    var scheduleTimer = null;
-    var watchdogTimer = null;
-    var reloadVersion = 0;
-    // A page reload is the last-resort recovery only: it is rate limited and its timestamp is
-    // persisted, so a broken television can never end up in a reload loop.
-    var RECOVERY_WINDOW_MS = 600000;
-    var WATCHDOG_INTERVAL_MS = 15000;
-    var recoveryBlockedUntil = 0;
-    var reloadInFlight = false;
-    var watchdogRecoveryFailures = 0;
-    var watchdogReloadTimer = null;
     var syncFailures = 0;
     var syncBackoffMs = 0;
-    var lastSyncAttemptAt = 0;
     var heartbeatFailures = 0;
     var heartbeatBackoffMs = 0;
-    var heartbeatRetryRequested = false;
+    // A page reload is the last-resort recovery only: it is rate limited in memory, on disk and by
+    // the central watchdog, so a broken television can never end up in a reload loop.
+    var RECOVERY_WINDOW_MS = 600000;
+    var recoveryBlockedUntil = 0;
+    var reloadInFlight = false;
+    // Command acknowledgement. Loaded during boot BEFORE the first synchronization can apply a
+    // command, which is what makes "the same command must never run twice" true across reloads.
+    var appliedSyncVersion = 0;
+    var appliedReloadVersion = 0;
+    var bootAt = new Date().toISOString();
+    var recoveryMeta = { count: 0, lastAt: null, reason: '', state: '', reloads: 0, reinits: 0 };
+    var pendingCommandSync = 0;
 
     function record(event, data) {
       log.push({ event: event, data: data || null, at: Date.now() });
-      if (log.length > 200) log.shift();
+      if (log.length > 500) log.shift();
+    }
+
+    /**
+     * Every watchdog call is optional: the television must keep playing even if watchdog.js did not
+     * load. Nothing here is allowed to throw into the playback path.
+     */
+    function wd(name, args) {
+      if (!watchdog || typeof watchdog[name] !== 'function') return undefined;
+      try { return watchdog[name].apply(watchdog, args || []); }
+      catch (error) {
+        record('watchdog_call_failed', { action: name, message: runtime.message(error, 'unknown').slice(0, 160) });
+        return undefined;
+      }
     }
 
     function diagnosticInfo() {
@@ -359,6 +378,31 @@
       var notes = (storage && storage.notes) || [];
       for (var n = 0; n < notes.length; n += 1) statusList.appendChild(createElement(doc, 'div', 'sp-row', TEXTS.notesLabel + ': ' + notes[n]));
       box.appendChild(statusList);
+
+      // Connection and self-healing state. Everything here is derived from real server
+      // communication; navigator.onLine is never used as evidence.
+      box.appendChild(createElement(doc, 'h2', null, TEXTS.connectionLabel));
+      var healthList = createElement(doc, 'div', 'sp-list');
+      var watch = wd('snapshot', []) || {};
+      function ago(value) {
+        if (!value) return TEXTS.neverLabel;
+        var seconds = Math.max(0, Math.round((Date.now() - Number(value)) / 1000));
+        if (seconds < 60) return seconds + ' ثانية';
+        if (seconds < 3600) return Math.round(seconds / 60) + ' دقيقة';
+        return Math.round(seconds / 3600) + ' ساعة';
+      }
+      healthList.appendChild(createElement(doc, 'div', 'sp-row', TEXTS.watchdogLabel + ': ' + (watch.state || 'boot')));
+      healthList.appendChild(createElement(doc, 'div', 'sp-row', TEXTS.lastHeartbeatLabel + ': ' + ago(watch.lastHeartbeatAt)));
+      healthList.appendChild(createElement(doc, 'div', 'sp-row', TEXTS.lastApiLabel + ': ' + ago(watch.lastApiSuccessAt)));
+      healthList.appendChild(createElement(doc, 'div', 'sp-row sp-mono', TEXTS.appliedCommandLabel + ': sync ' + appliedSyncVersion + ' · reload ' + appliedReloadVersion));
+      healthList.appendChild(createElement(doc, 'div', 'sp-row', TEXTS.recoveryLabel + ': ' + (Number(watch.recoveryCount) || 0)
+        + (watch.lastRecoveryReason ? ' · ' + watch.lastRecoveryReason : '') + ' · ' + ago(watch.lastRecoveryAt)));
+      healthList.appendChild(createElement(doc, 'div', 'sp-row sp-mono', 'failures: ' + (Number(watch.consecutiveFailures) || 0)
+        + ' · reinits: ' + (Number(watch.runtimeReinits) || 0) + ' · reloads: ' + (Number(watch.reloads) || 0)));
+      if (watch.healthStatus) {
+        healthList.appendChild(createElement(doc, 'div', 'sp-row sp-mono', TEXTS.healthLabel + ': ' + watch.healthStatus + ' · ' + ago(watch.healthCheckedAt)));
+      }
+      box.appendChild(healthList);
 
       box.appendChild(createElement(doc, 'h2', null, TEXTS.eventsLabel));
       var events = createElement(doc, 'div', 'sp-list sp-log');
@@ -556,6 +600,10 @@
       if (engine) {
         try { engine.stop(); } catch (error) { /* a stop failure must not block re-attachment */ }
       }
+      // The watchdog must learn about the credential here and nowhere else: a television that pairs
+      // AFTER boot (fresh pairing, credential re-issued by the server) would otherwise never beat,
+      // because the watchdog would still believe there is nothing to authenticate with.
+      wd('setHasCredential', [Boolean(token && http)]);
       sync = token && http ? syncFactory(syncOptions(token)) : null;
       engine = engineFactory({
         win: win,
@@ -576,11 +624,17 @@
         onItem: function () {
           state.playing = true;
           if (state.phase !== 'syncing') state.phase = 'playing';
+          wd('markProgress', []);
           paint();
         },
-        onProgress: persistPlaybackState,
+        onProgress: function (info) {
+          persistPlaybackState(info);
+          // Proof of life for the application watchdog: the runtime is still advancing.
+          wd('markProgress', []);
+        },
         onRecoveryExhausted: function (info) {
           record('recovery_exhausted', info || null);
+          wd('noteError', ['playback_recovery_exhausted']);
           if (engine && isFn(engine.advance)) engine.advance();
         }
       });
@@ -597,6 +651,170 @@
       }
       paint();
       return engine;
+    }
+
+    /* ------------------------------------------------------------------ watchdog ----------------*/
+
+    /** Is the stage showing (or about to show) something? Empty is only a fault when it should. */
+    function runtimeStatus() {
+      var playable = hasPlayableContent();
+      if (!engine || !state.manifest || !playable) {
+        // Nothing is supposed to be on screen: an empty stage is not an application failure.
+        return { healthy: true, hasLocal: false, playable: playable };
+      }
+      var visible = false;
+      try { visible = engineStageVisible(); } catch (error) { visible = false; }
+      var hasLocal = false;
+      try { hasLocal = isFn(engine.hasLocalMedia) ? Boolean(engine.hasLocalMedia()) : false; } catch (error) { hasLocal = false; }
+      return { healthy: visible, hasLocal: hasLocal, playable: true };
+    }
+
+    /**
+     * Rebuilds the runtime in place. This is the rung below a controlled page reload and above a
+     * plain retry: it never blanks a screen that is currently showing cached media.
+     */
+    function reinitRuntime(reason) {
+      record('runtime_reinit', { reason: String(reason || 'unknown').slice(0, 60) });
+      try {
+        // Rebuild the transport: a wedged XHR/fetch stack cannot be repaired any other way.
+        http = httpFactory(win, { Promise: P, log: record, transport: win.__SIGNAGE_TRANSPORT__ || null });
+      } catch (error) {
+        http = null;
+        record('runtime_reinit_http_failed', { message: runtime.message(error, 'unknown').slice(0, 160) });
+      }
+      if (!engine) { attachEngine(state.token); return; }
+      try { if (isFn(engine.ensurePlaying)) engine.ensurePlaying(); } catch (error) { record('runtime_reinit_ensure_failed', { message: runtime.message(error, 'unknown').slice(0, 160) }); }
+      if (reason === 'watchdog_empty_stage' || reason === 'watchdog_runtime_unrecoverable') {
+        // The stage is empty although local media exists: re-arm the local playlist.
+        if (isFn(engine.recover)) engine.recover(reason);
+        else engine.render();
+      } else {
+        try { engine.render(); } catch (error) { record('runtime_reinit_render_failed', { message: runtime.message(error, 'unknown').slice(0, 160) }); }
+      }
+      syncLock = false;
+      heartbeatLock = false;
+    }
+
+    /** Drops anything that can no longer succeed: locks and the transport that owns pending calls. */
+    function abortStale(reason) {
+      record('abort_stale', { reason: String(reason || 'unknown').slice(0, 60) });
+      syncLock = false;
+      heartbeatLock = false;
+      try {
+        http = httpFactory(win, { Promise: P, log: record, transport: win.__SIGNAGE_TRANSPORT__ || null });
+      } catch (error) { record('abort_stale_http_failed', { message: runtime.message(error, 'unknown').slice(0, 160) }); }
+    }
+
+    function resetBeatLock(reason) {
+      heartbeatLock = false;
+      record('beat_lock_released', { reason: String(reason || 'unknown').slice(0, 60) });
+    }
+    function resetSyncLock(reason) {
+      syncLock = false;
+      record('sync_lock_released', { reason: String(reason || 'unknown').slice(0, 60) });
+    }
+
+    /**
+     * The daily (and first-startup) self-check. It verifies the whole chain the administrator cares
+     * about and reports one safe operational code. It never touches the picture.
+     */
+    function healthCheck(when) {
+      var problems = [];
+      if (!storage) problems.push('no_storage');
+      if (!state.token) problems.push('no_credential');
+      if (!http) problems.push('no_transport');
+      if (!state.manifest) problems.push('no_manifest');
+      else if (!hasPlayableContent()) problems.push('no_content');
+      if (snapRecoveryState() === 'auth_error') problems.push('auth_error');
+      if (snapRecoveryState() === 'config_error') problems.push('config_error');
+      var snap = wd('snapshot', []) || {};
+      if (snap.lastHeartbeatAt && Date.now() - snap.lastHeartbeatAt > 5 * 60 * 1000) problems.push('heartbeat_stale');
+      if (snap.consecutiveFailures > 0) problems.push('pending_failures');
+      if (pendingCommandSync > 0) problems.push('command_pending');
+      if (!runtimeStatus().healthy) problems.push('stage_empty');
+      if (storage && storage.backend === 'memory') problems.push('volatile_storage');
+      var status = problems.length ? 'degraded:' + problems.slice(0, 6).join(',') : 'ok';
+      wd('setHealthStatus', [status]);
+      record('health_check', { when: String(when || 'scheduled'), status: status });
+      if (problems.length) {
+        // A degraded self-check is a legitimate reason to prove connectivity again right now.
+        wd('requestRecovery', ['health_check_' + problems[0]]);
+      }
+      return status;
+    }
+
+    function snapRecoveryState() {
+      var snap = wd('snapshot', []) || {};
+      return snap.state || 'boot';
+    }
+
+    function persistRecoveryMeta(reason) {
+      if (!storage || !isFn(storage.setRecoveryMeta)) return;
+      var snap = wd('snapshot', []) || {};
+      recoveryMeta = {
+        count: Number(snap.recoveryCount) || 0,
+        lastAt: snap.lastRecoveryAt ? new Date(snap.lastRecoveryAt).toISOString() : null,
+        reason: String(reason || snap.lastRecoveryReason || '').slice(0, 60),
+        state: String(snap.state || '').slice(0, 40),
+        reloads: Number(snap.reloads) || 0,
+        reinits: Number(snap.runtimeReinits) || 0
+      };
+      try { storage.setRecoveryMeta(recoveryMeta); } catch (error) { record('recovery_meta_failed', { message: runtime.message(error, 'unknown').slice(0, 160) }); }
+    }
+
+    function persistCommandState() {
+      if (!storage || !isFn(storage.setCommandState)) return;
+      try { storage.setCommandState({ appliedSyncVersion: appliedSyncVersion, appliedReloadVersion: appliedReloadVersion }); }
+      catch (error) { record('command_state_persist_failed', { message: runtime.message(error, 'unknown').slice(0, 160) }); }
+    }
+
+    function setupWatchdog() {
+      if (!watchdogFactory || !isFn(watchdogFactory.create)) {
+        record('watchdog_missing', null);
+        return false;
+      }
+      try {
+        watchdog = watchdogFactory.create({
+          win: win,
+          log: record,
+          timing: options.watchdogTiming || null,
+          actions: {
+            beat: function (reason) {
+              try { heartbeat(reason); }
+              catch (error) { heartbeatFailed(0, runtime.errorCode(error)); }
+            },
+            sync: function (reason) {
+              if (!state.token) { wd('scheduleSync', [60000]); return; }
+              performSync(state.token).then(null, function () { wd('noteSyncFailure', ['sync_internal_error']); });
+            },
+            housekeeping: function () {
+              try { tickSchedule(); } catch (error) { record('schedule_failed', { message: runtime.message(error, 'unknown') }); }
+              ensurePlaybackAlive();
+            },
+            runtimeStatus: runtimeStatus,
+            reinitRuntime: reinitRuntime,
+            abortStale: abortStale,
+            resetBeat: resetBeatLock,
+            resetSync: resetSyncLock,
+            reload: function (reason) { return reloadNow(reason); },
+            healthCheck: healthCheck,
+            onResume: function (reason) { restorePlayback(reason); },
+            onState: function (next, previous, snapshot) {
+              record('player_state', { state: next, from: previous, failures: snapshot.consecutiveFailures });
+              // The status line is the only visible surface; it never covers media.
+              if (state.playing) renderStatusBar();
+              if (next === 'recovering' || next === 'controlled_reload') persistRecoveryMeta(snapshot.lastRecoveryReason || next);
+            }
+          }
+        });
+      } catch (error) {
+        watchdog = null;
+        record('watchdog_init_failed', { message: runtime.message(error, 'unknown').slice(0, 160) });
+        return false;
+      }
+      watchdog.start();
+      record('watchdog_started', { version: watchdogFactory.STATES ? 'ok' : 'unknown' });
+      return true;
     }
 
     /* ------------------------------------------------------------------ sync ---------------------*/
@@ -620,22 +838,95 @@
       if (playable) state.phase = 'playing';
       state.message = '';
       paint();
-      var requested = manifest.commands && Number(manifest.commands.reloadVersion);
-      if (requested && requested > reloadVersion) {
-        reloadVersion = requested;
-        return storage.setSeenReloadVersion(requested).then(function () {
-          // A remote refresh may update/repaint local state, but it must never unload cached
-          // playback. This also consumes the version so an older television does not loop it.
-          record('reload_command_softened', { version: requested });
+      return applyCommands(manifest);
+    }
+
+    /**
+     * Command versioning and acknowledgement.
+     *
+     * The server is authoritative: `manifest.commands` carries the latest `syncVersion` and
+     * `reloadVersion`. The player compares them with the versions it has ALREADY applied (persisted
+     * locally, restored during boot) and:
+     *
+     *   - applies only strictly newer versions,
+     *   - persists + ACKs the version after the command was actually executed,
+     *   - never re-runs a version it has already acknowledged after a reconnect or a reload.
+     *
+     * An obsolete command is skipped, not queued: when a newer state supersedes it, running the old
+     * one would be wrong. The player always converges on the LATEST authoritative state.
+     */
+    function applyCommands(manifest) {
+      var commands = (manifest && manifest.commands) || null;
+      if (!commands || !storage) return null;
+      var wantedSync = Number(commands.syncVersion) || 0;
+      var wantedReload = Number(commands.reloadVersion) || 0;
+      // The server echoes back the versions it has already seen ACKnowledged by this screen through
+      // an authenticated heartbeat. Adopting them is the only defence against a command running
+      // twice after the local store was lost (cleared cache, factory reset with the same pair code):
+      // if the server knows the command was executed, it must never be executed again. Adoption is
+      // monotonic and only ever skips work, it can never skip a newer command.
+      var ack = commands.applied || null;
+      var ackSync = ack ? (Number(ack.syncVersion) || 0) : 0;
+      var ackReload = ack ? (Number(ack.reloadVersion) || 0) : 0;
+      if (ackSync >= wantedSync && ackSync > appliedSyncVersion) {
+        appliedSyncVersion = ackSync;
+        wd('markCommand', [ackSync]);
+        record('command_adopted_server_ack', { kind: 'sync', version: ackSync });
+        persistCommandState();
+      }
+      if (ackReload >= wantedReload && ackReload > appliedReloadVersion) {
+        appliedReloadVersion = ackReload;
+        wd('markCommand', [ackReload]);
+        record('command_adopted_server_ack', { kind: 'reload', version: ackReload });
+        persistCommandState();
+      }
+      pendingCommandSync = Math.max(0, wantedSync - appliedSyncVersion) + Math.max(0, wantedReload - appliedReloadVersion);
+
+      var chain = P.resolve(null);
+
+      if (wantedReload > appliedReloadVersion) {
+        chain = chain.then(function () {
+          // ACK first: the version is consumed the moment it is picked up, so a reconnect or a
+          // reload mid-execution can never run the same reload command twice.
+          appliedReloadVersion = wantedReload;
+          persistCommandState();
+          wd('markCommand', [wantedReload]);
+          record('reload_command_received', { version: wantedReload });
+          return storage.setSeenReloadVersion(wantedReload)['catch'](function () { return null; });
+        }).then(function () {
           if (engine && hasPlayableContent()) {
-            if (isFn(engine.ensurePlaying)) engine.ensurePlaying();
+            // Cached content is playing: reinitialize in place instead of unloading the page. A
+            // remote refresh must never blank a working screen.
+            record('reload_command_softened', { version: wantedReload });
+            try {
+              if (isFn(engine.ensurePlaying)) engine.ensurePlaying();
+              reinitRuntime('reload_command');
+            } catch (error) {
+              record('reload_command_reinit_failed', { message: runtime.message(error, 'unknown').slice(0, 160) });
+            }
             return null;
           }
           reloadNow('command_without_cached_content');
           return null;
-        }, function () { return null; });
+        });
       }
-      return null;
+
+      if (wantedSync > appliedSyncVersion) {
+        chain = chain.then(function () {
+          appliedSyncVersion = wantedSync;
+          persistCommandState();
+          wd('markCommand', [wantedSync]);
+          record('sync_command_received', { version: wantedSync });
+          // Force an immediate synchronization instead of waiting for the next scheduled one.
+          wd('scheduleSync', [0]);
+          return null;
+        });
+      }
+
+      return chain['catch'](function (error) {
+        record('command_apply_failed', { message: runtime.message(error, 'unknown').slice(0, 160) });
+        return null;
+      });
     }
 
     /**
@@ -650,14 +941,13 @@
       if (!http) {
         state.online = false;
         if (!state.manifest) state.error = state.lastSyncError || TEXTS.syncFailed;
-        lastSyncAttemptAt = Date.now();
         syncBackoffMs = Math.min(600000, Math.max(60000, syncBackoffMs * 2));
         record('sync_deferred_no_http', { backoffMs: syncBackoffMs });
+        wd('noteSyncFailure', ['no_transport']);
         if (!state.playing) paint();
         return P.resolve(false);
       }
       syncLock = true;
-      lastSyncAttemptAt = Date.now();
       state.phase = state.manifest ? 'playing' : 'syncing';
       state.error = '';
       record('sync_start', null);
@@ -668,6 +958,7 @@
       } catch (error) {
         syncLock = false;
         record('sync_init_failed', { message: runtime.message(error, 'sync init failed') });
+        wd('noteSyncFailure', ['sync_init_failed']);
         return P.resolve(false);
       }
       return activeSync.run().then(function (result) {
@@ -679,6 +970,8 @@
         state.progress = null;
         if (result.lastSyncAt) state.lastSyncAt = result.lastSyncAt;
         record('sync_ok', { changed: Boolean(result.changed) });
+        // A successful synchronization is proof of real, authenticated connectivity.
+        wd('markSync', [true]);
         return P.resolve(applyManifest(result.manifest)).then(function () {
           return refreshStorageState();
         }).then(function () { return true; });
@@ -692,8 +985,11 @@
         state.syncFailures = syncFailures;
         syncBackoffMs = Math.min(600000, 60000 * Math.pow(2, Math.min(syncFailures - 1, 4)));
         record('sync_failed', { code: code, message: String(state.error).slice(0, 200), backoffMs: syncBackoffMs });
+        wd('noteSyncFailure', [code]);
         if (code === 'screen_unauthorized') {
           state.token = null;
+          wd('setHasCredential', [false]);
+          wd('setAuthError', [code]);
           return storage.clearCredential().then(function () {
             // Cached content is never replaced by a pairing screen: the operator re-pairs from the
             // diagnostics panel, and until then playback continues from the local cache.
@@ -706,6 +1002,10 @@
             paint();
             return false;
           });
+        }
+        if (code === 'screen_disabled') {
+          // The server refused the screen itself, not the network: this is a configuration fault.
+          wd('setConfigError', [code]);
         }
         if (code === 'network_offline' || code === 'screen_disabled') state.online = false;
         if (state.manifest) {
@@ -722,6 +1022,7 @@
         // The promise chain itself must never produce an unhandled rejection.
         syncLock = false;
         record('sync_internal_error', { message: runtime.message(error, 'unknown') });
+        wd('noteSyncFailure', ['sync_internal_error']);
         paint();
         return false;
       });
@@ -753,9 +1054,14 @@
         reloadInFlight = false;
         return false;
       }
-      recoveryBlockedUntil = now + RECOVERY_WINDOW_MS;
-      record('reload', { reason: reason });
+      // Exponential backoff across repeated recoveries, on top of the fixed window: a television
+      // that keeps failing gets progressively longer to settle instead of looping.
+      var reloads = Number(recoveryMeta.reloads) || 0;
+      var backoff = Math.min(1800000, 60000 * Math.pow(2, Math.min(reloads, 5)));
+      recoveryBlockedUntil = now + Math.max(RECOVERY_WINDOW_MS, backoff);
+      record('reload', { reason: reason, reloads: reloads, blockedForMs: Math.max(RECOVERY_WINDOW_MS, backoff) });
       if (state.playbackInfo) persistPlaybackState(state.playbackInfo);
+      persistRecoveryMeta(reason);
       var armed = false;
       function go() {
         if (armed) return;
@@ -765,7 +1071,7 @@
       }
       try {
         if (storage && isFn(storage.setRecoveryState)) {
-          storage.setRecoveryState({ at: now, reason: String(reason || 'unknown').slice(0, 60) }).then(go, go);
+          storage.setRecoveryState({ at: now, reason: String(reason || 'unknown').slice(0, 60), reloads: reloads + 1 }).then(go, go);
           win.setTimeout(go, 500);
           return true;
         }
@@ -774,49 +1080,18 @@
       return true;
     }
 
-    /** Lightweight watchdog: reinitializes playback locally before any page-level recovery. */
-    function checkPlayback() {
+    /**
+     * Periodic playback keep-alive. It only ever resumes something that should already be playing
+     * (a paused video after a firmware hiccup); it never restarts the picture and never reloads.
+     * Escalation is the central watchdog's job.
+     */
+    function ensurePlaybackAlive() {
       try {
         if (!engine || !state.manifest) return;
-        if (!hasPlayableContent()) { state.emptyTicks = 0; return; }
+        if (!hasPlayableContent()) return;
         if (isFn(engine.ensurePlaying)) engine.ensurePlaying();
-        if (engineStageVisible()) {
-          state.emptyTicks = 0;
-          watchdogRecoveryFailures = 0;
-          if (watchdogReloadTimer) { win.clearTimeout(watchdogReloadTimer); watchdogReloadTimer = null; }
-          return;
-        }
-        state.emptyTicks += 1;
-        record('watchdog_empty_stage', { ticks: state.emptyTicks, offline: !state.online });
-        if (state.emptyTicks === 2) {
-          // Half a minute with nothing on the stage: explain it to the operator (never while media
-          // is on screen, so this cannot dim or cover playback) and re-arm the local playlist once.
-          paint();
-          try { engine.render(); } catch (error) { record('watchdog_render_failed', { message: runtime.message(error, 'unknown') }); }
-        } else if (state.emptyTicks >= 4 && isFn(engine.hasLocalMedia) && engine.hasLocalMedia()) {
-          // Local media is available: repeatedly try in-place recovery first. Only after three
-          // unsuccessful local cycles do we reinitialize from cache and arm one final page reload.
-          state.emptyTicks = 0;
-          watchdogRecoveryFailures += 1;
-          if (watchdogRecoveryFailures < 3) {
-            if (isFn(engine.recover)) engine.recover('watchdog_empty_stage');
-            else engine.render();
-          } else {
-            record('watchdog_runtime_reinitialize', { failures: watchdogRecoveryFailures });
-            heartbeat(true);
-            try { engine.render(); } catch (renderError) { record('watchdog_runtime_reinitialize_failed', { message: runtime.message(renderError, 'unknown') }); }
-            if (!watchdogReloadTimer) {
-              watchdogReloadTimer = win.setTimeout(function () {
-                watchdogReloadTimer = null;
-                if (engineStageVisible()) { watchdogRecoveryFailures = 0; return; }
-                record('watchdog_page_reload_final', { failures: watchdogRecoveryFailures });
-                reloadNow('watchdog_runtime_unrecoverable');
-              }, 5000);
-            }
-          }
-        }
       } catch (error) {
-        record('watchdog_failed', { message: runtime.message(error, 'unknown') });
+        record('playback_keepalive_failed', { message: runtime.message(error, 'unknown') });
       }
     }
 
@@ -831,22 +1106,19 @@
         return;
       }
       if (state.token) {
-        try { if (engine) engine.render(); } catch (error) { /* the sync below is the real retry */ }
-        heartbeat(true);
-        performSync(state.token).then(function () { paint(); });
+        try { if (engine && isFn(engine.ensurePlaying)) engine.ensurePlaying(); } catch (error) { record('manual_retry_render_failed', { message: runtime.message(error, 'unknown') }); }
+        wd('requestRecovery', ['manual_retry']);
+        wd('requestSync', ['manual_retry']);
         return;
       }
       storage.getCredential().then(function (token) {
         if (token) {
           state.token = token;
           attachEngine(token);
-          return performSync(token).then(function (ready) {
-            heartbeat(true);
-            return ready;
-          }, function () {
-            heartbeat(true);
-            return false;
-          });
+          wd('setHasCredential', [true]);
+          wd('requestRecovery', ['manual_retry']);
+          wd('requestSync', ['manual_retry']);
+          return true;
         }
         if (state.manifest && hasPlayableContent()) {
           // Cached content keeps playing: pairing is offered through the diagnostics panel.
@@ -891,20 +1163,6 @@
       }
     }
 
-    function scheduleHeartbeat(delayMs) {
-      if (heartbeatTimer) win.clearTimeout(heartbeatTimer);
-      if (!state.token || !http) { heartbeatTimer = null; return; }
-      var delay = Math.max(0, Number(delayMs) || 0);
-      if (heartbeatRetryRequested) {
-        heartbeatRetryRequested = false;
-        delay = 0;
-      }
-      heartbeatTimer = win.setTimeout(function () {
-        heartbeatTimer = null;
-        heartbeat(false);
-      }, delay);
-    }
-
     function heartbeatFailed(status, code) {
       heartbeatLock = false;
       heartbeatFailures = Math.min(heartbeatFailures + 1, 7);
@@ -912,16 +1170,17 @@
       state.online = false;
       record('heartbeat_retry_scheduled', { status: status || 0, code: code || 'heartbeat_failed', retryInMs: heartbeatBackoffMs });
       renderStatusBar();
-      scheduleHeartbeat(heartbeatBackoffMs);
+      wd('noteBeatFailure', [code || 'heartbeat_failed']);
     }
 
     function heartbeat(force) {
-      if (!state.token || !http) return;
+      if (!state.token || !http) { wd('scheduleBeat', [60000]); return; }
       if (heartbeatLock) {
-        if (force) heartbeatRetryRequested = true;
+        // A beat is already in flight. The watchdog owns the in-flight timeout, so the lock is
+        // always released and the next attempt is scheduled by the watchdog itself. Nothing is
+        // queued here: a flapping `online` event must never stack up retries.
         return;
       }
-      if (heartbeatTimer) { win.clearTimeout(heartbeatTimer); heartbeatTimer = null; }
       heartbeatLock = true;
       var item = engine ? engine.currentItem() : null;
       var playlistId = engine ? engine.playlistId() : null;
@@ -932,6 +1191,7 @@
           if (playlists[i].id === playlistId) { playlistVersion = Number(playlists[i].version) || null; break; }
         }
       }
+      var watch = wd('snapshot', []) || {};
       var payload = {
         currentPlaylistId: playlistId || null,
         currentPlaylistVersion: playlistVersion,
@@ -942,7 +1202,23 @@
         storageUsageBytes: isFiniteNumber(state.stats.usage) ? state.stats.usage : null,
         storageQuotaBytes: isFiniteNumber(state.stats.quota) ? state.stats.quota : null,
         lastSyncAt: state.lastSyncAt || null,
-        deviceInfo: runtime.deviceInfo(win)
+        deviceInfo: runtime.deviceInfo(win),
+        // --- 24/7 self-healing telemetry -------------------------------------------------------
+        // `playerState` is derived locally but is only ever PESSIMISTIC here: the server ignores it
+        // for "online" and computes that from this authenticated heartbeat's own timestamp.
+        playerState: watch.state || 'boot',
+        appliedSyncVersion: appliedSyncVersion,
+        appliedReloadVersion: appliedReloadVersion,
+        consecutiveFailures: Number(watch.consecutiveFailures) || 0,
+        recovery: {
+          count: Number(watch.recoveryCount) || 0,
+          lastAt: watch.lastRecoveryAt ? new Date(watch.lastRecoveryAt).toISOString() : null,
+          reason: String(watch.lastRecoveryReason || '').slice(0, 120) || null,
+          state: String(watch.state || '').slice(0, 40) || null
+        },
+        healthStatus: watch.healthStatus || null,
+        healthCheckedAt: watch.healthCheckedAt ? new Date(watch.healthCheckedAt).toISOString() : null,
+        bootAt: bootAt
       };
       var request;
       try { request = runtime.sendHeartbeat(http, state.token, payload); }
@@ -956,8 +1232,9 @@
             return;
           }
           heartbeatLock = false;
-          heartbeatRetryRequested = false;
           state.token = null;
+          wd('setHasCredential', [false]);
+          wd('setAuthError', ['screen_unauthorized']);
           return storage.clearCredential().then(function () {
             if (!state.manifest || !hasPlayableContent()) { state.showPairForm = true; state.phase = 'pair'; }
             else state.notice = TEXTS.unpairedNotice;
@@ -973,72 +1250,67 @@
           state.online = true;
           renderStatusBar();
         }
-        scheduleHeartbeat(60000);
+        // Success: the server validated the credential and recorded this instant. The watchdog then
+        // re-arms the next beat and, after an outage, drives RECONNECTING -> SYNC -> ONLINE.
+        wd('markHeartbeat', []);
         return null;
       }, function (error) {
         heartbeatFailed(0, runtime.errorCode(error));
       });
     }
 
+    /*
+     * There is deliberately no `startTimers()` any more.
+     *
+     * The heartbeat, the synchronization, the schedule switch, the playback keep-alive and the
+     * daily self-check are all scheduled from the ONE interval owned by the central watchdog
+     * (public/player/watchdog.js). Four independent timers used to race each other; worse, each of
+     * them could die silently on a single unsettled request and no code would ever notice.
+     */
     function startTimers() {
-      if (syncTimer) win.clearInterval(syncTimer);
-      if (heartbeatTimer) win.clearTimeout(heartbeatTimer);
-      if (scheduleTimer) win.clearInterval(scheduleTimer);
-      if (watchdogTimer) win.clearInterval(watchdogTimer);
-      syncTimer = win.setInterval(function () {
-        if (!state.token || syncLock) return;
-        // Retry with backoff: a longer outage never hammers the server, and the attempt is cheap
-        // and bounded when the television is offline.
-        if (Date.now() - lastSyncAttemptAt < syncBackoffMs) return;
-        performSync(state.token);
-      }, 60000);
-      heartbeatTimer = win.setTimeout(function () {
-        heartbeatTimer = null;
-        try { heartbeat(); } catch (error) { heartbeatFailed(0, runtime.errorCode(error)); }
-      }, 60000);
-      scheduleTimer = win.setInterval(function () {
-        try { tickSchedule(); } catch (error) { record('schedule_failed', { message: runtime.message(error, 'unknown') }); }
-      }, 15000);
-      watchdogTimer = win.setInterval(checkPlayback, WATCHDOG_INTERVAL_MS);
+      record('timers_moved_to_watchdog', null);
     }
 
     function bindEnvironment() {
       if (!win.addEventListener) return;
       win.addEventListener('online', function () {
-        state.online = true;
-        syncFailures = 0;
-        syncBackoffMs = 0;
-        state.syncFailures = 0;
-        heartbeatFailures = 0;
-        heartbeatBackoffMs = 0;
-        renderStatusBar();
-        // Force an authorized pulse immediately; an in-flight failure queues exactly one retry.
-        if (state.token) {
-          try { heartbeat(true); }
-          catch (error) { heartbeatFailed(0, runtime.errorCode(error)); }
-          performSync(state.token);
-        }
+        // navigator.onLine is only a hint. The watchdog attempts a real authenticated round trip
+        // immediately; only its success is allowed to report the player online again.
+        record('browser_online_event', { onLine: navigatorOnline() });
+        wd('requestRecovery', ['browser_online']);
+        restorePlayback('online');
       });
       win.addEventListener('offline', function () {
         state.online = false;
         renderStatusBar();
-        // Nothing else happens here on purpose: the cache keeps the playlist running.
+        // Nothing else happens here on purpose: the cache keeps the playlist running, and a reload
+        // is never taken because a browser thought the network went away.
+        record('browser_offline_event', null);
+        wd('markProgress', []);
       });
       win.addEventListener('focus', function () { restorePlayback('focus'); }, false);
-      win.addEventListener('pageshow', function () { restorePlayback('pageshow'); }, false);
+      win.addEventListener('pageshow', function () { restorePlayback('pageshow'); wd('requestRecovery', ['pageshow']); }, false);
       if (doc.addEventListener) {
         doc.addEventListener('visibilitychange', function () {
           var visible = true;
           try { visible = doc.visibilityState ? doc.visibilityState === 'visible' : !doc.hidden; } catch (error) { visible = true; }
-          if (visible) restorePlayback('visible');
-          else record('playback_visibility_hidden', null);
+          if (visible) {
+            restorePlayback('visible');
+            // A television that wakes from standby is the exact case a wall-clock gap cannot
+            // distinguish from a freeze: prove connectivity now instead of after the next backoff.
+            wd('requestRecovery', ['visible']);
+          } else record('playback_visibility_hidden', null);
         }, false);
       }
       win.addEventListener('error', function (event) {
-        record('window_error', { message: event && event.message ? String(event.message).slice(0, 200) : 'unknown' });
+        var message = event && event.message ? String(event.message).slice(0, 200) : 'unknown';
+        record('window_error', { message: message });
+        // Ten runtime errors without any progress means the runtime is broken, not the network.
+        wd('noteError', ['window_error']);
       });
       win.onunhandledrejection = function (event) {
         record('unhandled_rejection', { message: runtime.message(event && event.reason, 'unknown') });
+        wd('noteError', ['unhandled_rejection']);
       };
       win.addEventListener('keydown', function (event) {
         requestFullscreen(win);
@@ -1072,6 +1344,9 @@
         record('http_init_failed_nonblocking', { message: String(state.error).slice(0, 200) });
       }
       if (wantsDiagnostics(win)) win.setTimeout(function () { openDiagnostics('manual'); }, 0);
+      // The watchdog is started before storage resolves so the player is supervised from the very
+      // first frame; its actions are all safe when the credential or the storage is not ready yet.
+      setupWatchdog();
       var storagePromise;
       try {
         storagePromise = storageFactory(win, { Promise: P, log: record });
@@ -1087,6 +1362,10 @@
         // Startup priority: the local playlist and the cached media are the only things in the
         // critical path. Statistics, sync bookkeeping and the audio preference are all read in the
         // background (see backgroundWork) because none of them can put pixels on the screen.
+        //
+        // The acknowledged command versions are in the critical path instead: they must be known
+        // BEFORE the first synchronization can apply a command, otherwise a reload would re-run the
+        // command that was already executed before it.
         return P.all([
           adapter.getCredential(),
           adapter.getActiveManifest(),
@@ -1094,22 +1373,49 @@
           typeof adapter.getRecoveryState === 'function' ? adapter.getRecoveryState() : P.resolve(null),
           typeof adapter.countCachedAssets === 'function'
             ? adapter.countCachedAssets().then(function (count) { return count; }, function () { return 0; })
-            : P.resolve(0)
+            : P.resolve(0),
+          typeof adapter.getCommandState === 'function' ? adapter.getCommandState() : P.resolve(null),
+          typeof adapter.getRecoveryMeta === 'function' ? adapter.getRecoveryMeta() : P.resolve(null),
+          typeof adapter.getSeenReloadVersion === 'function' ? adapter.getSeenReloadVersion() : P.resolve(0)
         ]);
       }).then(function (values) {
         var token = values[0];
         var manifest = values[1];
         var playback = values[2];
         var recovery = values[3];
+        var commandState = values[5];
+        var recoveryStored = values[6];
+        var seenReload = Number(values[7]) || 0;
         state.cachedCount = Number(values[4]) || 0;
         state.token = token || null;
         state.manifest = manifest || null;
         state.resume = playback || null;
         state.playbackInfo = playback || null;
         state.screenName = (manifest && manifest.screen && manifest.screen.name) || '';
-        if (recovery && recovery.at && (Date.now() - Number(recovery.at)) < RECOVERY_WINDOW_MS) {
-          recoveryBlockedUntil = Number(recovery.at) + RECOVERY_WINDOW_MS;
+        appliedSyncVersion = Number(commandState && commandState.appliedSyncVersion) || 0;
+        appliedReloadVersion = Number(commandState && commandState.appliedReloadVersion) || 0;
+        // A television that was updated before this build only persisted the reload counter.
+        if (!appliedReloadVersion && seenReload) appliedReloadVersion = seenReload;
+        if (recoveryStored && typeof recoveryStored === 'object') {
+          recoveryMeta = recoveryStored;
+          if (recoveryStored.lastAt) {
+            var age = Date.now() - new Date(recoveryStored.lastAt).getTime();
+            if (age === age && age >= 0 && age < RECOVERY_WINDOW_MS) {
+              recoveryBlockedUntil = new Date(recoveryStored.lastAt).getTime() + RECOVERY_WINDOW_MS;
+            }
+          }
         }
+        if (recovery && recovery.at && (Date.now() - Number(recovery.at)) < RECOVERY_WINDOW_MS) {
+          recoveryBlockedUntil = Math.max(recoveryBlockedUntil, Number(recovery.at) + RECOVERY_WINDOW_MS);
+        }
+        record('boot_state', {
+          paired: Boolean(state.token),
+          appliedSyncVersion: appliedSyncVersion,
+          appliedReloadVersion: appliedReloadVersion,
+          recoveryCount: Number(recoveryMeta.count) || 0,
+          recoveryReason: String(recoveryMeta.reason || '').slice(0, 60)
+        });
+        wd('setHasCredential', [Boolean(state.token)]);
         var playable = runtime.hasPlayableContent(manifest);
         // A: local manifest, B: cached media, C: playback. No network request has been awaited yet.
         attachEngine(state.token);
@@ -1142,21 +1448,24 @@
      */
     function backgroundWork() {
       try { refreshStorageState(); } catch (error) { record('storage_state_failed', { message: runtime.message(error, 'unknown') }); }
-      if (storage && isFn(storage.getSeenReloadVersion)) {
-        storage.getSeenReloadVersion().then(function (value) { reloadVersion = Number(value) || 0; }, function () { return null; });
-      }
       if (storage && isFn(storage.getAudioEnabled)) {
         storage.getAudioEnabled().then(function (value) {
           state.audioEnabled = Boolean(value);
         }, function () { return null; });
       }
       if (!state.token) return;
-      try { heartbeat(true); }
-      catch (error) { heartbeatFailed(0, runtime.errorCode(error)); }
-      performSync(state.token).then(function (ready) {
-        if (!ready && !hasPlayableContent()) paint();
-        return null;
-      }, function () { return null; });
+      // The first heartbeat and the first synchronization after a boot are driven through the
+      // central watchdog, so they are covered by the same backoff, in-flight and bookkeeping rules
+      // as every later attempt instead of being a second, unsupervised code path.
+      wd('requestRecovery', ['boot']);
+      wd('requestSync', ['boot']);
+      if (wd('isRunning', []) !== true) {
+        // watchdog.js did not load (an old cached player shell): fall back to a direct attempt so
+        // the television still announces itself.
+        try { heartbeat(true); }
+        catch (error) { heartbeatFailed(0, runtime.errorCode(error)); }
+        performSync(state.token).then(function () { return null; }, function () { return null; });
+      }
     }
 
     return {
@@ -1169,6 +1478,11 @@
       engine: function () { return engine; },
       storage: function () { return storage; },
       sync: function () { return sync; },
+      watchdog: function () { return watchdog; },
+      healthCheck: function (when) { return healthCheck(when || 'manual'); },
+      appliedCommandVersions: function () {
+        return { appliedSyncVersion: appliedSyncVersion, appliedReloadVersion: appliedReloadVersion };
+      },
       texts: TEXTS,
       log: function () { return log.slice(); }
     };

@@ -755,6 +755,40 @@
   IdbAdapter.prototype.setRecoveryState = function (value) {
     return this._put('meta', { key: 'recoveryReload', value: value }).then(function () { return true; }, function () { return false; });
   };
+  /*
+   * Command acknowledgement.
+   *
+   * The last command version this television actually EXECUTED, persisted locally so that a
+   * reconnect, a runtime reinitialize or a controlled page reload can never run the same command
+   * twice. The server stays authoritative: the local value only ever suppresses a re-run, it never
+   * invents one.
+   */
+  IdbAdapter.prototype.getCommandState = function () {
+    return this._get('meta', 'commandState').then(function (row) {
+      var value = (row && row.value) || null;
+      return {
+        appliedSyncVersion: Number(value && value.appliedSyncVersion) || 0,
+        appliedReloadVersion: Number(value && value.appliedReloadVersion) || 0
+      };
+    }, function () { return { appliedSyncVersion: 0, appliedReloadVersion: 0 }; });
+  };
+  IdbAdapter.prototype.setCommandState = function (value) {
+    var record = {
+      appliedSyncVersion: Number(value && value.appliedSyncVersion) || 0,
+      appliedReloadVersion: Number(value && value.appliedReloadVersion) || 0
+    };
+    return this._put('meta', { key: 'commandState', value: record }).then(function () { return true; }, function () { return false; });
+  };
+  /*
+   * Recovery metadata: how often the player had to heal itself, when and why. Used to bound the
+   * reload rate across page loads, which is what stops a reload loop on a broken television.
+   */
+  IdbAdapter.prototype.getRecoveryMeta = function () {
+    return this._get('meta', 'recoveryMeta').then(function (row) { return (row && row.value) || null; }, function () { return null; });
+  };
+  IdbAdapter.prototype.setRecoveryMeta = function (value) {
+    return this._put('meta', { key: 'recoveryMeta', value: value }).then(function () { return true; }, function () { return false; });
+  };
   IdbAdapter.prototype.countCachedAssets = function () {
     return this._getAll('assets').then(function (rows) {
       var count = 0;
@@ -1072,6 +1106,28 @@
   CacheAdapter.prototype.setRecoveryState = function (value) {
     return this._putJson(this._metaUrl('recoveryReload'), { value: value });
   };
+  CacheAdapter.prototype.getCommandState = function () {
+    return this._getJson(this._metaUrl('commandState')).then(function (value) {
+      return {
+        appliedSyncVersion: Number(value && value.value && value.value.appliedSyncVersion) || 0,
+        appliedReloadVersion: Number(value && value.value && value.value.appliedReloadVersion) || 0
+      };
+    }, function () { return { appliedSyncVersion: 0, appliedReloadVersion: 0 }; });
+  };
+  CacheAdapter.prototype.setCommandState = function (value) {
+    return this._putJson(this._metaUrl('commandState'), {
+      value: {
+        appliedSyncVersion: Number(value && value.appliedSyncVersion) || 0,
+        appliedReloadVersion: Number(value && value.appliedReloadVersion) || 0
+      }
+    });
+  };
+  CacheAdapter.prototype.getRecoveryMeta = function () {
+    return this._getJson(this._metaUrl('recoveryMeta')).then(function (value) { return (value && value.value) || null; }, function () { return null; });
+  };
+  CacheAdapter.prototype.setRecoveryMeta = function (value) {
+    return this._putJson(this._metaUrl('recoveryMeta'), { value: value });
+  };
   CacheAdapter.prototype.countCachedAssets = function () {
     var self = this;
     return new this.P(function (resolve) {
@@ -1252,6 +1308,22 @@
   MemoryAdapter.prototype.setPlaybackState = function (value) { this.meta.playbackState = value; return this.P.resolve(true); };
   MemoryAdapter.prototype.getRecoveryState = function () { return this.P.resolve(this.meta.recoveryReload || null); };
   MemoryAdapter.prototype.setRecoveryState = function (value) { this.meta.recoveryReload = value; return this.P.resolve(true); };
+  MemoryAdapter.prototype.getCommandState = function () {
+    var value = this.meta.commandState || null;
+    return this.P.resolve({
+      appliedSyncVersion: Number(value && value.appliedSyncVersion) || 0,
+      appliedReloadVersion: Number(value && value.appliedReloadVersion) || 0
+    });
+  };
+  MemoryAdapter.prototype.setCommandState = function (value) {
+    this.meta.commandState = {
+      appliedSyncVersion: Number(value && value.appliedSyncVersion) || 0,
+      appliedReloadVersion: Number(value && value.appliedReloadVersion) || 0
+    };
+    return this.P.resolve(true);
+  };
+  MemoryAdapter.prototype.getRecoveryMeta = function () { return this.P.resolve(this.meta.recoveryMeta || null); };
+  MemoryAdapter.prototype.setRecoveryMeta = function (value) { this.meta.recoveryMeta = value; return this.P.resolve(true); };
   MemoryAdapter.prototype.countCachedAssets = function () {
     var count = 0;
     for (var hash in this.assets) if (hasOwn(this.assets, hash) && this.assets[hash].complete) count += 1;

@@ -94,6 +94,13 @@ export async function buildManifestBase(db: any, screen: any) {
     commands: {
       syncVersion: Number(screen.sync_command_version || 0),
       reloadVersion: Number(screen.reload_command_version || 0),
+      // The versions the television has already ACKnowledged. Echoing them lets the player detect a
+      // command it has already executed without having to trust its own storage alone, which is the
+      // only defence against a reload replaying a reload.
+      applied: {
+        syncVersion: Number(screen.last_applied_sync_version || 0),
+        reloadVersion: Number(screen.last_applied_reload_version || 0),
+      },
     },
   };
   return { base, hash: hashManifest(base) };

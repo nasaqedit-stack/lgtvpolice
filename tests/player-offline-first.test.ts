@@ -346,7 +346,9 @@ describe('navigator.onLine and background failures', () => {
     expect(plan.count('/api/player/heartbeat')).toBe(1);
     expect(await player.storage().getCredential()).toBe('credential-1');
     expect(player.log().filter((entry: any) => entry.event === 'heartbeat_retry_scheduled')[0].data.retryInMs).toBe(15000);
-    target.clock.advance(16000);
+    // The scheduled delay carries jitter (±25%) so a fleet of televisions never retries in lockstep;
+    // the reported backoff stays on the exact exponential ladder.
+    target.clock.advance(20000);
     await settle(target.win, target.clock, 100);
     expect(plan.count('/api/player/heartbeat')).toBe(2);
     const retries = player.log().filter((entry: any) => entry.event === 'heartbeat_retry_scheduled');
