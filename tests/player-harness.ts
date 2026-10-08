@@ -108,13 +108,13 @@ export async function settle(win: any, clock: VirtualClock, rounds = 60): Promis
 /* -------------------------------------------------------------------------------------------- */
 
 /** jsdom cannot play media; the stub records calls and resolves like a TV would. */
-export function installMediaStubs(win: any): { play: string[]; pause: string[]; finished: string[] } {
-  const calls = { play: [] as string[], pause: [] as string[], finished: [] as string[] };
+export function installMediaStubs(win: any): { play: string[]; pause: string[]; finished: string[]; load: string[] } {
+  const calls = { play: [] as string[], pause: [] as string[], finished: [] as string[], load: [] as string[] };
   const proto = win.HTMLMediaElement && win.HTMLMediaElement.prototype;
   if (!proto) return calls;
   proto.play = function play(this: any) { calls.play.push(String(this.src || '')); return win.Promise.resolve(); };
   proto.pause = function pause(this: any) { calls.pause.push(String(this.src || '')); };
-  proto.load = function load(this: any) { return undefined; };
+  proto.load = function load(this: any) { calls.load.push(String(this.src || '')); return undefined; };
   return calls;
 }
 

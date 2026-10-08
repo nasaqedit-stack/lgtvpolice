@@ -5,7 +5,7 @@ import { bytesToHex } from '@noble/hashes/utils.js';
 import type { ScreenManifest } from '../lib/shared';
 import {
   activateManifest, clearStalePartial, deleteUnreferencedAssets, finalizeAsset, getActiveManifest, getAssetBlob,
-  hasCompleteAsset, saveChunk, storeCredential, readCredential,
+  getAudioEnabled, hasCompleteAsset, saveChunk, setAudioEnabled, storeCredential, readCredential,
 } from '../lib/player/storage';
 
 const mime = 'image/png';
@@ -46,6 +46,12 @@ describe('persistent player storage', () => {
     await cache(hash, content);
     expect(await hasCompleteAsset(hash, content.byteLength, mime)).toBe(true);
     expect(await (await getAssetBlob(hash))?.text()).toBe('offline signage frame');
+  });
+
+  it('persists the one-time audio activation preference in player metadata', async () => {
+    expect(await getAudioEnabled()).toBe(false);
+    await setAudioEnabled(true);
+    expect(await getAudioEnabled()).toBe(true);
   });
 
   it('does not atomically activate a manifest until every referenced asset is complete', async () => {

@@ -9,11 +9,11 @@ import { MAX_UPLOAD_FILE_SIZE, UPLOAD_PART_SIZE, uploadPartCount } from '@/lib/s
 export const runtime = 'nodejs';
 export const maxDuration = 60;
 const maxFileSize = MAX_UPLOAD_FILE_SIZE;
-const mimeMap = { 'image/jpeg': 'image', 'image/png': 'image', 'image/webp': 'image', 'video/mp4': 'video' } as const;
+const mimeMap = { 'image/jpeg': 'image', 'image/png': 'image', 'image/webp': 'image', 'video/mp4': 'video', 'video/quicktime': 'video' } as const;
 const schema = z.object({
   fileName: z.string().trim().min(1).max(240),
   fileSize: z.number().int().positive().max(maxFileSize),
-  mimeType: z.enum(['image/jpeg', 'image/png', 'image/webp', 'video/mp4']),
+  mimeType: z.enum(['image/jpeg', 'image/png', 'image/webp', 'video/mp4', 'video/quicktime']),
 }).strict();
 
 export async function POST(request: NextRequest) {

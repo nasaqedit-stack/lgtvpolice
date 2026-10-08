@@ -616,15 +616,84 @@ describe('playback engine', () => {
     target.clock.advance(5200);
     await settle(target.win, target.clock);
     const video: any = await waitForElement(target, 'video.sp-video');
-    expect(video.getAttribute('src')).toContain('blob:');
-    expect(video.getAttribute('muted')).toBe('muted');
+    const firstVideoSource = video.getAttribute('src');
+    expect(firstVideoSource).toContain('blob:');
+    expect(video.getAttribute('muted')).toBeNull();
+    expect(video.muted).toBe(false);
     expect(video.getAttribute('playsinline')).toBe('playsinline');
     expect(target.media.play.length).toBeGreaterThan(0);
 
     video.oncanplay();
     video.onended();
     await settle(target.win, target.clock);
-    expect((await waitForElement(target, 'img.sp-media')).getAttribute('src')).toContain('blob:');
+    const nextImage: any = await waitForElement(target, 'img.sp-media');
+    expect(nextImage.getAttribute('src')).toContain('blob:');
+    nextImage.onload();
+    target.clock.advance(5200);
+    await settle(target.win, target.clock);
+    const reusedVideo = target.win.document.querySelector('video.sp-video');
+    expect(reusedVideo).toBe(video);
+    expect(reusedVideo.getAttribute('src')).toContain('blob:');
+    expect(reusedVideo.getAttribute('src')).not.toBe(firstVideoSource);
+  });
+
+  it('keeps the same local video source and skips load when an item repeats', async () => {
+    const fixture = buildFixture();
+    const videoItem = fixture.manifest.playlists[0].items[1];
+    fixture.manifest.playlists[0].items.push({ ...videoItem, id: '00000000-0000-4000-8000-000000000007', position: 2 });
+    const target = page();
+    const storage = await openStorage(target);
+    await saveAsset(storage, fixture.videoHash, fixture.videoBytes, 'video/mp4');
+    const { sync, http } = await openSync(target, storage, createTransport(fixture).transport);
+    const engine = startEngine(target, { storage, sync, http });
+    engine.setManifest(fixture.manifest);
+    engine.setPlaylist(fixture.playlistId);
+    engine.jump(1);
+    await settle(target.win, target.clock);
+
+    const video: any = await waitForElement(target, 'video.sp-video');
+    const source = video.getAttribute('src');
+    video.oncanplay();
+    await settle(target.win, target.clock);
+    const loadsBeforeRepeat = target.media.load.length;
+
+    video.onended();
+    await settle(target.win, target.clock);
+    const repeated = target.win.document.querySelector('video.sp-video');
+    expect(repeated).toBe(video);
+    expect(repeated.getAttribute('src')).toBe(source);
+    expect(target.media.load.length).toBe(loadsBeforeRepeat);
+  });
+
+  it('keeps video unmuted and persists audio after a one-time user activation', async () => {
+    const { fixture, target, storage, http, sync } = await readyPage();
+    let rejectAutoplay = true;
+    target.win.HTMLMediaElement.prototype.play = function () {
+      if (!rejectAutoplay) return target.win.Promise.resolve();
+      const error: any = new Error('play requires a user gesture');
+      error.name = 'NotAllowedError';
+      return target.win.Promise.reject(error);
+    };
+    const blocked: unknown[] = [];
+    const engine = startEngine(target, {
+      storage, sync, http,
+      options: { onAudioBlocked: (error: unknown) => blocked.push(error) }
+    });
+    engine.setManifest(fixture.manifest);
+    engine.setPlaylist(fixture.playlistId);
+    engine.jump(1);
+    await settle(target.win, target.clock, 30);
+
+    const video: any = await waitForElement(target, 'video.sp-video');
+    await settle(target.win, target.clock, 20);
+    expect(video.muted).toBe(false);
+    expect(video.getAttribute('muted')).toBeNull();
+    expect(blocked.length).toBeGreaterThan(0);
+
+    rejectAutoplay = false;
+    expect(await engine.enableAudio()).toBe(true);
+    expect(await storage.getAudioEnabled()).toBe(true);
+    expect(video.muted).toBe(false);
   });
 
   it('retries locally-failed media over the network before skipping it', async () => {

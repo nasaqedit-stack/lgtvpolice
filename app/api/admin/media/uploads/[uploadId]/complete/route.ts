@@ -4,6 +4,8 @@ import { z } from 'zod';
 import { errorResponse, HttpError, readJson, requireAdmin } from '@/lib/server/http';
 import { getS3Client, storageConfig, storageRequestOptions } from '@/lib/server/storage';
 import { loadUpload, verifyUploadParts } from '@/lib/server/uploads';
+import { inspectQuickTimeObject } from '@/lib/server/quicktime';
+import { isQuickTimeMovCompatible, type QuickTimeCodecInfo } from '@/lib/shared/quicktime';
 import { MAX_UPLOAD_FILE_SIZE } from '@/lib/shared';
 
 export const runtime = 'nodejs';
@@ -31,7 +33,7 @@ function signatureMatches(mime: string, bytes: Uint8Array) {
   if (mime === 'image/jpeg') return bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
   if (mime === 'image/png') return bytes[0] === 0x89 && String.fromCharCode(...bytes.slice(1, 4)) === 'PNG';
   if (mime === 'image/webp') return String.fromCharCode(...bytes.slice(0, 4)) === 'RIFF' && String.fromCharCode(...bytes.slice(8, 12)) === 'WEBP';
-  if (mime === 'video/mp4') return String.fromCharCode(...bytes.slice(4, 8)) === 'ftyp';
+  if (mime === 'video/mp4' || mime === 'video/quicktime') return String.fromCharCode(...bytes.slice(4, 8)) === 'ftyp';
   return false;
 }
 
@@ -44,6 +46,7 @@ function sameMediaType(left: string | undefined, right: string | undefined) {
 export async function POST(request: NextRequest, context: Context) {
   let uploadedKey: string | undefined;
   let bucketName: string | undefined;
+  let quickTimeCodecs: QuickTimeCodecInfo | null = null;
   let stage = 'admin_auth';
   try {
     const { db, user } = await requireAdmin(request);
@@ -53,6 +56,9 @@ export async function POST(request: NextRequest, context: Context) {
     stage = 'read_metadata';
     const parsed = schema.safeParse(await readJson(request));
     if (!parsed.success) throw new HttpError(400, 'بيانات الوسيط أو بصمته غير صالحة.', 'invalid_media_metadata');
+    if (upload.mime_type === 'video/quicktime' && parsed.data.compatibility !== 'candidate') {
+      throw new HttpError(422, 'لا يقبل النظام MOV قبل تأكيد توافق H.264/AAC من فحص الوسيط.', 'quicktime_compatibility_unverified');
+    }
     const config = storageConfig();
     bucketName = config.bucket;
     const client = getS3Client();
@@ -87,6 +93,15 @@ export async function POST(request: NextRequest, context: Context) {
       await db.from('media_uploads').update({ status: 'aborted' }).eq('id', upload.id);
       throw new HttpError(422, 'محتوى الملف لا يطابق نوعه المعلن. لم تتم إضافته إلى المكتبة.', 'file_signature_invalid');
     }
+    if (upload.mime_type === 'video/quicktime') {
+      stage = 'verify_quicktime_codecs';
+      quickTimeCodecs = await inspectQuickTimeObject(client, config.bucket, upload.storage_path, fileSize);
+      if (!isQuickTimeMovCompatible(quickTimeCodecs)) {
+        await client.send(new DeleteObjectCommand({ Bucket: config.bucket, Key: upload.storage_path }), storageRequestOptions());
+        await db.from('media_uploads').update({ status: 'aborted' }).eq('id', upload.id);
+        throw new HttpError(422, 'رُفض ملف MOV: تعذّر تأكيد مسار فيديو H.264 وصوت AAC مدعوم. حوّله إلى MP4/H.264/AAC.', 'quicktime_codec_unsupported');
+      }
+    }
     stage = 'check_media_duplicate';
     const { data: duplicate, error: duplicateError } = await db.from('media').select('id,display_name,sha256,file_size,mime_type,kind').eq('sha256', parsed.data.sha256).maybeSingle();
     if (duplicateError) throw duplicateError;
@@ -109,7 +124,11 @@ export async function POST(request: NextRequest, context: Context) {
       duration_ms: parsed.data.durationMs ?? null,
       thumbnail_data: parsed.data.thumbnailData ?? null,
       compatibility: parsed.data.compatibility,
-      metadata: { uploadProtocol: 's3-multipart', verifiedContainerSignature: true },
+      metadata: {
+        uploadProtocol: 's3-multipart',
+        verifiedContainerSignature: true,
+        ...(quickTimeCodecs ? { verifiedQuickTimeCodecs: quickTimeCodecs } : {}),
+      },
       uploaded_by: user.id,
     }).select('*').single();
     if (insertError) {

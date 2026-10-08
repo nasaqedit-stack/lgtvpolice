@@ -7,6 +7,7 @@ import { api, ApiError, jsonBody, withRequestTimeout } from '@/lib/client/api';
 import { buildPartManifest, uploadParts } from '@/lib/client/media-upload';
 import { runUploadTask, type UploadProgress, type UploadUiState } from '@/lib/client/upload-state';
 import { formatBytes } from '@/lib/shared';
+import { inspectQuickTimeFile, isQuickTimeMovCompatible } from '@/lib/client/quicktime';
 import { EmptyState, ErrorState, LoadingState, PageHeader } from '@/components/admin-common';
 
 const COMPLETE_TIMEOUT_MS = 55_000;
@@ -43,7 +44,7 @@ export default function MediaPage() {
   useEffect(() => { const timer = window.setTimeout(() => void load(), 180); return () => window.clearTimeout(timer); }, [load]);
   const processFile = async (file: File, report: UploadProgress) => {
     const info = detectType(file);
-    if (!info) throw new Error(`${file.name}: الصيغ المدعومة JPG وPNG وWebP وMP4 فقط. لا يتم قبول SVG غير المنقّح أو HEIC.`);
+    if (!info) throw new Error(`${file.name}: الصيغ المدعومة JPG وPNG وWebP وMP4 وMOV المتوافق فقط. لا يتم قبول SVG غير المنقّح أو HEIC.`);
     if (file.size <= 0 || file.size > 2 * 1024 * 1024 * 1024) throw new Error(`${file.name}: الحجم يجب أن يكون بين بايت واحد و2 جيجابايت.`);
     report('قراءة بيانات الملف…');
     let details: FileInfo;
@@ -181,12 +182,12 @@ export default function MediaPage() {
   const chooseFiles = () => { if (!isUploading) inputRef.current?.click(); };
 
   return <div className="page-content">
-    <PageHeader title="مكتبة الوسائط" description="ارفع الصور ومقاطع MP4 إلى تخزين الكائنات الخاص. يستخدم الرفع أجزاء قابلة للاستئناف، ويمنع تكرار الملف بالبصمة." action={<button className="button teal" onClick={chooseFiles} disabled={isUploading}>＋ رفع ملفات</button>} />
+    <PageHeader title="مكتبة الوسائط" description="ارفع الصور ومقاطع MP4 أو MOV المتوافقة إلى تخزين الكائنات الخاص. يستخدم الرفع أجزاء قابلة للاستئناف، ويمنع تكرار الملف بالبصمة." action={<button className="button teal" onClick={chooseFiles} disabled={isUploading}>＋ رفع ملفات</button>} />
     {error && <ErrorState message={error} retry={() => void load()} />}
     {uploadError && <ErrorState message={uploadError} />}
-    <input ref={inputRef} type="file" multiple disabled={isUploading} accept=".jpg,.jpeg,.png,.webp,.mp4,image/jpeg,image/png,image/webp,video/mp4" style={{ display: 'none' }} onChange={fileChange} />
+    <input ref={inputRef} type="file" multiple disabled={isUploading} accept=".jpg,.jpeg,.png,.webp,.mp4,.mov,image/jpeg,image/png,image/webp,video/mp4,video/quicktime" style={{ display: 'none' }} onChange={fileChange} />
     <div className={`upload-drop ${dragging ? 'dragging' : ''}`} role="button" aria-disabled={isUploading} tabIndex={isUploading ? -1 : 0} onClick={chooseFiles} onDragOver={event => { event.preventDefault(); if (!isUploading) setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={onDrop} onKeyDown={event => { if (!isUploading && (event.key === 'Enter' || event.key === ' ')) chooseFiles(); }}>
-      <div style={{ fontSize: 27, color: '#26998d' }}>⇧</div><strong>اسحب الملفات هنا أو اختر من جهازك</strong><small>JPG · PNG · WebP · MP4 · الحد الأقصى 2 جيجابايت للملف · SVG غير مدعوم حالياً لأنه يتطلب تنقية آمنة.</small>
+      <div style={{ fontSize: 27, color: '#26998d' }}>⇧</div><strong>اسحب الملفات هنا أو اختر من جهازك</strong><small>JPG · PNG · WebP · MP4 · MOV بفيديو H.264 وصوت AAC مدعومين · الحد الأقصى 2 جيجابايت · حوّل MOV غير المؤكد إلى MP4/H.264/AAC.</small>
     </div>
     {upload && <section className={`card card-pad upload-status ${upload.status}`} style={{ marginTop: 14 }} role={upload.status === 'error' ? 'alert' : 'status'} aria-live="polite">
       <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10 }}><strong>{upload.name}</strong><span>{upload.phase}</span></div>
@@ -199,15 +200,15 @@ export default function MediaPage() {
       {media.map(item => <article className="card media-card" key={item.id}>
         <div className="media-thumb" onClick={() => void previewMedia(item)} role="button" tabIndex={0}>
           {item.thumbnail_data ? <img src={item.thumbnail_data} alt="" /> : <span style={{ fontSize: 34, color: '#8293a8' }}>{item.kind === 'video' ? '▶' : '▧'}</span>}
-          <span className="media-type">{item.kind === 'video' ? 'فيديو MP4' : item.mime_type.split('/')[1]?.toUpperCase()}</span>
+          <span className="media-type">{item.kind === 'video' ? `فيديو ${item.mime_type === 'video/quicktime' ? 'MOV' : 'MP4'}` : item.mime_type.split('/')[1]?.toUpperCase()}</span>
         </div>
         <div className="media-body"><strong title={item.display_name}>{item.display_name}</strong><div className="media-meta"><span>{formatBytes(Number(item.file_size))}</span><span>{item.width && item.height ? `${item.width}×${item.height}` : item.duration_ms ? formatDuration(item.duration_ms) : item.kind === 'video' ? 'مدة تُقرأ من الفيديو' : '—'}</span></div><div className="media-meta"><span>استخدام: {item.usageCount}</span><span>{new Date(item.created_at).toLocaleDateString('ar-SA')}</span></div>
-          {item.kind === 'video' && <div className={`alert ${item.compatibility === 'warning' ? 'warning' : 'info'}`} style={{ padding: '6px 8px', marginTop: 8, fontSize: 10 }}>{item.compatibility === 'warning' ? 'تحذير: Codec غير مؤكد؛ اختبره على طراز التلفاز.' : 'مرشح MP4؛ يوصى بـ H.264 + AAC.'}</div>}
+          {item.kind === 'video' && <div className={`alert ${item.compatibility === 'warning' ? 'warning' : 'info'}`} style={{ padding: '6px 8px', marginTop: 8, fontSize: 10 }}>{item.compatibility === 'warning' ? 'تحذير: Codec غير مؤكد؛ اختبره على طراز التلفاز.' : item.mime_type === 'video/quicktime' ? 'MOV مفحوص: H.264/AAC؛ تحقق على التلفاز.' : 'مرشح MP4؛ يوصى بـ H.264 + AAC.'}</div>}
         </div>
         <div className="media-actions"><button className="icon-button" title="معاينة" onClick={() => void previewMedia(item)} disabled={busyId === item.id}>◉</button><button className="icon-button" title="إعادة تسمية" onClick={() => void rename(item)}>✎</button><button className="icon-button" title="حذف" onClick={() => void remove(item)}>×</button></div>
       </article>)}
     </div>}
-    {preview && <div className="modal-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) setPreview(null); }}><section className="modal" role="dialog" aria-modal="true" style={{ width: 'min(900px,100%)' }}><div className="modal-header"><h3>{preview.item.display_name}</h3><button className="icon-button" onClick={() => setPreview(null)}>×</button></div><div style={{ background: '#07101d', display: 'grid', placeItems: 'center', minHeight: 280, maxHeight: '65vh', overflow: 'hidden' }}>{preview.item.kind === 'video' ? <video src={preview.url} controls muted playsInline style={{ maxWidth: '100%', maxHeight: '65vh' }} /> : <img src={preview.url} alt={preview.item.display_name} style={{ maxWidth: '100%', maxHeight: '65vh', objectFit: 'contain' }} />}</div><small style={{ display: 'block', marginTop: 10, color: 'var(--muted)' }}>تُحمّل المعاينة عبر رابط موقّع قصير العمر. التشغيل على الشاشة يستخدم نسخة IndexedDB المحلية.</small></section></div>}
+    {preview && <div className="modal-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) setPreview(null); }}><section className="modal" role="dialog" aria-modal="true" style={{ width: 'min(900px,100%)' }}><div className="modal-header"><h3>{preview.item.display_name}</h3><button className="icon-button" onClick={() => setPreview(null)}>×</button></div><div style={{ background: '#07101d', display: 'grid', placeItems: 'center', minHeight: 280, maxHeight: '65vh', overflow: 'hidden' }}>{preview.item.kind === 'video' ? <video src={preview.url} controls playsInline style={{ maxWidth: '100%', maxHeight: '65vh' }} /> : <img src={preview.url} alt={preview.item.display_name} style={{ maxWidth: '100%', maxHeight: '65vh', objectFit: 'contain' }} />}</div><small style={{ display: 'block', marginTop: 10, color: 'var(--muted)' }}>تُحمّل المعاينة عبر رابط موقّع قصير العمر. التشغيل على الشاشة يستخدم نسخة IndexedDB المحلية.</small></section></div>}
   </div>;
 }
 
@@ -216,9 +217,12 @@ function detectType(file: File): { mimeType: string; kind: 'image' | 'video' } |
   const supported = extension === 'jpg' || extension === 'jpeg' ? { mimeType: 'image/jpeg', kind: 'image' as const }
     : extension === 'png' ? { mimeType: 'image/png', kind: 'image' as const }
     : extension === 'webp' ? { mimeType: 'image/webp', kind: 'image' as const }
-    : extension === 'mp4' ? { mimeType: 'video/mp4', kind: 'video' as const } : null;
+    : extension === 'mp4' ? { mimeType: 'video/mp4', kind: 'video' as const }
+    : extension === 'mov' ? { mimeType: 'video/quicktime', kind: 'video' as const } : null;
   if (!supported) return null;
-  if (file.type && file.type !== supported.mimeType && !(supported.mimeType === 'image/jpeg' && file.type === 'image/jpg')) return null;
+  const alternateJpeg = supported.mimeType === 'image/jpeg' && file.type === 'image/jpg';
+  const alternateQuickTime = supported.mimeType === 'video/quicktime' && (file.type === 'video/x-quicktime' || file.type === 'application/octet-stream');
+  if (file.type && file.type !== supported.mimeType && !alternateJpeg && !alternateQuickTime) return null;
   return supported;
 }
 async function hashFile(file: File, progress: (value: number) => void) {
@@ -247,12 +251,18 @@ async function inspectImage(file: File, mimeType: string): Promise<FileInfo> {
   finally { URL.revokeObjectURL(url); }
 }
 async function inspectVideo(file: File, mimeType: string): Promise<FileInfo> {
+  const isMov = mimeType === 'video/quicktime';
+  const movCodecs = isMov ? await inspectQuickTimeFile(file) : null;
+  if (isMov && !isQuickTimeMovCompatible(movCodecs)) {
+    throw new Error(`${file.name}: رُفض ملف MOV لأن مساراته ليست H.264 للفيديو وAAC للصوت (أو لأن بيانات codec غير قابلة للتحقق). حوّله إلى MP4 بصيغة H.264/AAC ثم أعد رفعه.`);
+  }
   const url = URL.createObjectURL(file);
   const video = document.createElement('video');
   video.preload = 'metadata';
-  video.muted = true;
   video.src = url;
-  const canPlay = video.canPlayType('video/mp4; codecs="avc1.42E01E, mp4a.40.2"');
+  const codecString = movCodecs?.hasAudioTrack ? 'avc1.42E01E, mp4a.40.2' : 'avc1.42E01E';
+  const mp4CanPlay = video.canPlayType(`video/mp4; codecs="${codecString}"`);
+  const canPlay = isMov ? (video.canPlayType('video/quicktime') || mp4CanPlay) : mp4CanPlay;
   let width: number | null = null;
   let height: number | null = null;
   let durationMs: number | null = null;
@@ -282,7 +292,7 @@ async function inspectVideo(file: File, mimeType: string): Promise<FileInfo> {
       canvas.getContext('2d')?.drawImage(video, 0, 0, canvas.width, canvas.height);
       thumbnailData = canvas.toDataURL('image/jpeg', 0.72);
     } catch { thumbnailData = null; }
-    // A browser probe is advisory only; the TV's WebOS codec stack is the final authority.
+    // This only verifies the upload-side browser's decoder; the actual LG still needs device testing.
     if (!durationMs || !width || !height) compatibility = 'warning';
   } catch {
     compatibility = 'warning';
@@ -291,6 +301,9 @@ async function inspectVideo(file: File, mimeType: string): Promise<FileInfo> {
     video.removeAttribute('src');
     video.load();
     URL.revokeObjectURL(url);
+  }
+  if (isMov && compatibility === 'warning') {
+    throw new Error(`${file.name}: لم يتمكن المتصفح من تأكيد فك ترميز هذا الـ MOV. حوّله إلى MP4/H.264/AAC؛ لا يتم رفع MOV غير المؤكد.`);
   }
   return { mimeType, kind: 'video', width, height, durationMs, thumbnailData, compatibility };
 }

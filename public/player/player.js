@@ -65,7 +65,9 @@
     pairingFailed: 'تعذر ربط الشاشة. تحقق من الرمز والاتصال.',
     syncFailed: 'تعذرت المزامنة.',
     unexpected: 'خطأ غير متوقع.',
-    fatalReason: 'أوقف خطأ غير متوقع التشغيل الطبيعي للمشغل.'
+    fatalReason: 'أوقف خطأ غير متوقع التشغيل الطبيعي للمشغل.',
+    enableAudio: 'تشغيل الصوت',
+    audioHint: 'اضغط لتفعيل صوت الفيديو.'
   };
 
   function createElement(doc, tag, className, text) {
@@ -137,7 +139,10 @@
       showPairForm: false,
       diagnosticsReason: '',
       online: true,
-      playing: false
+      playing: false,
+      audioEnabled: false,
+      audioUnlockRequired: false,
+      diagnosticsOpen: false
     };
     var nodes = {};
     var storage = null;
@@ -178,13 +183,23 @@
       var status = createElement(doc, 'div', 'sp-status');
       status.onclick = function () { openDiagnostics('manual'); };
       status.setAttribute('role', 'button');
+      var audioControl = createElement(doc, 'button', 'sp-audio-control', TEXTS.enableAudio);
+      audioControl.setAttribute('type', 'button');
+      audioControl.setAttribute('aria-label', TEXTS.enableAudio);
+      audioControl.style.display = 'none';
+      audioControl.onclick = function (event) {
+        if (event && event.preventDefault) event.preventDefault();
+        activateAudioFromGesture();
+      };
       host.appendChild(stage);
       host.appendChild(overlay);
       host.appendChild(status);
+      host.appendChild(audioControl);
       nodes.host = host;
       nodes.stage = stage;
       nodes.overlay = overlay;
       nodes.status = status;
+      nodes.audioControl = audioControl;
     }
 
     function panel(children) {
@@ -337,7 +352,7 @@
       });
       actions.appendChild(reload);
       actions.appendChild(button(TEXTS.close, 'sp-secondary', function () {
-        nodes.overlay.className = 'sp-overlay' + (state.manifest ? ' sp-overlay-quiet' : '');
+        state.diagnosticsOpen = false;
         paint();
       }));
       box.appendChild(actions);
@@ -345,8 +360,38 @@
       return wrap;
     }
 
+    function renderAudioControl() {
+      if (!nodes.audioControl) return;
+      nodes.audioControl.style.display = state.audioUnlockRequired && state.playing && !state.showPairForm && !state.diagnosticsOpen ? 'block' : 'none';
+      nodes.audioControl.textContent = TEXTS.enableAudio;
+      nodes.audioControl.setAttribute('aria-label', TEXTS.enableAudio);
+      nodes.audioControl.title = TEXTS.audioHint;
+    }
+
+    function activateAudioFromGesture() {
+      if (!engine || typeof engine.enableAudio !== 'function') return;
+      var activation;
+      try { activation = engine.enableAudio(); }
+      catch (error) { state.audioUnlockRequired = true; renderAudioControl(); return; }
+      P.resolve(activation).then(function (enabled) {
+        if (enabled) {
+          state.audioEnabled = true;
+          state.audioUnlockRequired = false;
+          record('audio_enabled', { persisted: true });
+        } else {
+          state.audioUnlockRequired = true;
+          record('audio_enable_failed', null);
+        }
+        renderAudioControl();
+      }, function () {
+        state.audioUnlockRequired = true;
+        renderAudioControl();
+      });
+    }
+
     function renderStatusBar() {
       if (!nodes.status) return;
+      nodes.status.style.display = state.playing && !state.showPairForm && !state.diagnosticsOpen ? 'none' : 'block';
       clearNode(nodes.status);
       nodes.status.appendChild(createElement(doc, 'span', 'sp-dot' + (state.online ? ' sp-dot-on' : ''), '●'));
       nodes.status.appendChild(createElement(doc, 'span', null, state.playing
@@ -374,8 +419,12 @@
       if (!nodes.overlay) return;
       clearNode(nodes.overlay);
       var hasContent = Boolean(state.manifest);
-      nodes.overlay.className = 'sp-overlay' + (hasContent ? ' sp-overlay-quiet' : '');
-      if (state.showPairForm) {
+      var showOverlay = state.diagnosticsOpen || state.showPairForm || !hasContent || !state.playing;
+      nodes.overlay.className = 'sp-overlay';
+      nodes.overlay.style.display = showOverlay ? 'block' : 'none';
+      if (state.diagnosticsOpen) {
+        nodes.overlay.appendChild(renderDiagnostics());
+      } else if (state.showPairForm) {
         nodes.overlay.appendChild(renderPairing(hasContent));
       } else if (!hasContent) {
         nodes.overlay.appendChild(state.phase === 'no_content' ? renderNoContent() : renderSync());
@@ -383,13 +432,14 @@
         nodes.overlay.appendChild(renderSync());
       }
       renderStatusBar();
+      renderAudioControl();
     }
 
     function openDiagnostics(reason) {
       if (!nodes.overlay) return;
       state.diagnosticsReason = reason === 'fatal' ? TEXTS.fatalReason : '';
-      nodes.overlay.className = 'sp-overlay';
-      nodes.overlay.appendChild(renderDiagnostics());
+      state.diagnosticsOpen = true;
+      paint();
     }
 
     function fatal(error, code) {
@@ -453,7 +503,16 @@
         http: http,
         token: token || null,
         Promise: P,
+        audioEnabled: state.audioEnabled,
         log: record,
+        onAudioBlocked: function () {
+          state.audioUnlockRequired = true;
+          renderAudioControl();
+        },
+        onAudioReady: function () {
+          state.audioUnlockRequired = false;
+          renderAudioControl();
+        },
         onNotice: function (text) {
           state.notice = text;
           if (state.playing) renderStatusBar(); else paint();
@@ -469,6 +528,7 @@
         engine.render();
         state.playing = true;
         state.phase = 'playing';
+        paint();
       }
       return engine;
     }
@@ -487,6 +547,7 @@
         engine.setPlaylist(runtime.scheduledPlaylistId(win, manifest, new Date()));
         engine.render();
       }
+      paint();
       var requested = manifest.commands && Number(manifest.commands.reloadVersion);
       if (requested && requested > reloadVersion) {
         reloadVersion = requested;
@@ -723,7 +784,8 @@
           adapter.getStats(),
           adapter.getLastSyncAt(),
           adapter.countCachedAssets(),
-          adapter.getSeenReloadVersion()
+          adapter.getSeenReloadVersion(),
+          typeof adapter.getAudioEnabled === 'function' ? adapter.getAudioEnabled() : P.resolve(false)
         ]);
       }).then(function (values) {
         var token = values[0];
@@ -732,6 +794,7 @@
         state.lastSyncAt = values[3] || null;
         state.cachedCount = values[4] || 0;
         reloadVersion = Number(values[5]) || 0;
+        state.audioEnabled = Boolean(values[6]);
         state.token = token || null;
         state.manifest = manifest || null;
         state.screenName = (manifest && manifest.screen && manifest.screen.name) || '';
