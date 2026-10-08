@@ -536,7 +536,18 @@
     return 0;
   };
   IdbAdapter.prototype.getCredential = function () {
-    return this._get('credentials', 'screen').then(function (row) { return (row && row.token) || null; }, function () { return null; });
+    var self = this;
+    function legacyCredential() {
+      // Older fallback storage kept the same opaque screen credential in localStorage. Reuse it
+      // only when IndexedDB has no credential; never replace or clear existing player identity.
+      var local = localStorageSafe(self.win);
+      if (!local) return null;
+      var token = local.getItem('signage.screenToken');
+      return typeof token === 'string' && token ? token : null;
+    }
+    return this._get('credentials', 'screen').then(function (row) {
+      return (row && row.token) || legacyCredential();
+    }, function () { return legacyCredential(); });
   };
   IdbAdapter.prototype.setCredential = function (token) {
     return this._put('credentials', { key: 'screen', token: token, savedAt: nowIso() }).then(function () { return true; });

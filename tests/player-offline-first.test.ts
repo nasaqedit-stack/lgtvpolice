@@ -109,6 +109,43 @@ function overlay(target: FakePage): any {
 }
 
 describe('cached playback never depends on the network', () => {
+  it('reuses a returning screen credential from same-origin localStorage when IndexedDB has none', async () => {
+    const fixture = buildFixture();
+    const plan = createTransport(fixture);
+    const target = page({ indexedDb: new IDBFactory(), transport: plan.transport });
+    target.win.localStorage.setItem('signage.screenToken', 'existing-screen-credential');
+
+    const player = await boot(target);
+    await settle(target.win, target.clock, 400);
+
+    expect(player.state.token).toBe('existing-screen-credential');
+    expect(target.win.document.querySelector('#signage-pair-code')).toBeNull();
+    expect(plan.calls.some((call) => call.url === '/api/player/pair')).toBe(false);
+    const manifestRequest = plan.calls.find((call) => call.url === '/api/player/manifest');
+    expect(manifestRequest?.headers.Authorization).toBe('Bearer existing-screen-credential');
+    expect(target.win.document.querySelector('img.sp-media, video.sp-video')).toBeTruthy();
+  });
+
+  it('prefers the existing IndexedDB credential and leaves a legacy localStorage value untouched', async () => {
+    const fixture = buildFixture();
+    const factory = new IDBFactory();
+    const seeded = page({ indexedDb: factory });
+    const storage = await openStorage(seeded);
+    await storage.setCredential('current-indexeddb-credential');
+    seeded.dom.window.close();
+
+    const plan = createTransport(fixture);
+    const target = page({ indexedDb: factory, transport: plan.transport });
+    target.win.localStorage.setItem('signage.screenToken', 'older-localstorage-credential');
+    const player = await boot(target);
+    await settle(target.win, target.clock, 400);
+
+    expect(player.state.token).toBe('current-indexeddb-credential');
+    expect(target.win.localStorage.getItem('signage.screenToken')).toBe('older-localstorage-credential');
+    expect(target.win.document.querySelector('#signage-pair-code')).toBeNull();
+    expect(plan.calls.some((call) => call.url === '/api/player/pair')).toBe(false);
+  });
+
   it('starts cached media with every single request failing (offline cold start)', async () => {
     const fixture = buildFixture();
     const factory = new IDBFactory();
@@ -549,6 +586,8 @@ describe('watchdog and crash recovery', () => {
 
     const second = page({ indexedDb: factory, transport: deadNetwork });
     const secondPlayer = await boot(second);
+    expect(secondPlayer.state.token).toBe('credential-1');
+    expect(second.win.document.querySelector('#signage-pair-code')).toBeNull();
     expect(secondPlayer.engine().index()).toBe(1);
     expect(secondPlayer.engine().currentItem().hash).toBe(fixture.videoHash);
     const video: any = await mediaElement(second);
