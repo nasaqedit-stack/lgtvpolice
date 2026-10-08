@@ -132,6 +132,16 @@ export async function setSeenReloadVersion(value: number) {
   tx.objectStore('meta').put({ key: 'seenReloadVersion', value });
   await transactionDone(tx);
 }
+export async function getAudioEnabled(): Promise<boolean> {
+  const row = await getOne<KeyValue>('meta', 'audioEnabled');
+  return row?.value === true;
+}
+export async function setAudioEnabled(value: boolean) {
+  const db = await openDatabase();
+  const tx = db.transaction('meta', 'readwrite');
+  tx.objectStore('meta').put({ key: 'audioEnabled', value: Boolean(value) });
+  await transactionDone(tx);
+}
 
 export async function getAssetRecord(hash: string): Promise<AssetRecord | undefined> {
   return getOne<AssetRecord>('assets', hash);

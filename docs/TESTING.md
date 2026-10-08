@@ -2,22 +2,24 @@
 
 ## Executed in this checkout
 
-Environment: Node.js 22.22.3, npm, fake IndexedDB. No Supabase project, object-storage credentials, deployed origin, or LG TV were available.
+Environment: Node.js 22.22.3, npm, fake IndexedDB. No Supabase project credentials, configured deployed origin, or LG TV were available for this checkout.
 
-- `npm run lint` — passed.
+- `npm run lint` — passed with no warnings.
 - `npm run typecheck` — passed.
-- `npm test` — 66 tests passed.
-  - Persistent IndexedDB credential/media metadata and Blob reconstruction.
+- `npm test` — 13 files, 160 tests passed.
+  - Persistent IndexedDB credential/media/audio metadata and Blob reconstruction.
   - Atomic manifest activation rejects incomplete assets and old manifest remains active.
   - Mocked player sync downloads an image/video pair once; an image-only manifest update requests only the new image; old video remains locally cached.
+  - Standalone video reuse, unchanged-source repeat without another `load()`, unmuted playback, and audio-unlock preference persistence.
+  - Playback UI stays hidden over active media; viewport cover CSS and ES5 standalone syntax are checked.
+  - QuickTime MOV parser requires H.264/AVC video and AAC-LC audio (when present); the upload API re-checks stored `moov` metadata and rejects unsupported codecs even when a client claims compatibility.
   - Mocked total network loss rejects sync without changing the active manifest; locally stored content remains readable.
   - Mocked corrupted download fails SHA-256 and does not replace the previous manifest.
   - Local time schedule selection and cross-midnight/week-day rollover.
   - Manifest routing: a screen with no assignment and no schedule follows the most recently published playlist; an explicit assignment wins over a newer one; an unpublished draft is never routed; an enabled schedule keeps its own playlist.
   - A 206 response whose body is longer than the requested window is trimmed to the window; a TV that cannot use the signed storage URL completes the download through the same-origin `/api/player/media/<mediaId>` stream.
-- `npm audit` — 0 vulnerabilities reported at test time.
 - `npm run build` — passed; `/player` is generated as a static route and API routes are server-rendered.
-- Local HTTP smoke check — `/player`, `/sw.js`, and `/login` returned HTTP 200. This did not exercise a configured login or storage API.
+- No `npm audit`, production deployment, Supabase migration, live media E2E, or physical-TV test has been run for this change.
 
 ## Multipart part-size defect (2026-10-08)
 
@@ -72,13 +74,13 @@ Coverage — `tests/media-upload-parts.test.ts` (30 tests):
   Storage received, reassembled in part order, are byte-for-byte the original image and MP4;
   a retried part re-derives its offsets instead of reusing a stale range.
 
-Integration coverage — `tests/media-upload-finalize.test.ts` (8 tests): the real browser uploader,
+Integration coverage — `tests/media-upload-finalize.test.ts` (11 tests): the real browser uploader,
 the real Next.js route handlers and the real AWS SDK v3 commands are wired to a fake object store
 that answers exactly like Supabase Storage's S3 protocol (its `ListParts` reply carries
 `PartNumber`/`LastModified`/`ETag` and **no** `<Size>` element). Restoring the pre-fix comparison
 in this harness reproduces the production failure verbatim — `409 upload_part_size_invalid`,
 «حجم أحد أجزاء الرفع غير صحيح», part number 1, expected 2048 for a small PNG and 8388608 for a
-multi-part file — and the fix turns all eight green:
+multi-part file — while the fixed path and the new MOV validation cases all pass:
 
 - a 2 KiB image (single part) finalizes, returns a media id, and the assembled bytes equal the file;
 - a 20 MB MP4 (three parts, short final part) finalizes and stores the exact bytes;
@@ -88,7 +90,9 @@ multi-part file — and the fix turns all eight green:
 - finalizing while a part never landed is still rejected (`upload_incomplete`);
 - a client that sends no manifest still finalizes (backward compatible across the deploy);
 - parts that are the right declared size but the wrong bytes are caught by `HeadObject`
-  (`stored_file_mismatch`), i.e. the store's own measurement of what landed.
+  (`stored_file_mismatch`), i.e. the store's own measurement of what landed;
+- structurally valid H.264/AAC-LC QuickTime MOV is stored with the original `video/quicktime` MIME;
+- missing client preflight and a forged `candidate` claim for HEVC are rejected, and the server removes the unsupported object before library insertion.
 
 `scripts/prod-media-e2e.mjs` now uploads through a shared driver that walks every part and
 declares the real byte length of each one, and adds a two-part upload whose final part is a
@@ -110,12 +114,12 @@ Run on the deployed production origin by the `Production media probe` workflow:
   authenticated A–I checks below report SKIP. The production Supabase URL is discoverable from the
   public bundle; the anon/service keys are not.
 
-## Production run after the fix (2026-10-08)
+## Prior production run (2026-10-08 baseline)
 
-Merged as `6b0d7c5`; the Vercel Production deployment of that commit reports
-`Deployment has completed` (state `success`). The `Production pairing E2E` workflow then ran
-against that deployment. Its media stage is no longer skipped when the pairing stage fails, and it
-confirmed from a GitHub runner:
+The production evidence below is for previously merged commit `6b0d7c5`, not this working change.
+The Vercel Production deployment of that baseline reported `Deployment has completed` (state
+`success`). The `Production pairing E2E` workflow then ran against that deployment. Its media stage
+was no longer skipped when the pairing stage failed, and it confirmed from a GitHub runner:
 
 - `https://lgtvpolice.vercel.app/login` and `/player` answer HTTP 200 (the deployment is live);
 - the storage endpoint serves the S3 protocol (`403 AccessDenied` with an S3 XML body for an

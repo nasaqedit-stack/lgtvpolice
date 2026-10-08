@@ -16,26 +16,27 @@
  *   3. `window.__signageGuard` reveals the diagnostic panel with the browser report if the runtime
  *      never signals `__signageBooted`, or if a player script fails to load (onerror).
  */
-export const PLAYER_VERSION = '2.0.0-1';
+export const PLAYER_VERSION = '2.1.0-1';
 
 export const PLAYER_ASSETS = ['/player/sha256.js', '/player/runtime.js', '/player/player.js'] as const;
 
 const STYLES = `
 * { box-sizing: border-box; }
-html, body { margin: 0; padding: 0; height: 100%; background: #050a12; color: #eef3f8;
+html, body { width: 100vw; height: 100vh; margin: 0; padding: 0; border: 0; background: #000; color: #eef3f8;
   font-family: Tahoma, Arial, "Noto Naskh Arabic", sans-serif; font-size: 15px; overflow: hidden; }
 img { border: 0; }
 h1 { font-size: 24px; margin: 0 0 10px; }
 h2 { font-size: 14px; margin: 18px 0 8px; color: #9fb4cc; font-weight: normal; }
 p { line-height: 1.8; margin: 0 0 12px; color: #c3d2e3; }
-#signage-root { position: fixed; top: 0; left: 0; right: 0; bottom: 0; z-index: 1; }
-.sp-stage { position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: #050a12; overflow: hidden; }
-.sp-media, .sp-video { position: absolute; top: 50%; left: 50%; max-width: 100%; max-height: 100%;
-  -webkit-transform: translate(-50%, -50%); transform: translate(-50%, -50%); background: #050a12; }
+#signage-root { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; margin: 0; padding: 0; border: 0; z-index: 1; overflow: hidden; background: #000; }
+.sp-stage { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; margin: 0; padding: 0; border: 0; background: #000; overflow: hidden; }
+.sp-media, .sp-video { display: block; position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
+  max-width: none; max-height: none; margin: 0; padding: 0; border: 0; object-fit: cover; object-position: center center;
+  -webkit-transform: none; transform: none; opacity: 1; visibility: visible; filter: none; -webkit-filter: none; z-index: 1; }
 .sp-video { background: transparent; }
-.sp-overlay { position: absolute; top: 0; left: 0; right: 0; bottom: 0; padding: 4%;
-  text-align: center; background: #050a12; overflow: hidden; }
-.sp-overlay-quiet { background: rgba(5, 10, 18, .82); }
+.sp-overlay { position: absolute; top: 0; left: 0; width: 100vw; height: 100vh; z-index: 2; padding: 4%;
+  text-align: center; background: #000; overflow: hidden; }
+.sp-overlay-quiet { background: transparent; }
 .sp-overlay:before { content: ""; display: inline-block; height: 100%; width: 0; vertical-align: middle; }
 .sp-ui { display: inline-block; vertical-align: middle; text-align: right; max-width: 100%; max-height: 100%; }
 .sp-panel { display: inline-block; text-align: right; width: 620px; max-width: 92%; background: #101e33;
@@ -60,8 +61,11 @@ p { line-height: 1.8; margin: 0 0 12px; color: #c3d2e3; }
 .sp-track { height: 10px; background: #0b1626; border: 1px solid #24374f; border-radius: 6px; overflow: hidden; }
 .sp-fill { height: 100%; width: 0; background: #28b9a8; }
 .sp-status { position: absolute; left: 3%; bottom: 3%; z-index: 3; max-width: 94%; padding: 6px 10px;
-  background: rgba(5, 10, 18, .55); border-radius: 8px; font-size: 12px; color: #cfdceb;
+  background: rgba(0, 0, 0, .72); border-radius: 8px; font-size: 12px; color: #cfdceb;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: left; cursor: pointer; }
+.sp-audio-control { position: fixed; left: 50%; bottom: 3%; z-index: 4; min-height: 46px; padding: 0 24px;
+  border: 0; border-radius: 10px; background: #28b9a8; color: #061d22; font-size: 16px; font-family: inherit;
+  font-weight: bold; cursor: pointer; -webkit-transform: translateX(-50%); transform: translateX(-50%); }
 .sp-dot { color: #7d8ea3; margin-left: 6px; }
 .sp-dot-on { color: #2dd4bf; }
 .sp-notice { color: #ffd9a0; }

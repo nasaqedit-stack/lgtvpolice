@@ -4,13 +4,14 @@ import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 're
 import type { ManifestItem, ScreenManifest, StorageStats } from '@/lib/shared';
 import { scheduledPlaylistId } from '@/lib/player/schedule';
 import {
-  clearCredential, countCachedAssets, getActiveManifest, getAssetBlob, getLastSyncAt,
-  getStorageStats, readCredential, requestPersistentStorage, setSeenReloadVersion, getSeenReloadVersion,
+  clearCredential, countCachedAssets, getActiveManifest, getAssetBlob, getAudioEnabled, getLastSyncAt,
+  getStorageStats, readCredential, requestPersistentStorage, setAudioEnabled, setSeenReloadVersion, getSeenReloadVersion,
   storeCredential,
 } from '@/lib/player/storage';
 import { PlayerSyncError, synchronizePlayer, type SyncProgress } from '@/lib/player/sync';
 
 type SyncState = 'ready' | 'syncing' | 'failed' | 'never';
+type PlayerMediaUrl = { hash: string; url: string; kind: 'image' | 'video'; loop: boolean; name: string };
 type ScreenCredentialResponse = { credential: string; screen: { id: string; name: string; timezone: string } };
 
 function deviceInfo() {
@@ -54,8 +55,15 @@ export default function Player() {
   const [pairError, setPairError] = useState('');
   const [pairing, setPairing] = useState(false);
   const [showPairForm, setShowPairForm] = useState(false);
-  const [mediaUrl, setMediaUrl] = useState<{ hash: string; url: string } | null>(null);
+  const [mediaUrl, setMediaUrl] = useState<PlayerMediaUrl | null>(null);
+  const mediaUrlRef = useRef<PlayerMediaUrl | null>(null);
+  mediaUrlRef.current = mediaUrl;
   const [mediaError, setMediaError] = useState(false);
+  const [audioUnlockRequired, setAudioUnlockRequired] = useState(false);
+  const [audioEnabled, setAudioEnabledState] = useState(false);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const activeObjectUrlRef = useRef<string | null>(null);
+  const objectUrlsRef = useRef<Set<string>>(new Set());
   const [storage, setStorage] = useState<StorageStats>({ usage: null, quota: null, persisted: null });
   const [cachedCount, setCachedCount] = useState(0);
   const [lastSyncAt, setLastSyncAtState] = useState<string | null>(null);
@@ -141,8 +149,8 @@ export default function Player() {
       try { await requestPersistentStorage(); } catch { /* Best effort; IndexedDB remains the primary store. */ }
     };
     void registerShell();
-    Promise.all([readCredential(), getActiveManifest(), getStorageStats(), getLastSyncAt(), countCachedAssets()])
-      .then(([savedToken, savedManifest, stats, syncedAt, count]) => {
+    Promise.all([readCredential(), getActiveManifest(), getStorageStats(), getLastSyncAt(), countCachedAssets(), getAudioEnabled()])
+      .then(([savedToken, savedManifest, stats, syncedAt, count, savedAudioEnabled]) => {
         if (!active) return;
         tokenRef.current = savedToken;
         setToken(savedToken);
@@ -157,6 +165,7 @@ export default function Player() {
         setStorage(stats);
         setLastSyncAtState(syncedAt);
         setCachedCount(count);
+        setAudioEnabledState(savedAudioEnabled);
         setShowPairForm(!savedToken && !savedManifest);
         setBooted(true);
       })
@@ -245,14 +254,30 @@ export default function Player() {
 
   useEffect(() => {
     if (!currentItem) { setMediaError(false); return; }
+    const retainedMedia = mediaUrlRef.current;
+    if (retainedMedia && retainedMedia.hash === currentItem.hash && retainedMedia.kind === currentItem.kind) {
+      if (retainedMedia.loop !== currentItem.loop || retainedMedia.name !== currentItem.name) {
+        setMediaUrl({ ...retainedMedia, loop: currentItem.loop, name: currentItem.name });
+      }
+      return;
+    }
+    const objectUrls = objectUrlsRef.current;
     let cancelled = false;
+    let handedOff = false;
     let createdUrl: string | null = null;
     let skipTimer: number | null = null;
     setMediaError(false);
     getAssetBlob(currentItem.hash).then(blob => {
       if (!blob) throw new Error('تعذر قراءة نسخة الوسيط من التخزين المحلي.');
       createdUrl = URL.createObjectURL(blob);
-      if (!cancelled) setMediaUrl({ hash: currentItem.hash, url: createdUrl });
+      objectUrls.add(createdUrl);
+      if (!cancelled) {
+        handedOff = true;
+        setMediaUrl({ hash: currentItem.hash, url: createdUrl, kind: currentItem.kind, loop: currentItem.loop, name: currentItem.name });
+      } else {
+        URL.revokeObjectURL(createdUrl);
+        objectUrls.delete(createdUrl);
+      }
     }).catch(() => {
       if (!cancelled) {
         setMediaError(true);
@@ -262,9 +287,78 @@ export default function Player() {
     return () => {
       cancelled = true;
       if (skipTimer !== null) window.clearTimeout(skipTimer);
-      if (createdUrl) URL.revokeObjectURL(createdUrl);
+      if (createdUrl && !handedOff) {
+        URL.revokeObjectURL(createdUrl);
+        objectUrls.delete(createdUrl);
+      }
     };
   }, [currentItem]);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    if (!mediaUrl || mediaUrl.kind !== 'video') {
+      video.pause();
+      if (video.hasAttribute('src')) {
+        video.removeAttribute('src');
+        video.load();
+      }
+      return;
+    }
+
+    const previousUrl = activeObjectUrlRef.current;
+    const releasePrevious = () => {
+      activeObjectUrlRef.current = mediaUrl.url;
+      if (previousUrl && previousUrl !== mediaUrl.url) {
+        URL.revokeObjectURL(previousUrl);
+        objectUrlsRef.current.delete(previousUrl);
+      }
+    };
+    const onLoadedData = () => releasePrevious();
+    const onPlaying = () => { releasePrevious(); setAudioUnlockRequired(false); };
+    const onPlayError = () => {
+      const error = video.error;
+      if (error?.code) {
+        setMediaError(true);
+        window.setTimeout(() => setIndex(value => value + 1), 1200);
+      }
+    };
+    video.muted = false;
+    video.defaultMuted = false;
+    video.volume = 1;
+    video.controls = false;
+    video.addEventListener('loadeddata', onLoadedData);
+    video.addEventListener('playing', onPlaying);
+    video.addEventListener('error', onPlayError);
+    if (video.getAttribute('src') !== mediaUrl.url) {
+      video.src = mediaUrl.url;
+      video.load();
+    }
+    try {
+      const playResult = video.play();
+      if (playResult && typeof playResult.then === 'function') {
+        void playResult.catch((error: unknown) => {
+          if (error instanceof DOMException && error.name === 'NotAllowedError') setAudioUnlockRequired(true);
+        });
+      }
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'NotAllowedError') setAudioUnlockRequired(true);
+    }
+    return () => {
+      video.removeEventListener('loadeddata', onLoadedData);
+      video.removeEventListener('playing', onPlaying);
+      video.removeEventListener('error', onPlayError);
+    };
+  }, [mediaUrl, audioEnabled]);
+
+  useEffect(() => {
+    const objectUrls = objectUrlsRef.current;
+    return () => {
+      for (const url of objectUrls) URL.revokeObjectURL(url);
+      objectUrls.clear();
+      activeObjectUrlRef.current = null;
+    };
+  }, []);
 
   useEffect(() => {
     if (!currentItem || currentItem.kind !== 'image' || mediaUrl?.hash !== currentItem.hash) return;
@@ -310,30 +404,53 @@ export default function Player() {
     setFullscreenAttempted(true);
     document.documentElement.requestFullscreen?.().catch(() => undefined);
   };
+  const markMediaDisplayed = (url: string) => {
+    const previous = activeObjectUrlRef.current;
+    activeObjectUrlRef.current = url;
+    if (previous && previous !== url) {
+      URL.revokeObjectURL(previous);
+      objectUrlsRef.current.delete(previous);
+    }
+  };
+  const enableAudio = () => {
+    const video = videoRef.current;
+    if (!video) return;
+    video.muted = false;
+    video.defaultMuted = false;
+    video.volume = 1;
+    const enabled = () => {
+      setAudioEnabledState(true);
+      setAudioUnlockRequired(false);
+      void setAudioEnabled(true).catch(() => undefined);
+    };
+    const failed = () => setAudioUnlockRequired(true);
+    try {
+      const result = video.play();
+      if (result && typeof result.then === 'function') void result.then(enabled, failed);
+      else enabled();
+    } catch { failed(); }
+  };
 
-  const isReadyToPlay = Boolean(currentItem && mediaUrl?.hash === currentItem.hash && !mediaError);
   const hasLocalPlaylist = Boolean(manifest && currentItem);
   const percent = progress.totalBytes > 0 ? Math.min(100, Math.round(progress.downloadedBytes / progress.totalBytes * 100)) : 0;
   const showInitialPairing = !hasLocalPlaylist;
 
   return <main className="player-root" onClick={attemptFullscreen} aria-label="مشغل الشاشة">
     <div className="player-stage">
-      {isReadyToPlay && currentItem?.kind === 'image' && <img className="player-media" src={mediaUrl?.url} alt="" draggable={false} onError={() => { setMediaError(true); window.setTimeout(advance, 1000); }} />}
-      {isReadyToPlay && currentItem?.kind === 'video' && <video
-        key={`${currentItem.hash}-${currentItem.id}`}
+      {mediaUrl?.kind === 'image' && <img className="player-media" src={mediaUrl.url} alt="" draggable={false} onLoad={() => markMediaDisplayed(mediaUrl.url)} onError={() => { setMediaError(true); window.setTimeout(advance, 1000); }} />}
+      <video
+        ref={videoRef}
         className="player-video"
-src={mediaUrl?.url}
+        style={{ display: mediaUrl?.kind === 'video' ? 'block' : 'none' }}
         autoPlay
-        muted
         playsInline
-        loop={currentItem.loop}
+        loop={Boolean(mediaUrl?.kind === 'video' && mediaUrl.loop)}
         preload="auto"
         onEnded={advance}
-        onError={() => { setMediaError(true); window.setTimeout(advance, 1200); }}
-        onCanPlay={event => { void event.currentTarget.play().catch(() => undefined); }}
-        aria-label={currentItem.name}
-      />}
-      {!isReadyToPlay && hasLocalPlaylist && <div className="player-fallback" aria-hidden="true" />}
+        aria-label={mediaUrl?.kind === 'video' ? mediaUrl.name : undefined}
+      />
+      {!mediaUrl && hasLocalPlaylist && <div className="player-fallback" aria-hidden="true" />}
+      {mediaUrl?.kind === 'video' && audioUnlockRequired && <button className="player-audio-control" type="button" onClick={enableAudio}>تشغيل الصوت</button>}
       {showInitialPairing && <div className="player-ui">
         <section className="player-panel">
           <div className="player-logo">ش</div>
@@ -367,16 +484,16 @@ src={mediaUrl?.url}
           </form>
         </section>
       </div>}
-      {hasLocalPlaylist && !showPairForm && (token ? <div className="player-status" aria-live="polite">
+      {!mediaUrl && hasLocalPlaylist && !showPairForm && (token ? <div className="player-status" aria-live="polite">
         <span style={{ color: online ? '#2dd4bf' : '#c4cbd5' }}>●</span>
         <span>{online ? 'تشغيل محلي' : 'تشغيل محلي دون اتصال'}</span>
         <span>·</span><span>{screenName || manifest?.screen.name || 'الشاشة'}</span>
       </div> : <button className="player-status" style={{ border: 0, background: 'transparent', color: 'white' }} onClick={() => setShowPairForm(true)} aria-label="إعادة ربط الشاشة">● تشغيل محلي · إعادة الربط</button>)}
-      {hasLocalPlaylist && mediaError && <div className="player-status" role="status">تعذر قراءة وسيط محلي؛ الانتقال إلى العنصر التالي…</div>}
+      {!mediaUrl && hasLocalPlaylist && mediaError && <div className="player-status" role="status">تعذر قراءة وسيط محلي؛ الانتقال إلى العنصر التالي…</div>}
       {!hasLocalPlaylist && token && !showInitialPairing && <div className="player-ui"><section className="player-panel"><h1>لا يوجد محتوى منشور</h1><p>عيّن قائمة تشغيل منشورة لهذه الشاشة أو أضف جدولاً زمنياً من لوحة الإدارة.</p><button className="button secondary" onClick={() => void runSync(token)}>إعادة التحقق</button></section></div>}
-      {booted && storage.persisted === false && <span className="player-footnote" style={{ position: 'absolute', bottom: 15, right: 15 }}>تنبيه: المتصفح لم يؤكد الاحتفاظ الدائم بالتخزين.</span>}
+      {!mediaUrl && booted && storage.persisted === false && <span className="player-footnote" style={{ position: 'absolute', bottom: 15, right: 15 }}>تنبيه: المتصفح لم يؤكد الاحتفاظ الدائم بالتخزين.</span>}
       {!booted && <div className="player-ui"><section className="player-panel"><div className="player-logo">ش</div><p>جارٍ استعادة القائمة المحفوظة…</p></section></div>}
-      {booted && !hasLocalPlaylist && token && (progress.phase === 'downloading' || progress.phase === 'checking') && <div className="player-status">{cachedCount} وسائط محلية · آخر مزامنة {lastSyncAt ? new Date(lastSyncAt).toLocaleString('ar-SA') : 'لم تتم بعد'}</div>}
+      {!mediaUrl && booted && !hasLocalPlaylist && token && (progress.phase === 'downloading' || progress.phase === 'checking') && <div className="player-status">{cachedCount} وسائط محلية · آخر مزامنة {lastSyncAt ? new Date(lastSyncAt).toLocaleString('ar-SA') : 'لم تتم بعد'}</div>}
     </div>
   </main>;
 }

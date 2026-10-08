@@ -7,7 +7,7 @@
  * three player scripts, and navigations are network-first so a new deployment always reaches the
  * television. APIs, storage URLs and signed media URLs are never cached here.
  */
-const CACHE_NAME = 'signage-player-shell-v2';
+const CACHE_NAME = 'signage-player-shell-v3';
 const SHELL_PATH = '/player';
 const PLAYER_ASSETS = ['/player/sha256.js', '/player/runtime.js', '/player/player.js'];
 

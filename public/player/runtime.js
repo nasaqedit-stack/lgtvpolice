@@ -26,7 +26,7 @@
 })(typeof self !== 'undefined' ? self : (typeof window !== 'undefined' ? window : this), function (root) {
   'use strict';
 
-  var VERSION = '2.0.0';
+  var VERSION = '2.1.0';
   var DB_NAME = 'digital-signage-player';  // unchanged: TVs already paired keep their data
   var DB_VERSION = 1;
   var DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024;
@@ -723,6 +723,12 @@
   IdbAdapter.prototype.setSeenReloadVersion = function (value) {
     return this._put('meta', { key: 'seenReloadVersion', value: Number(value) || 0 }).then(function () { return true; });
   };
+  IdbAdapter.prototype.getAudioEnabled = function () {
+    return this._get('meta', 'audioEnabled').then(function (row) { return Boolean(row && row.value); }, function () { return false; });
+  };
+  IdbAdapter.prototype.setAudioEnabled = function (value) {
+    return this._put('meta', { key: 'audioEnabled', value: Boolean(value) }).then(function () { return true; });
+  };
   IdbAdapter.prototype.countCachedAssets = function () {
     return this._getAll('assets').then(function (rows) {
       var count = 0;
@@ -1022,6 +1028,12 @@
   CacheAdapter.prototype.setSeenReloadVersion = function (value) {
     return this._putJson(this._metaUrl('seenReloadVersion'), { version: Number(value) || 0 });
   };
+  CacheAdapter.prototype.getAudioEnabled = function () {
+    return this._getJson(this._metaUrl('audioEnabled')).then(function (value) { return Boolean(value && value.enabled); });
+  };
+  CacheAdapter.prototype.setAudioEnabled = function (value) {
+    return this._putJson(this._metaUrl('audioEnabled'), { enabled: Boolean(value) });
+  };
   CacheAdapter.prototype.countCachedAssets = function () {
     var self = this;
     return new this.P(function (resolve) {
@@ -1196,6 +1208,8 @@
   MemoryAdapter.prototype.setLastSyncAt = function (value) { this.meta.lastSyncAt = value; return this.P.resolve(true); };
   MemoryAdapter.prototype.getSeenReloadVersion = function () { return this.P.resolve(Number(this.meta.seenReloadVersion || 0)); };
   MemoryAdapter.prototype.setSeenReloadVersion = function (value) { this.meta.seenReloadVersion = Number(value) || 0; return this.P.resolve(true); };
+  MemoryAdapter.prototype.getAudioEnabled = function () { return this.P.resolve(Boolean(this.meta.audioEnabled)); };
+  MemoryAdapter.prototype.setAudioEnabled = function (value) { this.meta.audioEnabled = Boolean(value); return this.P.resolve(true); };
   MemoryAdapter.prototype.countCachedAssets = function () {
     var count = 0;
     for (var hash in this.assets) if (hasOwn(this.assets, hash) && this.assets[hash].complete) count += 1;
@@ -2031,7 +2045,14 @@
     var notice = isFn(options.onNotice) ? options.onNotice : noop;
     var onItem = isFn(options.onItem) ? options.onItem : noop;
     var onState = isFn(options.onState) ? options.onState : noop;
-    var state = { manifest: null, playlistId: null, index: 0, item: null, element: null, objectUrl: null, source: null, mounted: false };
+    var onAudioBlocked = isFn(options.onAudioBlocked) ? options.onAudioBlocked : noop;
+    var onAudioReady = isFn(options.onAudioReady) ? options.onAudioReady : noop;
+    var state = {
+      manifest: null, playlistId: null, index: 0, item: null, element: null, objectUrl: null,
+      source: null, mounted: false, mountedHash: null, mountedKind: null, videoElement: null, videoSourceUrl: null,
+      pendingImage: null, pendingImageUrl: null, playbackGeneration: 0, renderRequest: 0,
+      audioEnabled: Boolean(options.audioEnabled), audioBlocked: false
+    };
     var imageTimer = null;
     var stallTimer = null;
     var watchdogMs = options.watchdogMs || 25000;
@@ -2042,17 +2063,78 @@
       if (imageTimer) { win.clearTimeout(imageTimer); imageTimer = null; }
       if (stallTimer) { win.clearTimeout(stallTimer); stallTimer = null; }
     }
-    function revokeCurrent() {
-      if (state.objectUrl && win.URL && isFn(win.URL.revokeObjectURL)) {
-        try { win.URL.revokeObjectURL(state.objectUrl); } catch (error) { noop(); }
+    function releaseObjectUrl(url) {
+      var urlApi = win.URL || win.webkitURL;
+      if (url && urlApi && isFn(urlApi.revokeObjectURL)) {
+        try { urlApi.revokeObjectURL(url); } catch (error) { noop(); }
       }
+    }
+    function revokeCurrent() {
+      releaseObjectUrl(state.objectUrl);
       state.objectUrl = null;
     }
-    function removeElement() {
-      if (state.element && state.element.parentNode) {
-        try { state.element.parentNode.removeChild(state.element); } catch (error) { noop(); }
+    function removeImage(image) {
+      if (image && image.parentNode) {
+        try { image.parentNode.removeChild(image); } catch (error) { noop(); }
       }
+    }
+    function createVideoElement() {
+      if (state.videoElement) return state.videoElement;
+      var video = doc.createElement('video');
+      video.className = 'sp-video';
+      video.setAttribute('autoplay', 'autoplay');
+      video.setAttribute('playsinline', 'playsinline');
+      video.setAttribute('webkit-playsinline', 'webkit-playsinline');
+      video.setAttribute('preload', 'auto');
+      video.controls = false;
+      video.muted = false;
+      video.defaultMuted = false;
+      video.volume = 1;
+      video.removeAttribute('muted');
+      video.style.display = 'none';
+      video.style.visibility = 'hidden';
+      video.style.opacity = '1';
+      video.style.filter = 'none';
+      video.style.webkitFilter = 'none';
+      stage.appendChild(video);
+      state.videoElement = video;
+      return video;
+    }
+    function setVideoVisible(video, visible) {
+      if (!video || !video.style) return;
+      video.style.display = visible ? 'block' : 'none';
+      video.style.visibility = visible ? 'visible' : 'hidden';
+      video.style.opacity = '1';
+      video.style.filter = 'none';
+      video.style.webkitFilter = 'none';
+    }
+    function clearVideoSource(video) {
+      if (!video) return;
+      try { video.pause(); } catch (error) { noop(); }
+      video.oncanplay = null;
+      video.onplaying = null;
+      video.ontimeupdate = null;
+      video.onprogress = null;
+      video.onended = null;
+      video.onerror = null;
+      setVideoVisible(video, false);
+      if (state.videoSourceUrl) {
+        try { video.removeAttribute('src'); } catch (error) { noop(); }
+        state.videoSourceUrl = null;
+        try { if (isFn(video.load)) video.load(); } catch (error) { noop(); }
+      }
+    }
+    function removeElement() {
+      if (state.element === state.videoElement) clearVideoSource(state.videoElement);
+      else removeImage(state.element);
       state.element = null;
+    }
+    function cancelPendingImage() {
+      if (!state.pendingImage) return;
+      removeImage(state.pendingImage);
+      if (state.pendingImageUrl && state.pendingImageUrl !== state.objectUrl) releaseObjectUrl(state.pendingImageUrl);
+      state.pendingImage = null;
+      state.pendingImageUrl = null;
     }
     function objectUrl(blob) {
       var urlApi = win.URL || win.webkitURL;
@@ -2075,79 +2157,195 @@
       if (imageTimer) win.clearTimeout(imageTimer);
       imageTimer = win.setTimeout(function () { advance(); }, delayMs || 1200);
     }
-
-    function mount(item, source) {
-      revokeCurrent();
-      removeElement();
-      clearTimers();
+    function isAutoplayBlocked(error) {
+      var name = error && error.name ? String(error.name) : '';
+      var text = error && error.message ? String(error.message).toLowerCase() : '';
+      return name === 'NotAllowedError' || name === 'SecurityError'
+        || text.indexOf('user gesture') !== -1 || text.indexOf('not allowed') !== -1
+        || text.indexOf('user interaction') !== -1;
+    }
+    function reportAudioBlocked(error) {
+      state.audioBlocked = true;
+      log('audio_gesture_required', { name: error && error.name ? String(error.name) : 'play_rejected' });
+      onAudioBlocked(error || null);
+    }
+    function tryPlay(video, generation) {
+      if (!video || generation !== state.playbackGeneration || !isFn(video.play)) return;
+      var result;
+      try {
+        video.muted = false;
+        video.defaultMuted = false;
+        video.removeAttribute('muted');
+        video.volume = 1;
+        result = video.play();
+      } catch (error) {
+        if (isAutoplayBlocked(error)) reportAudioBlocked(error);
+        else log('video_play_failed', { message: message(error, 'play failed') });
+        return;
+      }
+      if (result && isFn(result.then)) {
+        result.then(function () {
+          if (generation === state.playbackGeneration) {
+            state.audioBlocked = false;
+            onAudioReady();
+          }
+        }, function (error) {
+          if (generation !== state.playbackGeneration) return;
+          if (isAutoplayBlocked(error)) reportAudioBlocked(error);
+          else log('video_play_failed', { message: message(error, 'play failed') });
+        });
+      }
+    }
+    function activateVideo(item, source, video, generation) {
+      if (generation !== state.playbackGeneration) return;
+      if (state.element && state.element !== video) {
+        if (state.element === state.videoElement) clearVideoSource(state.videoElement);
+        else removeImage(state.element);
+      }
+      var oldUrl = state.objectUrl;
+      state.element = video;
       state.source = source;
-      if (source.objectUrl) state.objectUrl = source.objectUrl;
+      state.objectUrl = source.objectUrl || null;
       state.mounted = true;
-      if (item.kind === 'video') renderVideo(item, source);
-      else renderImage(item, source);
+      state.mountedHash = item.hash;
+      state.mountedKind = item.kind;
+      setVideoVisible(video, true);
+      if (oldUrl && oldUrl !== state.objectUrl) releaseObjectUrl(oldUrl);
+      onItem(item, source);
       onState({ item: item, source: source.kind, index: state.index, playlistId: state.playlistId });
     }
 
-    function renderImage(item, source) {
+    function mount(item, source) {
+      clearTimers();
+      cancelPendingImage();
+      state.mounted = false;
+      var generation = state.playbackGeneration + 1;
+      state.playbackGeneration = generation;
+      if (item.kind === 'video') renderVideo(item, source, generation);
+      else renderImage(item, source, generation);
+    }
+
+    function renderImage(item, source, generation) {
       var img = doc.createElement('img');
       img.className = 'sp-media';
       img.setAttribute('alt', '');
       img.setAttribute('draggable', 'false');
+      img.style.display = 'none';
+      img.style.visibility = 'hidden';
+      img.style.opacity = '1';
+      img.style.filter = 'none';
+      img.style.webkitFilter = 'none';
       img.onload = function () {
+        if (generation !== state.playbackGeneration || state.pendingImage !== img) {
+          removeImage(img);
+          if (source.objectUrl && source.objectUrl !== state.objectUrl) releaseObjectUrl(source.objectUrl);
+          return;
+        }
+        var previousUrl = state.objectUrl;
+        if (state.element && state.element !== img) {
+          if (state.element === state.videoElement) clearVideoSource(state.videoElement);
+          else removeImage(state.element);
+        }
+        img.style.display = 'block';
+        img.style.visibility = 'visible';
+        state.element = img;
+        state.pendingImage = null;
+        state.pendingImageUrl = null;
+        state.source = source;
+        state.objectUrl = source.objectUrl || null;
+        state.mounted = true;
+        state.mountedHash = item.hash;
+        state.mountedKind = item.kind;
+        if (previousUrl && previousUrl !== state.objectUrl) releaseObjectUrl(previousUrl);
         if (stallTimer) { win.clearTimeout(stallTimer); stallTimer = null; }
         var duration = Number(item.durationMs);
         if (!isFinite(duration) || duration < 1000) duration = imageDurationDefaultMs;
         if (duration > 86400000) duration = 86400000;
         if (imageTimer) win.clearTimeout(imageTimer);
         imageTimer = win.setTimeout(function () { advance(); }, duration);
+        onItem(item, source);
+        onState({ item: item, source: source.kind, index: state.index, playlistId: state.playlistId });
       };
-      img.onerror = function () { handleMediaFailure(item, source, 'image'); };
+      img.onerror = function () { handleMediaFailure(item, source, 'image', img, generation); };
+      state.pendingImage = img;
+      state.pendingImageUrl = source.objectUrl || null;
       img.src = source.url;
       stage.appendChild(img);
-      state.element = img;
       armStall('image');
-      onItem(item, source);
     }
 
-    function renderVideo(item, source) {
-      var video = doc.createElement('video');
-      video.className = 'sp-video';
+    function renderVideo(item, source, generation) {
+      var video = createVideoElement();
+      if (state.element !== video) setVideoVisible(video, false);
       video.setAttribute('autoplay', 'autoplay');
-      video.setAttribute('muted', 'muted');
       video.setAttribute('playsinline', 'playsinline');
       video.setAttribute('webkit-playsinline', 'webkit-playsinline');
       video.setAttribute('preload', 'auto');
-      try { video.muted = true; } catch (error) { noop(); }
+      video.controls = false;
+      video.muted = false;
+      video.defaultMuted = false;
+      video.removeAttribute('muted');
+      video.volume = 1;
       if (item.loop) video.setAttribute('loop', 'loop');
+      else video.removeAttribute('loop');
       video.oncanplay = function () {
+        if (generation !== state.playbackGeneration) return;
+        activateVideo(item, source, video, generation);
         armStall('video');
-        try { if (isFn(video.play)) video.play(); } catch (error) { noop(); }
+        tryPlay(video, generation);
       };
-      video.onplaying = function () { armStall('video'); };
-      video.ontimeupdate = function () { armStall('video'); };
-      video.onprogress = function () { armStall('video'); };
+      video.onplaying = function () {
+        if (generation !== state.playbackGeneration) return;
+        activateVideo(item, source, video, generation);
+        state.audioBlocked = false;
+        onAudioReady();
+        armStall('video');
+      };
+      video.ontimeupdate = function () { if (generation === state.playbackGeneration) armStall('video'); };
+      video.onprogress = function () { if (generation === state.playbackGeneration) armStall('video'); };
       video.onended = function () {
+        if (generation !== state.playbackGeneration) return;
         if (item.loop) {
-          try { video.currentTime = 0; video.play(); return; } catch (error) { /* fall through to advance */ }
+          try { video.currentTime = 0; tryPlay(video, generation); return; } catch (error) { /* advance if repeat failed */ }
         }
         advance();
       };
-      video.onerror = function () { handleMediaFailure(item, source, 'video'); };
-      video.src = source.url;
-      stage.appendChild(video);
-      state.element = video;
+      video.onerror = function () { handleMediaFailure(item, source, 'video', video, generation); };
+      if (state.videoSourceUrl !== source.url) {
+        try { video.pause(); } catch (error) { noop(); }
+        video.src = source.url;
+        state.videoSourceUrl = source.url;
+        try { if (isFn(video.load)) video.load(); } catch (error) { noop(); }
+      }
       armStall('video');
-      try { if (isFn(video.play)) video.play(); } catch (error) { noop(); }
-      onItem(item, source);
+      tryPlay(video, generation);
     }
 
-    function handleMediaFailure(item, source, kind) {
+    function handleMediaFailure(item, source, kind, failedElement, generation) {
+      if (generation !== state.playbackGeneration) return;
       log('media_error', { hash: safeString(item.hash, 12), kind: kind, source: source && source.kind });
-      removeElement();
+      if (failedElement && failedElement !== state.element) {
+        if (failedElement === state.pendingImage) {
+          removeImage(failedElement);
+          state.pendingImage = null;
+          state.pendingImageUrl = null;
+        }
+      } else if (failedElement === state.videoElement) {
+        clearVideoSource(state.videoElement);
+        state.element = null;
+      } else if (failedElement) {
+        removeImage(failedElement);
+        state.element = null;
+      }
       clearTimers();
+      state.mounted = false;
+      state.mountedHash = null;
+      state.mountedKind = null;
+      state.source = null;
       if (source && source.kind === 'local' && !networkRetry[item.hash]) {
         networkRetry[item.hash] = true;
-        revokeCurrent();
+        if (source.objectUrl && source.objectUrl !== state.objectUrl) releaseObjectUrl(source.objectUrl);
+        if (source.objectUrl === state.objectUrl) revokeCurrent();
         notice('تعذر قراءة الوسيط المحلي؛ ستتم محاولة التشغيل من الشبكة.');
         return resolveNetworkSource(item).then(function (networkSource) {
           if (networkSource) { mount(item, networkSource); return; }
@@ -2155,7 +2353,7 @@
           advanceLater(1200);
         }, function () { advanceLater(1200); });
       }
-      revokeCurrent();
+      if (source && source.objectUrl && source.objectUrl !== state.objectUrl) releaseObjectUrl(source.objectUrl);
       notice(kind === 'video' ? 'تعذر تشغيل الفيديو؛ الانتقال إلى العنصر التالي…' : 'تعذر عرض الصورة؛ الانتقال إلى العنصر التالي…');
       advanceLater(1200);
     }
@@ -2193,38 +2391,95 @@
       }, function () { return bufferedNetworkSource(item); });
     }
 
+    function discardSource(source) {
+      if (source && source.objectUrl && source.objectUrl !== state.objectUrl) releaseObjectUrl(source.objectUrl);
+    }
+
     function render() {
+      state.renderRequest += 1;
+      var requestId = state.renderRequest;
       if (!state.manifest || !state.playlistId) {
+        cancelPendingImage();
         removeElement();
         revokeCurrent();
         clearTimers();
         state.mounted = false;
+        state.mountedHash = null;
+        state.mountedKind = null;
+        state.item = null;
+        state.source = null;
         onState({ item: null, index: 0, playlistId: state.playlistId });
         return;
       }
       var current = activeItem(state.manifest, state.playlistId, state.index);
       if (!current) {
+        cancelPendingImage();
         removeElement();
         revokeCurrent();
         clearTimers();
         state.mounted = false;
+        state.mountedHash = null;
+        state.mountedKind = null;
+        state.item = null;
+        state.source = null;
         onState({ item: null, index: 0, playlistId: state.playlistId });
         return;
       }
-      state.item = current.item;
-      state.index = current.index;
       var item = current.item;
+      state.index = current.index;
+      if (state.mounted && state.mountedHash === item.hash && state.mountedKind === item.kind && state.source
+        && state.source.objectUrl && (state.source.kind === 'local' || state.source.kind === 'network-buffered')) {
+        state.item = item;
+        mount(item, state.source);
+        return;
+      }
+      state.item = item;
       resolveLocalSource(item).then(function (localSource) {
+        if (requestId !== state.renderRequest) { discardSource(localSource); return; }
         if (localSource) { mount(item, localSource); return; }
         return resolveNetworkSource(item).then(function (networkSource) {
+          if (requestId !== state.renderRequest) { discardSource(networkSource); return; }
           if (networkSource) { mount(item, networkSource); return; }
           notice('لا توجد نسخة محلية من الوسيط ولا اتصال متاح. سيتم تجاوز العنصر.');
           advanceLater(1500);
         });
       }, function (error) {
+        if (requestId !== state.renderRequest) return;
         log('local_source_failed', { code: errorCode(error) });
         notice('تعذر فتح الوسيط المحلي؛ الانتقال إلى العنصر التالي…');
         advanceLater(1200);
+      });
+    }
+
+    function enableAudio() {
+      var video = state.videoElement;
+      if (!video) return P.resolve(false);
+      var result;
+      try {
+        video.muted = false;
+        video.defaultMuted = false;
+        video.removeAttribute('muted');
+        video.volume = 1;
+        result = isFn(video.play) ? video.play() : null;
+      } catch (error) {
+        if (isAutoplayBlocked(error)) reportAudioBlocked(error);
+        return P.resolve(false);
+      }
+      var succeeded = !result || !isFn(result.then) ? P.resolve(true) : P.resolve(result).then(function () { return true; }, function (error) {
+        if (isAutoplayBlocked(error)) reportAudioBlocked(error);
+        return false;
+      });
+      return succeeded.then(function (ok) {
+        if (!ok) return false;
+        state.audioEnabled = true;
+        state.audioBlocked = false;
+        return P.resolve(storage && isFn(storage.setAudioEnabled) ? storage.setAudioEnabled(true) : true).then(function () {
+          onAudioReady();
+          return true;
+        }, function () {
+          onAudioReady();
+          return true;
+        });
       });
     }
 
@@ -2247,16 +2502,27 @@
       currentItem: function () { return state.item; },
       currentSource: function () { return state.source; },
       isMounted: function () { return state.mounted; },
+      enableAudio: enableAudio,
       jump: function (index) { state.index = Number(index) || 0; render(); },
       advance: advance,
       render: render,
       stop: function () {
+        state.renderRequest += 1;
+        state.playbackGeneration += 1;
         clearTimers();
+        cancelPendingImage();
         removeElement();
         revokeCurrent();
+        if (state.videoElement && state.videoElement.parentNode) {
+          try { state.videoElement.parentNode.removeChild(state.videoElement); } catch (error) { noop(); }
+        }
+        state.videoElement = null;
+        state.videoSourceUrl = null;
         state.item = null;
         state.source = null;
         state.mounted = false;
+        state.mountedHash = null;
+        state.mountedKind = null;
       }
     };
   }

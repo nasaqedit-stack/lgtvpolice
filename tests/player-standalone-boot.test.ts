@@ -256,6 +256,48 @@ describe('pairing, downloading and playing through the UI', () => {
     expect(plan.calls.some((call) => call.isRange)).toBe(true);
   });
 
+  it('hides playback UI and offers a persistent one-time audio-unlock button when autoplay is blocked', async () => {
+    const { buildFixture } = await import('./player-harness');
+    const fixture = buildFixture();
+    const plan = createTransport(fixture);
+    const target = page({ transport: plan.transport, indexedDb: new IDBFactory() });
+    let blockAutoplay = true;
+    target.win.HTMLMediaElement.prototype.play = function () {
+      if (!blockAutoplay) return target.win.Promise.resolve();
+      const error: any = new Error('play requires a user gesture');
+      error.name = 'NotAllowedError';
+      return target.win.Promise.reject(error);
+    };
+    const player = await boot(target);
+    setPairCode(target, 'ABCD-1234');
+    await settle(target.win, target.clock, 400);
+
+    const image: any = target.win.document.querySelector('img.sp-media');
+    expect(image).toBeTruthy();
+    image.onload();
+    target.clock.advance(5200);
+    await settle(target.win, target.clock, 100);
+
+    const video: any = target.win.document.querySelector('video.sp-video');
+    const overlay: any = target.win.document.querySelector('.sp-overlay');
+    const status: any = target.win.document.querySelector('.sp-status');
+    const audioButton: any = target.win.document.querySelector('.sp-audio-control');
+    expect(video).toBeTruthy();
+    expect(video.getAttribute('muted')).toBeNull();
+    expect(video.muted).toBe(false);
+    expect(overlay.style.display).toBe('none');
+    expect(status.style.display).toBe('none');
+    expect(audioButton.textContent).toBe('تشغيل الصوت');
+    expect(audioButton.style.display).toBe('block');
+
+    blockAutoplay = false;
+    audioButton.onclick({ preventDefault() { /* direct user-gesture path */ } });
+    await settle(target.win, target.clock, 40);
+    expect(await player.storage().getAudioEnabled()).toBe(true);
+    expect(audioButton.style.display).toBe('none');
+    expect(video.muted).toBe(false);
+  });
+
   it('keeps playing cached media when the network dies and recovers on retry', async () => {
     const { buildFixture } = await import('./player-harness');
     const fixture = buildFixture();

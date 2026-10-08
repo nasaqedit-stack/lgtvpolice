@@ -48,7 +48,7 @@ create table if not exists public.media (
   organization_id uuid references public.organizations(id) on delete set null,
   storage_path text not null unique,
   display_name text not null check (char_length(display_name) between 1 and 240),
-  mime_type text not null check (mime_type in ('image/jpeg', 'image/png', 'image/webp', 'video/mp4')),
+  mime_type text not null check (mime_type in ('image/jpeg', 'image/png', 'image/webp', 'video/mp4', 'video/quicktime')),
   kind text not null check (kind in ('image', 'video')),
   file_size bigint not null check (file_size > 0 and file_size <= 2147483648),
   sha256 text not null check (sha256 ~ '^[a-f0-9]{64}$'),
@@ -192,7 +192,7 @@ create table if not exists public.media_uploads (
   multipart_id text not null,
   file_name text not null,
   file_size bigint not null check (file_size > 0 and file_size <= 2147483648),
-  mime_type text not null check (mime_type in ('image/jpeg', 'image/png', 'image/webp', 'video/mp4')),
+  mime_type text not null check (mime_type in ('image/jpeg', 'image/png', 'image/webp', 'video/mp4', 'video/quicktime')),
   status text not null default 'uploading' check (status in ('uploading', 'completed', 'aborted')),
   created_at timestamptz not null default now(),
   expires_at timestamptz not null,
@@ -404,7 +404,7 @@ create policy profiles_read_self on public.profiles for select to authenticated 
 
 -- Storage is private. No public policies are created; server-generated S3 signed URLs are short-lived.
 insert into storage.buckets(id, name, public, file_size_limit, allowed_mime_types)
-values ('signage-media', 'signage-media', false, 2147483648, array['image/jpeg','image/png','image/webp','video/mp4'])
+values ('signage-media', 'signage-media', false, 2147483648, array['image/jpeg','image/png','image/webp','video/mp4','video/quicktime'])
 on conflict (id) do update set public = false, file_size_limit = excluded.file_size_limit, allowed_mime_types = excluded.allowed_mime_types;
 
 -- Keep only recent heartbeat history; run this as a scheduled maintenance task.

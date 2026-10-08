@@ -114,6 +114,14 @@ describe('player scripts are ES5', () => {
     expect(sha).toContain('create');
     expect(sha).toContain('digestHex');
   });
+
+  it('never mutes video and reuses a persistent video element', () => {
+    const runtime = stripComments(readScript('runtime.js'));
+    expect(runtime).toContain('function createVideoElement()');
+    expect(runtime).toContain('if (state.videoElement) return state.videoElement;');
+    expect(runtime).not.toMatch(/setAttribute\(['"]muted/);
+    expect(runtime).not.toMatch(/video\.muted\s*=\s*true/);
+  });
 });
 
 describe('the /player shell document', () => {
@@ -150,6 +158,14 @@ describe('the /player shell document', () => {
     expect(html).toContain('id="signage-fatal-ua"');
     expect(html).toContain('__signageGuard');
     expect(html).toContain('__signageBooted');
+  });
+
+  it('forces fullscreen cover sizing without introducing browser-new CSS', () => {
+    expect(html).toContain('.sp-media, .sp-video {');
+    expect(html).toMatch(/\.sp-media, \.sp-video \{[^}]*position: fixed;[^}]*top: 0;[^}]*left: 0;[^}]*width: 100vw;[^}]*height: 100vh/s);
+    expect(html).toMatch(/\.sp-media, \.sp-video \{[^}]*margin: 0;[^}]*padding: 0;[^}]*border: 0;[^}]*object-fit: cover;/s);
+    expect(html).toMatch(/\.sp-media, \.sp-video \{[^}]*opacity: 1;[^}]*visibility: visible;[^}]*filter: none;/s);
+    expect(html).not.toContain('rgba(5, 10, 18, .82)');
   });
 
   it('uses only CSS that Chromium 38 understands', () => {
@@ -226,7 +242,7 @@ describe('the optional offline shell (service worker)', () => {
   const sw = readFileSync(path.join(process.cwd(), 'public', 'sw.js'), 'utf8');
 
   it('never touches APIs, storage URLs or older shell caches', () => {
-    expect(sw).toContain("signage-player-shell-v2");
+    expect(sw).toContain("signage-player-shell-v3");
     expect(sw).toContain("name.startsWith('signage-player-shell-')");
     expect(sw).toContain("url.pathname.startsWith('/api/')");
     expect(sw).toContain("url.pathname.startsWith('/storage/')");

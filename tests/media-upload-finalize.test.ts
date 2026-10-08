@@ -257,6 +257,52 @@ function mp4Bytes(length: number): Uint8Array<ArrayBuffer> {
   for (let index = 12; index < length; index += 1) bytes[index] = (index * 37 + 11) % 251;
   return bytes;
 }
+function testAscii(value: string) { return new Uint8Array([...value].map(character => character.charCodeAt(0))); }
+function joinTestBytes(...parts: Uint8Array[]) {
+  const result = new Uint8Array(parts.reduce((sum, part) => sum + part.length, 0));
+  let offset = 0;
+  for (const part of parts) { result.set(part, offset); offset += part.length; }
+  return result as Uint8Array<ArrayBuffer>;
+}
+function testAtom(type: string, payload = new Uint8Array()) {
+  const result = new Uint8Array(8 + payload.length);
+  new DataView(result.buffer).setUint32(0, result.length, false);
+  result.set(testAscii(type), 4);
+  result.set(payload, 8);
+  return result;
+}
+function testDescriptor(tag: number, payload: Uint8Array) {
+  if (payload.length >= 128) throw new Error('test descriptor too large');
+  return joinTestBytes(new Uint8Array([tag, payload.length]), payload);
+}
+function testAacSampleEntry() {
+  const decoderConfig = new Uint8Array(13);
+  decoderConfig[0] = 0x40;
+  decoderConfig[1] = 0x15;
+  const decoderSpecific = testDescriptor(0x05, new Uint8Array([0x12, 0x10]));
+  const decoderConfigDescriptor = testDescriptor(0x04, joinTestBytes(decoderConfig, decoderSpecific));
+  const esDescriptor = testDescriptor(0x03, joinTestBytes(new Uint8Array([0, 1, 0]), decoderConfigDescriptor, testDescriptor(0x06, new Uint8Array([2]))));
+  return testAtom('mp4a', joinTestBytes(new Uint8Array(28), testAtom('esds', joinTestBytes(new Uint8Array(4), esDescriptor))));
+}
+function testSampleDescription(codec: string) {
+  const entryCount = new Uint8Array(4);
+  new DataView(entryCount.buffer).setUint32(0, 1, false);
+  const entry = codec === 'mp4a' ? testAacSampleEntry() : testAtom(codec);
+  return testAtom('stsd', joinTestBytes(new Uint8Array(4), entryCount, entry));
+}
+function testTrack(handler: 'vide' | 'soun', codec: string) {
+  const handlerPayload = joinTestBytes(new Uint8Array(8), testAscii(handler), new Uint8Array(12));
+  const mediaInformation = testAtom('minf', testAtom('stbl', testSampleDescription(codec)));
+  return testAtom('trak', testAtom('mdia', joinTestBytes(testAtom('hdlr', handlerPayload), mediaInformation)));
+}
+function movBytes(videoCodec = 'avc1', audioCodec: string | null = 'mp4a'): Uint8Array<ArrayBuffer> {
+  const fileType = testAtom('ftyp', joinTestBytes(testAscii('qt  '), new Uint8Array(4)));
+  const tracks = [testTrack('vide', videoCodec)];
+  if (audioCodec) tracks.push(testTrack('soun', audioCodec));
+  const movie = testAtom('moov', joinTestBytes(...tracks));
+  const mediaData = testAtom('mdat', new Uint8Array([1, 2, 3, 4]));
+  return joinTestBytes(fileType, movie, mediaData);
+}
 
 const sha256Of = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex');
 
@@ -267,7 +313,7 @@ function expectSameBytes(actual: Uint8Array, expected: Uint8Array) {
 }
 
 /** Runs the complete browser flow: session -> parts -> Blob PUTs -> status -> complete. */
-async function uploadLikeTheBrowser(bytes: Uint8Array<ArrayBuffer>, fileName: string, mimeType: 'image/png' | 'video/mp4') {
+async function uploadLikeTheBrowser(bytes: Uint8Array<ArrayBuffer>, fileName: string, mimeType: 'image/png' | 'video/mp4' | 'video/quicktime') {
   const file = new File([bytes], fileName, { type: mimeType });
   const session = await callApi('POST', '/api/admin/media/uploads', { fileName, fileSize: file.size, mimeType });
   expect(session.status, JSON.stringify(session.body)).toBe(201);
@@ -350,6 +396,43 @@ describe('finalization against a Supabase-shaped object store', () => {
     expect(result.uploaded.map(part => part.size)).toEqual([8_388_608, 8_388_608, 3_222_784]);
     expect(result.progress.reduce((sum, value) => sum + value, 0)).toBe(bytes.length);
     expectSameBytes(store.objects.get(String(result.complete.body.media.storage_path))!.bytes, bytes);
+  });
+
+  it('stores an explicitly compatibility-checked QuickTime MOV with its original MIME type', async () => {
+    const bytes = movBytes();
+    const result = await uploadLikeTheBrowser(bytes, 'h264-aac.mov', 'video/quicktime');
+
+    expect(result.complete.status, JSON.stringify(result.complete.body)).toBe(201);
+    expect(result.complete.body.media.mime_type).toBe('video/quicktime');
+    expect(store.objects.get(String(result.complete.body.media.storage_path))!.contentType).toBe('video/quicktime');
+    expectSameBytes(store.objects.get(String(result.complete.body.media.storage_path))!.bytes, bytes);
+  });
+
+  it('refuses a MOV upload with no successful client codec-compatibility preflight', async () => {
+    const bytes = movBytes();
+    const file = new File([bytes], 'unverified.mov', { type: 'video/quicktime' });
+    const session = await callApi('POST', '/api/admin/media/uploads', { fileName: file.name, fileSize: file.size, mimeType: 'video/quicktime' });
+    expect(session.status).toBe(201);
+    const uploadId = session.body.uploadId as string;
+    const { uploadParts, buildPartManifest } = await import('@/lib/client/media-upload');
+    const uploaded = await uploadParts(file, uploadId, [1], () => undefined);
+    const complete = await callApi('POST', `/api/admin/media/uploads/${uploadId}/complete`, {
+      sha256: sha256Of(bytes), width: null, height: null, durationMs: null, thumbnailData: null,
+      compatibility: 'warning', parts: buildPartManifest(file.size, uploaded),
+    });
+    expect(complete.status).toBe(422);
+    expect(complete.body.code).toBe('quicktime_compatibility_unverified');
+  });
+
+  it('rejects a QuickTime file with unsupported codecs even when a forged client claims it is compatible', async () => {
+    const before = store.objects.size;
+    const bytes = movBytes('hvc1', 'mp4a');
+    const result = await uploadLikeTheBrowser(bytes, 'unsupported-hevc.mov', 'video/quicktime');
+
+    expect(result.complete.status).toBe(422);
+    expect(result.complete.body.code).toBe('quicktime_codec_unsupported');
+    expect(store.objects.size).toBe(before);
+    expect(dbState.media.some(row => row.sha256 === sha256Of(bytes))).toBe(false);
   });
 
   it('is not fooled by a ListParts answer without <Size>', async () => {
