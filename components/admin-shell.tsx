@@ -11,11 +11,12 @@ const items = [
   { href: '/media', label: 'الوسائط', icon: '▧' },
   { href: '/playlists', label: 'قوائم التشغيل', icon: '≡' },
   { href: '/schedule', label: 'الجدولة', icon: '◷' },
+  { href: '/submissions', label: 'المشاركات', icon: '✉' },
   { href: '/settings', label: 'الإعدادات', icon: '⚙' },
 ];
 const titles: Record<string, string> = {
   '/dashboard': 'نظرة عامة', '/screens': 'إدارة الشاشات', '/media': 'مكتبة الوسائط',
-  '/playlists': 'قوائم التشغيل', '/schedule': 'جدولة المحتوى', '/settings': 'الإعدادات',
+  '/playlists': 'قوائم التشغيل', '/schedule': 'جدولة المحتوى', '/submissions': 'مراجعة المشاركات', '/settings': 'الإعدادات',
 };
 
 export default function AdminShell({ children, email, role }: { children: React.ReactNode; email: string; role: string }) {

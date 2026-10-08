@@ -9,6 +9,11 @@ function required(name: string): string {
   return value;
 }
 
+export function getSubmissionRateLimitSalt(): string {
+  // Falls back to PAIRING_RATE_LIMIT_SALT when unset
+  return process.env.SUBMISSION_RATE_LIMIT_SALT || required('PAIRING_RATE_LIMIT_SALT');
+}
+
 const SUPABASE_REQUEST_TIMEOUT_MS = 15_000;
 
 function supabaseFetch(input: RequestInfo | URL, init: RequestInit = {}) {

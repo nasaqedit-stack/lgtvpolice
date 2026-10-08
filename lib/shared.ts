@@ -123,3 +123,20 @@ export function formatBytes(value: number): string {
   }
   return `${new Intl.NumberFormat('ar', { maximumFractionDigits: 1 }).format(amount)} ${units[index]}`;
 }
+
+export {
+  type SubmissionState,
+  SUBMISSION_STATES,
+  SUBMISSION_STATE_LABELS,
+  SUBMISSION_STATE_TONES,
+  VALID_TRANSITIONS,
+  CONSENT_VERSION,
+  CONSENT_TEXT,
+  SUBMISSION_MAX_FILE_SIZE,
+  SUBMISSION_ALLOWED_MIME_TYPES,
+  type SubmissionAllowedMimeType,
+  SUBMISSION_OPTIMIZED_IMAGE_MAX_DIMENSION,
+  SUBMISSION_THUMBNAIL_MAX_DIMENSION,
+  SUBMISSION_VIDEO_MAX_WIDTH,
+  SUBMISSION_VIDEO_MAX_HEIGHT,
+} from '@/lib/shared/submissions';

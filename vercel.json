@@ -1,5 +1,6 @@
 {
   "crons": [
-    { "path": "/api/cron/cleanup", "schedule": "17 3 * * *" }
+    { "path": "/api/cron/cleanup", "schedule": "17 3 * * *" },
+    { "path": "/api/cron/process-submissions", "schedule": "*/10 * * * *" }
   ]
 }
