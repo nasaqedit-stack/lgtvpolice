@@ -5,6 +5,7 @@ import { z } from 'zod';
 import { errorResponse, HttpError, readJson, requireAdmin } from '@/lib/server/http';
 import { getS3Client, storageConfig } from '@/lib/server/storage';
 import { loadUpload } from '@/lib/server/uploads';
+import { UPLOAD_PART_SIZE, uploadPartCount } from '@/lib/shared';
 
 export const runtime = 'nodejs';
 export const maxDuration = 60;
@@ -21,8 +22,8 @@ export async function POST(request: NextRequest, context: Context) {
     stage = 'validate_part_request';
     const parsed = schema.safeParse(await readJson(request));
     if (!parsed.success) throw new HttpError(400, 'أرقام أجزاء الرفع غير صالحة.', 'invalid_parts');
-    const partSize = 8 * 1024 * 1024;
-    const totalParts = Math.ceil(Number(upload.file_size) / partSize);
+    const partSize = UPLOAD_PART_SIZE;
+    const totalParts = uploadPartCount(Number(upload.file_size));
     const numbers = [...new Set(parsed.data.partNumbers)];
     if (numbers.some(number => number > totalParts)) throw new HttpError(400, 'رقم الجزء يتجاوز حجم الملف.', 'invalid_parts');
     const config = storageConfig();

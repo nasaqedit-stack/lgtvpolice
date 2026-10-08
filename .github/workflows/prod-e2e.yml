@@ -112,11 +112,13 @@ jobs:
       # Media delivery: upload -> storage -> media row -> playlist -> publish -> manifest ->
       # signed URL -> byte download. Needs the same admin credentials as the pairing stage; without
       # them it reports SKIP with the exact missing capability instead of failing the job.
+      # `always()` keeps the media evidence coming even when the pairing stage above fails for an
+      # unrelated reason (it used to be skipped, which hid the multipart finalization failure).
       - name: Verify the media test fixture
-        if: inputs.mode != 'probe'
+        if: ${{ always() && inputs.mode != 'probe' }}
         run: node scripts/prod-media-e2e.mjs --self-test
       - name: Run production media E2E
-        if: inputs.mode != 'probe'
+        if: ${{ always() && inputs.mode != 'probe' }}
         env:
           APP_ORIGIN: ${{ inputs.origin || 'https://lgtvpolice.vercel.app' }}
           E2E_KEEP: ${{ inputs.keep_test_media && '1' || '' }}

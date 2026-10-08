@@ -3,7 +3,8 @@ import { CompleteMultipartUploadCommand, DeleteObjectCommand, GetObjectCommand, 
 import { z } from 'zod';
 import { errorResponse, HttpError, readJson, requireAdmin } from '@/lib/server/http';
 import { getS3Client, storageConfig, storageRequestOptions } from '@/lib/server/storage';
-import { loadUpload } from '@/lib/server/uploads';
+import { loadUpload, verifyUploadParts } from '@/lib/server/uploads';
+import { MAX_UPLOAD_FILE_SIZE } from '@/lib/shared';
 
 export const runtime = 'nodejs';
 export const maxDuration = 60;
@@ -15,6 +16,15 @@ const schema = z.object({
   durationMs: z.number().int().positive().max(7 * 24 * 60 * 60 * 1000).nullable().optional(),
   thumbnailData: z.string().max(400000).regex(/^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/).nullable().optional(),
   compatibility: z.enum(['unknown', 'candidate', 'warning']).default('unknown'),
+  /**
+   * The byte length the browser read off each Blob it PUT, one entry per part.
+   * Optional only so an admin tab that was already open before this deploy keeps
+   * working; a current client always sends it and is validated part by part.
+   */
+  parts: z.array(z.object({
+    partNumber: z.number().int().positive().max(10_000),
+    size: z.number().int().nonnegative().max(MAX_UPLOAD_FILE_SIZE),
+  }).strict()).max(1024).optional(),
 }).strict();
 
 function signatureMatches(mime: string, bytes: Uint8Array) {
@@ -23,6 +33,12 @@ function signatureMatches(mime: string, bytes: Uint8Array) {
   if (mime === 'image/webp') return String.fromCharCode(...bytes.slice(0, 4)) === 'RIFF' && String.fromCharCode(...bytes.slice(8, 12)) === 'WEBP';
   if (mime === 'video/mp4') return String.fromCharCode(...bytes.slice(4, 8)) === 'ftyp';
   return false;
+}
+
+/** Compare media types only: a store may echo parameters (`image/png; charset=binary`) it was never given. */
+function sameMediaType(left: string | undefined, right: string | undefined) {
+  const trim = (value: string | undefined) => String(value ?? '').split(';')[0]?.trim().toLowerCase() ?? '';
+  return trim(left) === trim(right) && trim(left) !== '';
 }
 
 export async function POST(request: NextRequest, context: Context) {
@@ -40,18 +56,12 @@ export async function POST(request: NextRequest, context: Context) {
     const config = storageConfig();
     bucketName = config.bucket;
     const client = getS3Client();
-    const partSize = 8 * 1024 * 1024;
-    const totalParts = Math.ceil(Number(upload.file_size) / partSize);
+    const fileSize = Number(upload.file_size);
     stage = 'list_uploaded_parts';
+    // The 2 GiB file cap means at most 256 parts, well inside ListParts' 1000-part page.
     const listed = await client.send(new ListPartsCommand({ Bucket: config.bucket, Key: upload.storage_path, UploadId: upload.multipart_id }), storageRequestOptions());
-    const parts = (listed.Parts ?? []).sort((a, b) => (a.PartNumber ?? 0) - (b.PartNumber ?? 0));
-    if (parts.length !== totalParts || parts.some((part, index) => part.PartNumber !== index + 1 || !part.ETag)) {
-      throw new HttpError(409, 'لم تكتمل كل أجزاء الملف. أعد محاولة الأجزاء الناقصة.', 'upload_incomplete');
-    }
-    for (let index = 0; index < parts.length; index += 1) {
-      const expected = Math.min(partSize, Number(upload.file_size) - index * partSize);
-      if (Number(parts[index].Size) !== expected) throw new HttpError(409, 'حجم أحد أجزاء الرفع غير صحيح.', 'upload_part_size_invalid');
-    }
+    stage = 'verify_part_sizes';
+    const parts = verifyUploadParts(fileSize, listed.Parts ?? [], parsed.data.parts);
     stage = 'complete_storage_multipart';
     await client.send(new CompleteMultipartUploadCommand({
       Bucket: config.bucket,
@@ -61,8 +71,10 @@ export async function POST(request: NextRequest, context: Context) {
     }), storageRequestOptions());
     uploadedKey = upload.storage_path;
     stage = 'verify_stored_object';
+    // The authoritative byte count: whatever the parts really contained is what the store
+    // assembled, so this is the size validation that cannot be fooled by a client manifest.
     const head = await client.send(new HeadObjectCommand({ Bucket: config.bucket, Key: upload.storage_path }), storageRequestOptions());
-    if (Number(head.ContentLength) !== Number(upload.file_size) || head.ContentType !== upload.mime_type) {
+    if (Number(head.ContentLength) !== fileSize || !sameMediaType(head.ContentType, upload.mime_type)) {
       await client.send(new DeleteObjectCommand({ Bucket: config.bucket, Key: upload.storage_path }), storageRequestOptions());
       await db.from('media_uploads').update({ status: 'aborted' }).eq('id', upload.id);
       throw new HttpError(422, 'الملف المخزن لا يطابق الحجم أو النوع المتوقع.', 'stored_file_mismatch');
