@@ -634,7 +634,10 @@ describe('playback engine', () => {
     const reusedVideo = target.win.document.querySelector('video.sp-video');
     expect(reusedVideo).toBe(video);
     expect(reusedVideo.getAttribute('src')).toContain('blob:');
-    expect(reusedVideo.getAttribute('src')).not.toBe(firstVideoSource);
+    // The cached object URL of a repeated item is reused: the playlist loop never re-reads the
+    // media from IndexedDB and never asks the server for it again.
+    expect(reusedVideo.getAttribute('src')).toBe(firstVideoSource);
+    expect(target.blobUrls.created.length).toBe(2);
   });
 
   it('keeps the same local video source and skips load when an item repeats', async () => {
@@ -720,7 +723,7 @@ describe('playback engine', () => {
     await waitForElement(target, 'video.sp-video');
   });
 
-  it('advances when a video never starts (stall watchdog)', async () => {
+  it('reinitializes a stalled video before advancing (watchdog recovery, then skip)', async () => {
     const { fixture, target, storage, http, sync } = await readyPage();
     const notices: string[] = [];
     const engine = startEngine(target, { storage, sync, http, options: { watchdogMs: 20000, onNotice: (text: string) => notices.push(text) } });
@@ -728,8 +731,21 @@ describe('playback engine', () => {
     engine.setPlaylist(fixture.playlistId);
     engine.jump(1);
     await settle(target.win, target.clock);
-    await waitForElement(target, 'video.sp-video');
+    const video: any = await waitForElement(target, 'video.sp-video');
+    video.oncanplay();
+    await settle(target.win, target.clock);
+    const loadsBeforeStall = target.media.load.length;
 
+    // First watchdog tick: the media element itself is reinitialized from the local copy.
+    target.clock.advance(21000);
+    await settle(target.win, target.clock);
+    expect(notices.join(' ')).toContain('إعادة تهيئة');
+    expect(engine.index()).toBe(1);
+    expect(target.media.load.length).toBeGreaterThan(loadsBeforeStall);
+
+    // Only when recovery keeps failing does the playlist move on, with the diagnostic notice.
+    target.clock.advance(21000);
+    await settle(target.win, target.clock);
     target.clock.advance(21000);
     await settle(target.win, target.clock);
     expect(notices.join(' ')).toContain('تأخر');
@@ -778,7 +794,7 @@ describe('playback engine', () => {
     expect(image.getAttribute('src')).toContain('https://objects.example.test/');
   });
 
-  it('notifies and skips an item that cannot be played at all, instead of freezing on it', async () => {
+  it('keeps the item on a missing asset, retries in the background, and only then skips it', async () => {
     const fixture = buildFixture();
     const target = page();
     const storage = await openStorage(target);
@@ -786,15 +802,25 @@ describe('playback engine', () => {
     const http = target.runtime.createHttp(target.win, { Promise: target.win.Promise, transport: dead });
     const sync = target.runtime.createSync({ win: target.win, storage, http, token: 'credential-1', Promise: target.win.Promise });
     const notices: string[] = [];
-    const engine = startEngine(target, { storage, sync, http, options: { onNotice: (text: string) => notices.push(text) } });
+    const engine = startEngine(target, {
+      storage, sync, http,
+      options: { onNotice: (text: string) => notices.push(text), missRetryBaseMs: 1000, missRetryLimit: 2 }
+    });
     engine.setManifest(fixture.manifest);
     engine.setPlaylist(fixture.playlistId);
     engine.render();
     await settle(target.win, target.clock, 30);
     expect(notices.length).toBeGreaterThan(0);
 
+    // The missing asset is retried on the same item: the playlist does not rush past it (and, with
+    // media already on screen, nothing is blanked while it is retried).
     target.clock.advance(1500);
     await settle(target.win, target.clock, 30);
+    expect(engine.index()).toBe(0);
+
+    // Only after the bounded retry budget is exhausted does the playlist move on.
+    target.clock.advance(10000);
+    await settle(target.win, target.clock, 60);
     expect(engine.index()).toBe(1);
   });
 });

@@ -67,7 +67,13 @@
     unexpected: 'خطأ غير متوقع.',
     fatalReason: 'أوقف خطأ غير متوقع التشغيل الطبيعي للمشغل.',
     enableAudio: 'تشغيل الصوت',
-    audioHint: 'اضغط لتفعيل صوت الفيديو.'
+    audioHint: 'اضغط لتفعيل صوت الفيديو.',
+    rePairScreen: 'إعادة ربط الشاشة',
+    unpairedNotice: 'الشاشة غير مربوطة من لوحة الإدارة؛ يستمر العرض المحلي للوسائط المحفوظة.',
+    playbackLabel: 'العرض',
+    playbackFromCache: 'يعرض من التخزين المحلي',
+    playbackIdle: 'لا يوجد وسيط معروض الآن',
+    recoveryLabel: 'الاستعادة'
   };
 
   function createElement(doc, tag, className, text) {
@@ -79,6 +85,10 @@
 
   function clearNode(node) {
     while (node.firstChild) node.removeChild(node.firstChild);
+  }
+
+  function isFn(value) {
+    return typeof value === 'function';
   }
 
   function logLine(entry) {
@@ -142,7 +152,14 @@
       playing: false,
       audioEnabled: false,
       audioUnlockRequired: false,
-      diagnosticsOpen: false
+      diagnosticsOpen: false,
+      pairFormExplicit: false,
+      resume: null,
+      playbackInfo: null,
+      emptyTicks: 0,
+      syncFailures: 0,
+      lastSyncAttemptAt: 0,
+      lastSyncError: ''
     };
     var nodes = {};
     var storage = null;
@@ -154,7 +171,17 @@
     var syncTimer = null;
     var heartbeatTimer = null;
     var scheduleTimer = null;
+    var watchdogTimer = null;
     var reloadVersion = 0;
+    // A page reload is the last-resort recovery only: it is rate limited and its timestamp is
+    // persisted, so a broken television can never end up in a reload loop.
+    var RECOVERY_WINDOW_MS = 600000;
+    var WATCHDOG_INTERVAL_MS = 15000;
+    var recoveryBlockedUntil = 0;
+    var reloadInFlight = false;
+    var syncFailures = 0;
+    var syncBackoffMs = 0;
+    var lastSyncAttemptAt = 0;
 
     function record(event, data) {
       log.push({ event: event, data: data || null, at: Date.now() });
@@ -333,6 +360,11 @@
       statusList.appendChild(createElement(doc, 'div', 'sp-row', TEXTS.storageLabel + ': ' + ((storage && storage.backend) || '—')));
       statusList.appendChild(createElement(doc, 'div', 'sp-row', TEXTS.cachedLabel + ': ' + state.cachedCount));
       statusList.appendChild(createElement(doc, 'div', 'sp-row', TEXTS.lastSyncLabel + ': ' + (state.lastSyncAt || TEXTS.lastSyncNever)));
+      statusList.appendChild(createElement(doc, 'div', 'sp-row', TEXTS.playbackLabel + ': ' + (engineStageVisible() ? TEXTS.playbackFromCache : TEXTS.playbackIdle)));
+      if (state.playbackInfo && state.playbackInfo.hash) {
+        statusList.appendChild(createElement(doc, 'div', 'sp-row sp-mono', 'playback: ' + String(state.playbackInfo.hash).slice(0, 12) + ' · ' + (Number(state.playbackInfo.positionMs) || 0) + 'ms'));
+      }
+      if (state.syncFailures) statusList.appendChild(createElement(doc, 'div', 'sp-row', TEXTS.recoveryLabel + ': ' + state.syncFailures));
       if (state.error) statusList.appendChild(createElement(doc, 'div', 'sp-row', TEXTS.errorLabel + ': ' + state.error));
       var notes = (storage && storage.notes) || [];
       for (var n = 0; n < notes.length; n += 1) statusList.appendChild(createElement(doc, 'div', 'sp-row', TEXTS.notesLabel + ': ' + notes[n]));
@@ -347,8 +379,15 @@
 
       var actions = createElement(doc, 'div', 'sp-actions');
       actions.appendChild(button(TEXTS.retry, 'sp-primary', function () { retryEverything(); }));
+      actions.appendChild(button(TEXTS.rePairScreen, 'sp-secondary', function () {
+        // Explicit operator action: only this path may cover playing content with the pair form.
+        state.pairFormExplicit = true;
+        state.showPairForm = true;
+        state.diagnosticsOpen = false;
+        paint();
+      }));
       var reload = button(TEXTS.reload, 'sp-secondary', function () {
-        try { win.location.reload(); } catch (error) { /* some TV browsers block reload */ }
+        reloadNow('manual');
       });
       actions.appendChild(reload);
       actions.appendChild(button(TEXTS.close, 'sp-secondary', function () {
@@ -415,20 +454,47 @@
       }
     }
 
+    /** True when the engine is showing media or is about to (a decoded image is already prepared). */
+    function engineStageVisible() {
+      if (!engine) return false;
+      try {
+        return Boolean(isFn(engine.isMounted) && engine.isMounted()) ||
+          Boolean(isFn(engine.isPending) && engine.isPending());
+      } catch (error) { return false; }
+    }
+
+    function hasPlayableContent() {
+      try { return runtime.hasPlayableContent(state.manifest); } catch (error) { return Boolean(state.manifest); }
+    }
+
+    /**
+     * The overlay is never allowed to cover media that is on screen. It appears only when there is
+     * genuinely nothing to show, or when the operator explicitly asks for the diagnostics / pairing
+     * screens. Background synchronization therefore cannot dim, blank or interrupt playback.
+     */
     function paint() {
       if (!nodes.overlay) return;
       clearNode(nodes.overlay);
-      var hasContent = Boolean(state.manifest);
-      var showOverlay = state.diagnosticsOpen || state.showPairForm || !hasContent || !state.playing;
+      var hasContent = hasPlayableContent();
+      var stageVisible = engineStageVisible();
+      var pairVisible = state.showPairForm && (state.pairFormExplicit || !hasContent || !stageVisible);
+      // `emptyTicks` is raised by the playback watchdog only after the stage has been genuinely
+      // empty for half a minute: an operator then gets an explanation instead of a silent black
+      // screen. It never appears while media is loading normally (images report pending, videos
+      // start within the same watchdog window).
+      var stalled = !stageVisible && state.emptyTicks >= 2;
+      var showOverlay = state.diagnosticsOpen || pairVisible || !hasContent || (!state.playing && !stageVisible) || stalled;
       nodes.overlay.className = 'sp-overlay';
       nodes.overlay.style.display = showOverlay ? 'block' : 'none';
       if (state.diagnosticsOpen) {
         nodes.overlay.appendChild(renderDiagnostics());
-      } else if (state.showPairForm) {
+      } else if (pairVisible) {
         nodes.overlay.appendChild(renderPairing(hasContent));
       } else if (!hasContent) {
         nodes.overlay.appendChild(state.phase === 'no_content' ? renderNoContent() : renderSync());
-      } else if (!state.playing) {
+      } else if (!state.playing && !stageVisible) {
+        nodes.overlay.appendChild(renderSync());
+      } else if (stalled) {
         nodes.overlay.appendChild(renderSync());
       }
       renderStatusBar();
@@ -445,10 +511,11 @@
     function fatal(error, code) {
       state.error = runtime.message(error, TEXTS.unexpected);
       state.phase = 'error';
-      state.playing = state.playing && Boolean(state.manifest);
       record('fatal', { code: code || runtime.errorCode(error), message: String(state.error).slice(0, 200) });
       paint();
-      openDiagnostics('fatal');
+      // A failure must never replace media that is already playing with an error screen: the
+      // diagnostics panel is only opened when there is nothing on the screen to protect.
+      if (!engineStageVisible() && !state.playing) openDiagnostics('fatal');
     }
 
     /* ------------------------------------------------------------------ pairing ------------------*/
@@ -473,6 +540,7 @@
         state.screenName = (result.screen && result.screen.name) || state.screenName;
         state.pairCode = '';
         state.showPairForm = false;
+        state.pairFormExplicit = false;
         state.online = true;
         record('pair_ok', { screen: state.screenName });
         attachEngine(result.credential);
@@ -489,11 +557,33 @@
 
     /* ------------------------------------------------------------------ engine -------------------*/
 
+    /** Options shared by every sync instance so garbage collection always protects live media. */
+    function syncOptions(token) {
+      return {
+        win: win, storage: storage, http: http, token: token, Promise: P, log: record,
+        protectHashes: function () {
+          try { return engine && isFn(engine.protectedHashes) ? engine.protectedHashes() : []; }
+          catch (error) { return []; }
+        },
+        onProgress: function (payload) {
+          state.progress = payload;
+          // Never repaint while media is on screen: synchronization must not touch the picture.
+          if (!state.playing) paint();
+        }
+      };
+    }
+
+    function persistPlaybackState(info) {
+      state.playbackInfo = info || state.playbackInfo;
+      if (!storage || !isFn(storage.setPlaybackState) || !state.playbackInfo) return;
+      try { storage.setPlaybackState(state.playbackInfo); } catch (error) { /* never fatal */ }
+    }
+
     function attachEngine(token) {
       if (engine) {
         try { engine.stop(); } catch (error) { /* a stop failure must not block re-attachment */ }
       }
-      sync = token ? syncFactory({ win: win, storage: storage, http: http, token: token, Promise: P, log: record }) : null;
+      sync = token ? syncFactory(syncOptions(token)) : null;
       engine = engineFactory({
         win: win,
         doc: doc,
@@ -504,6 +594,7 @@
         token: token || null,
         Promise: P,
         audioEnabled: state.audioEnabled,
+        resume: state.resume || null,
         log: record,
         onAudioBlocked: function () {
           state.audioUnlockRequired = true;
@@ -520,16 +611,25 @@
         onItem: function () {
           state.playing = true;
           if (state.phase !== 'syncing') state.phase = 'playing';
+        },
+        onProgress: persistPlaybackState,
+        onRecoveryExhausted: function (info) {
+          record('recovery_exhausted', info || null);
+          recoveryReload('watchdog');
         }
       });
-      if (state.manifest) {
+      if (state.manifest && hasPlayableContent()) {
+        // Priority: cached manifest -> cached media -> playback. No network request is awaited
+        // before this call, so the first frame never depends on Vercel, Supabase or auth.
         engine.setManifest(state.manifest);
         engine.setPlaylist(runtime.scheduledPlaylistId(win, state.manifest, new Date()));
         engine.render();
         state.playing = true;
         state.phase = 'playing';
-        paint();
+      } else {
+        state.playing = false;
       }
+      paint();
       return engine;
     }
 
@@ -537,40 +637,64 @@
 
     function applyManifest(manifest) {
       if (!manifest) return null;
+      var previousHash = state.manifest && state.manifest.manifestHash ? state.manifest.manifestHash : null;
+      var sameContent = Boolean(previousHash && manifest.manifestHash && previousHash === manifest.manifestHash);
       state.manifest = manifest;
       state.screenName = (manifest.screen && manifest.screen.name) || state.screenName;
-      state.playing = true;
-      state.phase = 'playing';
-      state.message = '';
+      var playable = runtime.hasPlayableContent(manifest);
       if (engine) {
         engine.setManifest(manifest);
         engine.setPlaylist(runtime.scheduledPlaylistId(win, manifest, new Date()));
-        engine.render();
+        // A background synchronization must never interrupt the picture: when the content is
+        // unchanged the engine is left completely alone, and even for a new playlist the engine
+        // keeps the current item on screen until its own transition decides otherwise.
+        if (!sameContent) engine.render();
       }
+      state.playing = playable;
+      if (playable) state.phase = 'playing';
+      state.message = '';
       paint();
       var requested = manifest.commands && Number(manifest.commands.reloadVersion);
       if (requested && requested > reloadVersion) {
         reloadVersion = requested;
         return storage.setSeenReloadVersion(requested).then(function () {
-          try { win.location.reload(); } catch (error) { /* offline TVs keep the cached shell running */ }
+          // An explicit reload command from the admin app: persist the position first so the
+          // television resumes the same cached item after it comes back.
+          reloadNow('command');
           return null;
         }, function () { return null; });
       }
       return null;
     }
 
+    /**
+     * Background synchronization. It is deliberately fire-and-forget from the playback point of
+     * view: every failure ends in a recorded diagnostic plus a retry later, never in a paused
+     * player, a cleared cache, a redirect or a blocking screen.
+     */
     function performSync(requestedToken) {
       var token = requestedToken || state.token;
       if (!token || !storage) return P.resolve(false);
       if (syncLock) return P.resolve(false);
       syncLock = true;
+      lastSyncAttemptAt = Date.now();
       state.phase = state.manifest ? 'playing' : 'syncing';
       state.error = '';
       record('sync_start', null);
-      paint();
-      var activeSync = syncFactory({ win: win, storage: storage, http: http, token: token, Promise: P, log: record });
+      if (!state.playing) paint();
+      var activeSync;
+      try {
+        activeSync = syncFactory(syncOptions(token));
+      } catch (error) {
+        syncLock = false;
+        record('sync_init_failed', { message: runtime.message(error, 'sync init failed') });
+        return P.resolve(false);
+      }
       return activeSync.run().then(function (result) {
         syncLock = false;
+        syncFailures = 0;
+        syncBackoffMs = 0;
+        state.syncFailures = 0;
         state.online = true;
         state.progress = null;
         if (result.lastSyncAt) state.lastSyncAt = result.lastSyncAt;
@@ -583,15 +707,22 @@
         var code = runtime.errorCode(error);
         state.progress = null;
         state.error = runtime.message(error, TEXTS.syncFailed);
-        record('sync_failed', { code: code, message: String(state.error).slice(0, 200) });
+        state.lastSyncError = state.error;
+        syncFailures += 1;
+        state.syncFailures = syncFailures;
+        syncBackoffMs = Math.min(600000, 60000 * Math.pow(2, Math.min(syncFailures - 1, 4)));
+        record('sync_failed', { code: code, message: String(state.error).slice(0, 200), backoffMs: syncBackoffMs });
         if (code === 'screen_unauthorized') {
           state.token = null;
           return storage.clearCredential().then(function () {
-            if (!state.manifest) { state.showPairForm = true; state.phase = 'pair'; }
+            // Cached content is never replaced by a pairing screen: the operator re-pairs from the
+            // diagnostics panel, and until then playback continues from the local cache.
+            if (!state.manifest || !hasPlayableContent()) { state.showPairForm = true; state.phase = 'pair'; }
+            else state.notice = TEXTS.unpairedNotice;
             paint();
             return false;
           }, function () {
-            if (!state.manifest) { state.showPairForm = true; state.phase = 'pair'; }
+            if (!state.manifest || !hasPlayableContent()) { state.showPairForm = true; state.phase = 'pair'; }
             paint();
             return false;
           });
@@ -605,6 +736,12 @@
           return P.resolve(refreshStorageState()).then(function () { return false; });
         }
         state.phase = code === 'no_published_content' ? 'no_content' : 'error';
+        paint();
+        return false;
+      })['catch'](function (error) {
+        // The promise chain itself must never produce an unhandled rejection.
+        syncLock = false;
+        record('sync_internal_error', { message: runtime.message(error, 'unknown') });
         paint();
         return false;
       });
@@ -622,14 +759,81 @@
       }, function () { return false; });
     }
 
+    /**
+     * The ONLY place that reloads the page. It is used for the last-resort watchdog recovery and
+     * for an explicit reload command from the admin app — never for a failed API request. It is
+     * rate limited in memory and on disk so a television can never enter a reload loop.
+     */
+    function reloadNow(reason) {
+      if (reloadInFlight) return false;
+      reloadInFlight = true;
+      var now = Date.now();
+      if (now < recoveryBlockedUntil) {
+        record('reload_suppressed', { reason: reason });
+        reloadInFlight = false;
+        return false;
+      }
+      recoveryBlockedUntil = now + RECOVERY_WINDOW_MS;
+      record('reload', { reason: reason });
+      if (state.playbackInfo) persistPlaybackState(state.playbackInfo);
+      var armed = false;
+      function go() {
+        if (armed) return;
+        armed = true;
+        try { win.location.reload(); }
+        catch (error) { reloadInFlight = false; }
+      }
+      try {
+        if (storage && isFn(storage.setRecoveryState)) {
+          storage.setRecoveryState({ at: now, reason: String(reason || 'unknown').slice(0, 60) }).then(go, go);
+          win.setTimeout(go, 500);
+          return true;
+        }
+      } catch (error) { /* fall through to the immediate reload */ }
+      go();
+      return true;
+    }
+
+    function recoveryReload(reason) {
+      return reloadNow(reason);
+    }
+
+    /** Lightweight watchdog: reinitializes playback locally before any page-level recovery. */
+    function checkPlayback() {
+      try {
+        if (!engine || !state.manifest) return;
+        if (!hasPlayableContent()) { state.emptyTicks = 0; return; }
+        if (engineStageVisible()) { state.emptyTicks = 0; return; }
+        state.emptyTicks += 1;
+        record('watchdog_empty_stage', { ticks: state.emptyTicks, offline: !state.online });
+        if (state.emptyTicks === 2) {
+          // Half a minute with nothing on the stage: explain it to the operator (never while media
+          // is on screen, so this cannot dim or cover playback) and re-arm the local playlist once.
+          paint();
+          try { engine.render(); } catch (error) { record('watchdog_render_failed', { message: runtime.message(error, 'unknown') }); }
+        } else if (state.emptyTicks >= 4 && isFn(engine.hasLocalMedia) && engine.hasLocalMedia()) {
+          // Media is cached but nothing reached the screen for a full minute: reinitialize the
+          // player. Guarded, so an offline television with an empty cache is never reloaded.
+          state.emptyTicks = 0;
+          recoveryReload('watchdog_empty_stage');
+        }
+      } catch (error) {
+        record('watchdog_failed', { message: runtime.message(error, 'unknown') });
+      }
+    }
+
     function retryEverything() {
       state.error = '';
       state.notice = '';
+      state.emptyTicks = 0;
       if (!storage) {
-        try { win.location.reload(); } catch (error) { /* fall through to the pairing form */ }
+        state.showPairForm = true;
+        state.phase = 'pair';
+        paint();
         return;
       }
       if (state.token) {
+        try { if (engine) engine.render(); } catch (error) { /* the sync below is the real retry */ }
         performSync(state.token).then(function () { paint(); });
         return;
       }
@@ -638,6 +842,11 @@
           state.token = token;
           attachEngine(token);
           return performSync(token);
+        }
+        if (state.manifest && hasPlayableContent()) {
+          // Cached content keeps playing: pairing is offered through the diagnostics panel.
+          state.notice = TEXTS.unpairedNotice;
+          return null;
         }
         state.showPairForm = true;
         state.phase = 'pair';
@@ -664,7 +873,7 @@
     }
 
     function heartbeat() {
-      if (!state.token || heartbeatLock || !navigatorOnline()) return;
+      if (!state.token || heartbeatLock) return;
       heartbeatLock = true;
       var item = engine ? engine.currentItem() : null;
       var playlistId = engine ? engine.playlistId() : null;
@@ -692,7 +901,8 @@
         if (response.status === 401) {
           state.token = null;
           return storage.clearCredential().then(function () {
-            if (!state.manifest) { state.showPairForm = true; state.phase = 'pair'; }
+            if (!state.manifest || !hasPlayableContent()) { state.showPairForm = true; state.phase = 'pair'; }
+            else state.notice = TEXTS.unpairedNotice;
             paint();
             return null;
           }, function () { return null; });
@@ -713,23 +923,38 @@
       if (syncTimer) win.clearInterval(syncTimer);
       if (heartbeatTimer) win.clearInterval(heartbeatTimer);
       if (scheduleTimer) win.clearInterval(scheduleTimer);
+      if (watchdogTimer) win.clearInterval(watchdogTimer);
       syncTimer = win.setInterval(function () {
-        if (state.token && state.online && !syncLock) performSync(state.token);
+        if (!state.token || syncLock) return;
+        // Retry with backoff: a longer outage never hammers the server, and the attempt is cheap
+        // and bounded when the television is offline.
+        if (Date.now() - lastSyncAttemptAt < syncBackoffMs) return;
+        performSync(state.token);
       }, 60000);
-      heartbeatTimer = win.setInterval(heartbeat, 60000);
-      scheduleTimer = win.setInterval(tickSchedule, 15000);
+      heartbeatTimer = win.setInterval(function () {
+        try { heartbeat(); } catch (error) { record('heartbeat_failed', { message: runtime.message(error, 'unknown') }); }
+      }, 60000);
+      scheduleTimer = win.setInterval(function () {
+        try { tickSchedule(); } catch (error) { record('schedule_failed', { message: runtime.message(error, 'unknown') }); }
+      }, 15000);
+      watchdogTimer = win.setInterval(checkPlayback, WATCHDOG_INTERVAL_MS);
     }
 
     function bindEnvironment() {
       if (!win.addEventListener) return;
       win.addEventListener('online', function () {
         state.online = true;
+        syncFailures = 0;
+        syncBackoffMs = 0;
+        state.syncFailures = 0;
         renderStatusBar();
+        // The network came back: synchronization resumes, playback was never paused for it.
         if (state.token) performSync(state.token);
       });
       win.addEventListener('offline', function () {
         state.online = false;
         renderStatusBar();
+        // Nothing else happens here on purpose: the cache keeps the playlist running.
       });
       win.addEventListener('error', function (event) {
         record('window_error', { message: event && event.message ? String(event.message).slice(0, 200) : 'unknown' });
@@ -777,45 +1002,78 @@
       return storagePromise.then(function (adapter) {
         storage = adapter;
         state.storage = adapter;
+        state.online = navigatorOnline();
         record('storage', { backend: adapter.backend });
+        // Startup priority: the local playlist and the cached media are the only things in the
+        // critical path. Statistics, sync bookkeeping and the audio preference are all read in the
+        // background (see backgroundWork) because none of them can put pixels on the screen.
         return P.all([
           adapter.getCredential(),
           adapter.getActiveManifest(),
-          adapter.getStats(),
-          adapter.getLastSyncAt(),
-          adapter.countCachedAssets(),
-          adapter.getSeenReloadVersion(),
-          typeof adapter.getAudioEnabled === 'function' ? adapter.getAudioEnabled() : P.resolve(false)
+          typeof adapter.getPlaybackState === 'function' ? adapter.getPlaybackState() : P.resolve(null),
+          typeof adapter.getRecoveryState === 'function' ? adapter.getRecoveryState() : P.resolve(null)
         ]);
       }).then(function (values) {
         var token = values[0];
         var manifest = values[1];
-        state.stats = values[2] || state.stats;
-        state.lastSyncAt = values[3] || null;
-        state.cachedCount = values[4] || 0;
-        reloadVersion = Number(values[5]) || 0;
-        state.audioEnabled = Boolean(values[6]);
+        var playback = values[2];
+        var recovery = values[3];
         state.token = token || null;
         state.manifest = manifest || null;
+        state.resume = playback || null;
+        state.playbackInfo = playback || null;
         state.screenName = (manifest && manifest.screen && manifest.screen.name) || '';
-        attachEngine(state.token);
-        if (!state.token) {
-          state.showPairForm = true;
-          if (!manifest) state.phase = 'pair';
-          paint();
-          startTimers();
-          return false;
+        if (recovery && recovery.at && (Date.now() - Number(recovery.at)) < RECOVERY_WINDOW_MS) {
+          recoveryBlockedUntil = Number(recovery.at) + RECOVERY_WINDOW_MS;
         }
+        var playable = runtime.hasPlayableContent(manifest);
+        // A: local manifest, B: cached media, C: playback. No network request has been awaited yet.
+        attachEngine(state.token);
         startTimers();
-        heartbeat();
-        return performSync(state.token).then(function () { paint(); return true; });
-      }).then(function (ready) {
-        if (!ready && state.token) paint();
-        return ready;
+        if (playable) {
+          state.playing = true;
+          state.phase = 'playing';
+          if (!state.token) state.notice = TEXTS.unpairedNotice;
+        } else if (!state.token) {
+          state.phase = 'pair';
+          state.showPairForm = true;
+        } else {
+          state.phase = 'syncing';
+        }
+        paint();
+        // E: background synchronization, only after playback has started (or when there is nothing
+        // to play, in which case synchronization is the only way to get content).
+        backgroundWork();
+        if (playable || state.token) return true;
+        return false;
       }, function (error) {
         fatal(error, 'boot_failed');
         return false;
       });
+    }
+
+    /**
+     * Everything that is optional for playback. Each call is individually guarded: a failure here
+     * is a diagnostic, never a stopped player.
+     */
+    function backgroundWork() {
+      try { refreshStorageState(); } catch (error) { record('storage_state_failed', { message: runtime.message(error, 'unknown') }); }
+      if (storage && isFn(storage.getSeenReloadVersion)) {
+        storage.getSeenReloadVersion().then(function (value) { reloadVersion = Number(value) || 0; }, function () { return null; });
+      }
+      if (storage && isFn(storage.getAudioEnabled)) {
+        storage.getAudioEnabled().then(function (value) {
+          state.audioEnabled = Boolean(value);
+        }, function () { return null; });
+      }
+      if (!state.token) return;
+      try {
+        heartbeat();
+      } catch (error) { record('heartbeat_failed', { message: runtime.message(error, 'unknown') }); }
+      performSync(state.token).then(function (ready) {
+        if (!ready && !hasPlayableContent()) paint();
+        return null;
+      }, function () { return null; });
     }
 
     return {

@@ -16,7 +16,7 @@
  *   3. `window.__signageGuard` reveals the diagnostic panel with the browser report if the runtime
  *      never signals `__signageBooted`, or if a player script fails to load (onerror).
  */
-export const PLAYER_VERSION = '2.1.0-1';
+export const PLAYER_VERSION = '2.2.0-1';
 
 export const PLAYER_ASSETS = ['/player/sha256.js', '/player/runtime.js', '/player/player.js'] as const;
 
