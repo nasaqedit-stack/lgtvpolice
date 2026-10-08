@@ -1,22 +1,27 @@
-/* The service worker caches only the player app shell and immutable app bundles.
-   Signage media is stored separately in IndexedDB; APIs and signed media URLs are NEVER cached here. */
-const CACHE_NAME = 'signage-player-shell-v1';
+/* Optional offline shell for the signage player.
+ *
+ * The player NEVER depends on this worker: media lives in IndexedDB, the runtime is three classic
+ * scripts, and everything works when no service worker exists (webOS 3.5 has none at all).
+ *
+ * When a modern browser does register it, it only ever caches the /player shell document and the
+ * three player scripts, and navigations are network-first so a new deployment always reaches the
+ * television. APIs, storage URLs and signed media URLs are never cached here.
+ */
+const CACHE_NAME = 'signage-player-shell-v2';
 const SHELL_PATH = '/player';
+const PLAYER_ASSETS = ['/player/sha256.js', '/player/runtime.js', '/player/player.js'];
 
 self.addEventListener('install', event => {
   event.waitUntil((async () => {
     const cache = await caches.open(CACHE_NAME);
     try {
       const response = await fetch(SHELL_PATH, { cache: 'reload', credentials: 'same-origin' });
-      if (response.ok) {
-        const copy = response.clone();
-        await cache.put(SHELL_PATH, copy);
-        const html = await response.text();
-        const assets = [...new Set((html.match(/\/_next\/static\/[A-Za-z0-9_./-]+/g) || []))];
-        await Promise.all(assets.map(path => cache.add(path).catch(() => undefined)));
-      }
-    } catch { /* A failed install leaves the browser's regular app cache usable. */ }
-    await cache.add('/manifest.webmanifest').catch(() => undefined);
+      if (response.ok) await cache.put(SHELL_PATH, response.clone());
+    } catch { /* a failed install leaves the browser's regular HTTP cache usable */ }
+    await Promise.all(
+      PLAYER_ASSETS.concat(['/manifest.webmanifest'])
+        .map(path => cache.add(new Request(path, { cache: 'reload' })).catch(() => undefined))
+    );
     await self.skipWaiting();
   })());
 });
@@ -24,6 +29,7 @@ self.addEventListener('install', event => {
 self.addEventListener('activate', event => {
   event.waitUntil((async () => {
     const names = await caches.keys();
+    // Older shell caches may hold an outdated /player document: drop them on activation.
     await Promise.all(names.filter(name => name.startsWith('signage-player-shell-') && name !== CACHE_NAME).map(name => caches.delete(name)));
     await self.clients.claim();
   })());
@@ -37,30 +43,28 @@ self.addEventListener('fetch', event => {
   if (url.pathname.startsWith('/api/') || url.pathname.startsWith('/storage/')) return;
 
   const isPlayerNavigation = request.mode === 'navigate' && (url.pathname === '/player' || url.pathname === '/player/');
-  const isHashedBundle = url.pathname.startsWith('/_next/static/');
+  const isPlayerAsset = PLAYER_ASSETS.indexOf(url.pathname) !== -1;
   const isManifest = url.pathname === '/manifest.webmanifest';
-  if (!isPlayerNavigation && !isHashedBundle && !isManifest) return;
+  if (!isPlayerNavigation && !isPlayerAsset && !isManifest) return;
 
   event.respondWith((async () => {
     const cache = await caches.open(CACHE_NAME);
-    const cacheKey = isPlayerNavigation ? SHELL_PATH : request;
-    const cached = await cache.match(cacheKey, { ignoreSearch: isHashedBundle });
-    if (cached) {
-      if (!isPlayerNavigation) return cached;
-      // App shell navigation is cache-first for offline TV restarts. Background refresh is best-effort.
-      fetch(request).then(response => { if (response.ok) cache.put(SHELL_PATH, response.clone()); }).catch(() => undefined);
-      return cached;
-    }
-    try {
-      const response = await fetch(request);
-      if (response.ok) cache.put(cacheKey, response.clone()).catch(() => undefined);
-      return response;
-    } catch (error) {
-      if (isPlayerNavigation) {
+    if (isPlayerNavigation) {
+      // Network first: a fresh deployment must win whenever the television is online.
+      try {
+        const response = await fetch(request);
+        if (response.ok) cache.put(SHELL_PATH, response.clone()).catch(() => undefined);
+        return response;
+      } catch (error) {
         const fallback = await cache.match(SHELL_PATH);
         if (fallback) return fallback;
+        throw error;
       }
-      throw error;
     }
+    const cached = await cache.match(request, { ignoreSearch: isPlayerAsset });
+    if (cached) return cached;
+    const response = await fetch(request);
+    if (response.ok) cache.put(request, response.clone()).catch(() => undefined);
+    return response;
   })());
 });
