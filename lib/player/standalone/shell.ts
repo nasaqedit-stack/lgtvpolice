@@ -15,7 +15,7 @@
  *   2. `window.__signageGuard` shows a diagnostic and retries missing assets automatically without
  *      requiring a remote-control action or reloading the page.
  */
-export const PLAYER_VERSION = '2.2.0-2';
+export const PLAYER_VERSION = '2.2.0-3';
 
 export const PLAYER_ASSETS = ['/player/sha256.js', '/player/runtime.js', '/player/player.js'] as const;
 

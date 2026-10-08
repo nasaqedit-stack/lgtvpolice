@@ -245,7 +245,7 @@ describe('the optional offline shell (service worker)', () => {
   const sw = readFileSync(path.join(process.cwd(), 'public', 'sw.js'), 'utf8');
 
   it('never touches APIs, storage URLs or older shell caches', () => {
-    expect(sw).toContain("signage-player-shell-v3");
+    expect(sw).toContain("signage-player-shell-v4");
     expect(sw).toContain("name.startsWith('signage-player-shell-')");
     expect(sw).toContain("url.pathname.startsWith('/api/')");
     expect(sw).toContain("url.pathname.startsWith('/storage/')");
