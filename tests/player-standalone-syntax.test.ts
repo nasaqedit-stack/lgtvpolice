@@ -115,10 +115,12 @@ describe('player scripts are ES5', () => {
     expect(sha).toContain('digestHex');
   });
 
-  it('falls back to muted autoplay and reuses a persistent video element', () => {
+  it('falls back to muted autoplay and reuses a bounded pair of video elements', () => {
     const runtime = stripComments(readScript('runtime.js'));
     expect(runtime).toContain('function createVideoElement()');
-    expect(runtime).toContain('if (state.videoElement) return state.videoElement;');
+    expect(runtime).toContain('function videoForRender()');
+    expect(runtime).toContain('if (state.videoElements[i] !== state.element) return state.videoElements[i];');
+    expect(runtime).toContain('if (state.videoElements.length < 2) return createVideoElement();');
     expect(runtime).toMatch(/setAttribute\(['"]muted/);
     expect(runtime).toMatch(/video\.muted\s*=\s*true/);
     expect(runtime).toContain('video_auto_resume');
@@ -245,7 +247,7 @@ describe('the optional offline shell (service worker)', () => {
   const sw = readFileSync(path.join(process.cwd(), 'public', 'sw.js'), 'utf8');
 
   it('never touches APIs, storage URLs or older shell caches', () => {
-    expect(sw).toContain("signage-player-shell-v7");
+    expect(sw).toContain("signage-player-shell-v9");
     expect(sw).toContain("name.startsWith('signage-player-shell-')");
     expect(sw).toContain("url.pathname.startsWith('/api/')");
     expect(sw).toContain("url.pathname.startsWith('/storage/')");

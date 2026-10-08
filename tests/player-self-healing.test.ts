@@ -16,7 +16,7 @@
  */
 import { IDBFactory } from 'fake-indexeddb';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createPage, createTransport, settle, waitFor, type FakePage } from './player-harness';
+import { createPage, createTransport, refreshManifestHash, settle, waitFor, type FakePage } from './player-harness';
 import { PLAYER_DIR } from './player-harness';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
@@ -405,6 +405,7 @@ describe('24/7 self-healing player — named acceptance tests', () => {
     const { buildFixture } = await import('./player-harness');
     const fixture = buildFixture();
     fixture.manifest.commands = { syncVersion: 1, reloadVersion: 1 };
+    refreshManifestHash(fixture.manifest);
     const plan = createTransport(fixture);
     const target = tv({ indexedDb: new IDBFactory(), transport: plan.transport });
     await seedCache(target, fixture);
@@ -424,8 +425,8 @@ describe('24/7 self-healing player — named acceptance tests', () => {
   it('10. an obsolete command is skipped instead of being queued behind a newer one', async () => {
     const { buildFixture } = await import('./player-harness');
     const fixture = buildFixture();
-    fixture.manifest.manifestHash = 'a'.repeat(64);
     fixture.manifest.commands = { syncVersion: 1, reloadVersion: 5 };
+    refreshManifestHash(fixture.manifest);
     const plan = createTransport(fixture);
     const target = tv({ indexedDb: new IDBFactory(), transport: plan.transport });
     await seedCache(target, fixture);
@@ -436,7 +437,7 @@ describe('24/7 self-healing player — named acceptance tests', () => {
 
     // The server rewinds to an older version (a restored backup, a replayed queue entry).
     fixture.manifest.commands.reloadVersion = 3;
-    fixture.manifest.manifestHash = 'b'.repeat(64);
+    refreshManifestHash(fixture.manifest);
     for (let round = 0; round < 3; round += 1) target.clock.advance(61000);
     await settle(target.win, target.clock, 400);
 
@@ -444,7 +445,7 @@ describe('24/7 self-healing player — named acceptance tests', () => {
     expect(player.watchdog().snapshot().lastAppliedCommandVersion).toBe(5);
     // A newer version still wins: the player always converges on the latest authoritative state.
     fixture.manifest.commands.reloadVersion = 6;
-    fixture.manifest.manifestHash = 'c'.repeat(64);
+    refreshManifestHash(fixture.manifest);
     for (let round = 0; round < 3; round += 1) target.clock.advance(61000);
     await settle(target.win, target.clock, 400);
     expect(player.log().filter((entry: any) => entry.event === 'reload_command_received').length).toBe(2);
@@ -454,6 +455,7 @@ describe('24/7 self-healing player — named acceptance tests', () => {
     const { buildFixture } = await import('./player-harness');
     const fixture = buildFixture();
     fixture.manifest.commands = { syncVersion: 1, reloadVersion: 2 };
+    refreshManifestHash(fixture.manifest);
     const plan = createTransport(fixture);
     const target = tv({ indexedDb: new IDBFactory(), transport: plan.transport });
     const storage = await seedCache(target, fixture);
@@ -479,6 +481,7 @@ describe('24/7 self-healing player — named acceptance tests', () => {
       reloadVersion: 4,
       applied: { syncVersion: 4, reloadVersion: 4 },
     };
+    refreshManifestHash(fixture.manifest);
     const plan = createTransport(fixture);
     const target = tv({ indexedDb: new IDBFactory(), transport: plan.transport });
     await seedCache(target, fixture);

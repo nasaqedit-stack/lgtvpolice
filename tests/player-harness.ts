@@ -121,7 +121,12 @@ export function installMediaStubs(win: any): { play: string[]; pause: string[]; 
   const calls = { play: [] as string[], pause: [] as string[], finished: [] as string[], load: [] as string[] };
   const proto = win.HTMLMediaElement && win.HTMLMediaElement.prototype;
   if (!proto) return calls;
-  proto.play = function play(this: any) { calls.play.push(String(this.src || '')); return win.Promise.resolve(); };
+  proto.play = function play(this: any) {
+    calls.play.push(String(this.src || ''));
+    const result = win.Promise.resolve();
+    result.then(() => { if (typeof this.onplaying === 'function') this.onplaying(); });
+    return result;
+  };
   proto.pause = function pause(this: any) { calls.pause.push(String(this.src || '')); };
   proto.load = function load(this: any) { calls.load.push(String(this.src || '')); return undefined; };
   return calls;
@@ -313,6 +318,7 @@ export function buildFixture(options: FixtureOptions = {}): Fixture {
     ],
     commands: { syncVersion: 1, reloadVersion: 0 }
   };
+  refreshManifestHash(manifest);
   return {
     manifest,
     imageId: ids.image,
@@ -467,6 +473,23 @@ export function sha256Hex(bytes: Uint8Array): string {
   return createHash('sha256').update(Buffer.from(bytes)).digest('hex');
 }
 
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    const object = value as Record<string, unknown>;
+    return `{${Object.keys(object).sort().map((key) => `${JSON.stringify(key)}:${stableJson(object[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+/** Recomputes the server-compatible checksum after a fixture manifest is intentionally changed. */
+export function refreshManifestHash<T extends Record<string, any>>(manifest: T): T {
+  const base = Object.fromEntries(Object.entries(manifest).filter(([key]) =>
+    key !== 'manifestVersion' && key !== 'manifestHash' && key !== 'generatedAt'));
+  (manifest as Record<string, any>).manifestHash = createHash('sha256').update(stableJson(base)).digest('hex');
+  return manifest;
+}
+
 /* -------------------------------------------------------------------------------------------- */
 /* Page factory                                                                                   */
 /* -------------------------------------------------------------------------------------------- */
@@ -509,6 +532,9 @@ export function createPage(options: PageOptions = {}): FakePage {
   const clock = installClock(win);
   const media = installMediaStubs(win);
   const blobUrls = installBlobUrls(win);
+  // The harness cannot decode real media; player tests explicitly control render events instead.
+  // Individual tests may replace this hook to exercise rejected candidate preparation.
+  win.__SIGNAGE_PREFLIGHT_ASSET__ = () => win.Promise.resolve(true);
   if (options.indexedDb) installFakeIndexedDb(win, options.indexedDb);
   if (options.cacheApi) installFakeCaches(win);
   if (options.transport) win.__SIGNAGE_TRANSPORT__ = options.transport;

@@ -17,6 +17,7 @@ import {
   jsonResponse,
   networkError,
   readPlayerScript,
+  refreshManifestHash,
   settle,
   sha256Hex,
   stripModernApis,
@@ -113,6 +114,22 @@ async function saveAsset(storage: any, hash: string, bytes: Uint8Array, mimeType
 }
 
 describe('capability detection', () => {
+  it('exports manifest and asset integrity verifiers at the runtime API boundary', () => {
+    const target = page();
+    const fixture = buildFixture();
+    const asset = fixture.manifest.assets[0];
+
+    expect(target.runtime.validateManifest(fixture.manifest)).toBe(true);
+    expect(target.runtime.verifyManifestIntegrity(fixture.manifest)).toBe(true);
+    expect(target.runtime.verifyAssetIntegrity(fixture.imageBytes, asset)).toBe(true);
+    expect(target.runtime.verifyAssetIntegrity(new TextEncoder().encode('tampered'), asset)).toBe(false);
+
+    const corrupted = JSON.parse(JSON.stringify(fixture.manifest));
+    corrupted.screen.name = 'changed without a new digest';
+    expect(target.runtime.validateManifest(corrupted)).toBe(false);
+    expect(target.runtime.verifyManifestIntegrity(corrupted)).toBe(false);
+  });
+
   it('recognises webOS 3.5 / Chromium 38 and the APIs it lacks', () => {
     const target = page();
     stripModernApis(target.win);
@@ -364,7 +381,9 @@ describe('sync against the player API', () => {
     const invalid = await openSync(target, storage, createTransport(fixture, { manifestInvalid: true }).transport);
     await expect(invalid.sync.run()).rejects.toMatchObject({ code: 'invalid_manifest' });
 
-    const emptyManifest = { ...fixture.manifest, playlists: [], defaultPlaylistId: null, schedules: [] };
+    const emptyManifest = { ...fixture.manifest, playlists: [], defaultPlaylistId: null, schedules: [], assets: [] };
+    refreshManifestHash(emptyManifest);
+    expect(target.runtime.validateManifest(emptyManifest)).toBe(true);
     const noContent = await openSync(target, storage, () => Promise.resolve(jsonResponse(200, emptyManifest)));
     await expect(noContent.sync.run()).rejects.toMatchObject({ code: 'no_published_content' });
   });
@@ -423,7 +442,7 @@ describe('sync against the player API', () => {
   it('refuses corrupted bytes and keeps the previous playlist active', async () => {
     const fixture = buildFixture();
     const mismatched = buildFixture({ hashOverride: { image: 'f'.repeat(64) } });
-    mismatched.manifest.manifestHash = 'b'.repeat(64);
+    refreshManifestHash(mismatched.manifest);
     const target = page();
     const storage = await openStorage(target);
 
@@ -723,6 +742,8 @@ describe('playback engine', () => {
 
   it('reinitializes a stalled video before advancing (watchdog recovery, then skip)', async () => {
     const { fixture, target, storage, http, sync } = await readyPage();
+    // Keep the media clock stationary: the test TV must not synthesize an `onplaying` event here.
+    target.win.HTMLMediaElement.prototype.play = function () { return target.win.Promise.resolve(); };
     const notices: string[] = [];
     const engine = startEngine(target, { storage, sync, http, options: { watchdogMs: 20000, onNotice: (text: string) => notices.push(text) } });
     engine.setManifest(fixture.manifest);

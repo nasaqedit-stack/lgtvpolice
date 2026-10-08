@@ -4,10 +4,9 @@
  * scripts, and everything works when no service worker exists (webOS 3.5 has none at all).
  *
  * When a modern browser does register it, it only ever caches the /player shell document and the
- * three player scripts, and navigations are network-first so a new deployment always reaches the
- * television. APIs, storage URLs and signed media URLs are never cached here.
+ * four player scripts. APIs, storage URLs and signed media URLs are never cached here.
  */
-const CACHE_NAME = 'signage-player-shell-v7';
+const CACHE_NAME = 'signage-player-shell-v9';
 const SHELL_PATH = '/player';
 const PLAYER_ASSETS = ['/player/sha256.js', '/player/runtime.js', '/player/watchdog.js', '/player/player.js'];
 
@@ -16,20 +15,25 @@ self.addEventListener('install', event => {
     const cache = await caches.open(CACHE_NAME);
     try {
       const response = await fetch(SHELL_PATH, { cache: 'reload', credentials: 'same-origin' });
-      if (response.ok) await cache.put(SHELL_PATH, response.clone());
-    } catch { /* a failed install leaves the browser's regular HTTP cache usable */ }
-    await Promise.all(
-      PLAYER_ASSETS.concat(['/manifest.webmanifest'])
-        .map(path => cache.add(new Request(path, { cache: 'reload' })).catch(() => undefined))
-    );
-    await self.skipWaiting();
+      if (!response.ok) throw new Error('player_shell_unavailable');
+      await cache.put(SHELL_PATH, response.clone());
+      // Do not install/activate a partial player update. A failed asset leaves the currently active
+      // service worker and its previous shell cache untouched.
+      await Promise.all(PLAYER_ASSETS.map(path => cache.add(new Request(path, { cache: 'reload' }))));
+      cache.add(new Request('/manifest.webmanifest', { cache: 'reload' })).catch(() => undefined);
+      await self.skipWaiting();
+    } catch (error) {
+      await caches.delete(CACHE_NAME).catch(() => undefined);
+      throw error;
+    }
   })());
 });
 
 self.addEventListener('activate', event => {
   event.waitUntil((async () => {
     const names = await caches.keys();
-    // Older shell caches may hold an outdated /player document: drop them on activation.
+    // Older shell caches may hold an outdated /player document: drop them only after the new worker
+    // successfully installed every required script.
     await Promise.all(names.filter(name => name.startsWith('signage-player-shell-') && name !== CACHE_NAME).map(name => caches.delete(name)));
     await self.clients.claim();
   })());

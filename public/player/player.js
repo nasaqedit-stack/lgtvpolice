@@ -101,9 +101,17 @@
     try { when = new Date(entry.at).toISOString().slice(11, 19); } catch (error) { when = ''; }
     var detail = '';
     if (entry.data) {
-      try { detail = JSON.stringify(entry.data); } catch (error) { detail = ''; }
+      var safe = {};
+      var allowed = { code: true, reason: true, state: true, failures: true, count: true, attempt: true, kind: true, version: true, manifestVersion: true, backoffMs: true, retryInMs: true };
+      for (var key in entry.data) {
+        if (!Object.prototype.hasOwnProperty.call(entry.data, key) || !allowed[key]) continue;
+        var value = entry.data[key];
+        if (typeof value === 'string') value = value.slice(0, 60);
+        if (typeof value === 'number' || typeof value === 'string' || value === null) safe[key] = value;
+      }
+      try { detail = JSON.stringify(safe); } catch (error) { detail = ''; }
     }
-    return when + ' ' + entry.event + (detail ? ' ' + detail : '');
+    return when + ' ' + String(entry.event || 'event').slice(0, 60) + (detail && detail !== '{}' ? ' ' + detail : '');
   }
 
   function wantsDiagnostics(win) {
@@ -145,6 +153,7 @@
       token: null,
       screenName: '',
       manifest: null,
+      latestManifest: null,
       storage: null,
       stats: { usage: null, quota: null, persisted: null, backend: null, notes: [] },
       cachedCount: 0,
@@ -164,7 +173,8 @@
       emptyTicks: 0,
       syncFailures: 0,
       lastSyncAttemptAt: 0,
-      lastSyncError: ''
+      lastSyncError: '',
+      lastErrorCode: ''
     };
     var nodes = {};
     var storage = null;
@@ -190,6 +200,21 @@
     var bootAt = new Date().toISOString();
     var recoveryMeta = { count: 0, lastAt: null, reason: '', state: '', reloads: 0, reinits: 0 };
     var pendingCommandSync = 0;
+    var commandStateReady = false;
+    var credentialReadCancelled = false;
+    var backgroundStarted = false;
+    var startPromise = null;
+    var localStateReady = false;
+    var disposed = false;
+    var eventBindings = [];
+    var environmentBound = false;
+    var previousUnhandledRejection = win.onunhandledrejection;
+    var assignedUnhandledRejection = null;
+    var lastStorageRefreshAt = 0;
+    var preflightedAssetHashes = {};
+    var preflightedAssetOrder = [];
+    var operationalRetryTimer = null;
+    var operationalWarningTimer = null;
 
     function record(event, data) {
       log.push({ event: event, data: data || null, at: Date.now() });
@@ -214,7 +239,7 @@
         storageBackend: storage ? storage.backend : null,
         cachedCount: state.cachedCount,
         lastSyncAt: state.lastSyncAt,
-        lastError: state.error,
+        lastError: state.lastErrorCode,
         notes: (storage && storage.notes) || []
       };
     }
@@ -313,8 +338,8 @@
     function renderSync() {
       var children = [];
       children.push(createElement(doc, 'h1', null, TEXTS.syncTitle));
-      children.push(createElement(doc, 'p', null, (state.progress && state.progress.message) || state.error || TEXTS.syncHelp));
-      if (state.error) children.push(createElement(doc, 'div', 'sp-alert sp-alert-warn', state.error));
+      children.push(createElement(doc, 'p', null, (state.progress && state.progress.message) || (state.error ? TEXTS.syncFailed : TEXTS.syncHelp)));
+      if (state.error) children.push(createElement(doc, 'div', 'sp-alert sp-alert-warn', TEXTS.syncFailed));
       if (state.progress && state.progress.totalBytes > 0) {
         var percent = Math.min(100, Math.round((state.progress.downloadedBytes / state.progress.totalBytes) * 100));
         var track = createElement(doc, 'div', 'sp-track');
@@ -444,7 +469,7 @@
       }
       if (state.error) {
         nodes.status.appendChild(createElement(doc, 'span', null, '·'));
-        nodes.status.appendChild(createElement(doc, 'span', 'sp-notice', String(state.error).slice(0, 160)));
+        nodes.status.appendChild(createElement(doc, 'span', 'sp-notice', TEXTS.syncFailed));
       }
       if (state.notice) {
         nodes.status.appendChild(createElement(doc, 'span', null, '·'));
@@ -459,8 +484,8 @@
     function engineStageVisible() {
       if (!engine) return false;
       try {
-        return Boolean(isFn(engine.isMounted) && engine.isMounted()) ||
-          Boolean(isFn(engine.isPending) && engine.isPending());
+        if (isFn(engine.displayStatus)) return Boolean(engine.displayStatus().healthy);
+        return Boolean(isFn(engine.isMounted) && engine.isMounted()) || Boolean(isFn(engine.isPending) && engine.isPending());
       } catch (error) { return false; }
     }
 
@@ -520,9 +545,10 @@
     }
 
     function fatal(error, code) {
-      state.error = runtime.message(error, TEXTS.unexpected);
+      state.lastErrorCode = code || runtime.errorCode(error);
+      state.error = TEXTS.unexpected;
       state.phase = 'error';
-      record('fatal', { code: code || runtime.errorCode(error), message: String(state.error).slice(0, 200) });
+      record('fatal', { code: state.lastErrorCode });
       paint();
       // A failure must never replace media that is already playing with an error screen: the
       // diagnostics panel is only opened when there is nothing on the screen to protect.
@@ -532,7 +558,7 @@
     /* ------------------------------------------------------------------ pairing ------------------*/
 
     function submitPair() {
-      if (state.pairing) return;
+      if (disposed || state.pairing) return;
       var code = runtime.normalizePairCode(state.pairCode);
       if (code.length !== 8) {
         state.pairError = TEXTS.pairCodeError;
@@ -541,30 +567,31 @@
         return;
       }
       state.pairing = true;
+      credentialReadCancelled = true;
       state.pairError = '';
       requestFullscreen(win);
       paint();
       record('pair_start', null);
       runtime.pairScreen(win, http, storage, code).then(function (result) {
+        if (disposed) return false;
         state.pairing = false;
         state.token = result.credential;
         state.screenName = (result.screen && result.screen.name) || state.screenName;
         state.pairCode = '';
         state.showPairForm = false;
         state.pairFormExplicit = false;
-        state.online = true;
+        state.online = false;
+        state.phase = state.manifest && hasPlayableContent() ? 'playing' : 'syncing';
         record('pair_ok', { screen: state.screenName });
         attachEngine(result.credential);
-        return performSync(result.credential).then(function (ready) {
-          heartbeat(true);
-          return ready;
-        }, function () {
-          heartbeat(true);
-          return false;
-        });
+        startAuthenticatedWork('pair');
+        paint();
+        return true;
       }, function (error) {
+        if (disposed) return null;
         state.pairing = false;
-        state.pairError = runtime.message(error, TEXTS.pairingFailed);
+        state.pairError = TEXTS.pairingFailed;
+        state.lastErrorCode = runtime.errorCode(error);
         state.showPairForm = true;
         if (runtime.errorCode(error) === 'network_offline') state.online = false;
         record('pair_failed', { code: runtime.errorCode(error) });
@@ -578,6 +605,24 @@
     function syncOptions(token) {
       return {
         win: win, storage: storage, http: http, token: token, Promise: P, log: record,
+        deferActivation: true,
+        preflightAsset: function (asset) {
+          if (!asset || !asset.hash) return P.resolve(false);
+          if (preflightedAssetHashes[asset.hash]) return P.resolve(true);
+          var prepared;
+          try {
+            if (isFn(win.__SIGNAGE_PREFLIGHT_ASSET__)) prepared = win.__SIGNAGE_PREFLIGHT_ASSET__(asset);
+            else if (isFn(runtime.preflightAsset)) prepared = runtime.preflightAsset(win, storage, asset, { Promise: P });
+            else prepared = P.resolve(true);
+          } catch (error) { return P.reject(error); }
+          return P.resolve(prepared).then(function (ok) {
+            if (ok === false) return false;
+            preflightedAssetHashes[asset.hash] = true;
+            preflightedAssetOrder.push(asset.hash);
+            while (preflightedAssetOrder.length > 1000) delete preflightedAssetHashes[preflightedAssetOrder.shift()];
+            return true;
+          });
+        },
         protectHashes: function () {
           try { return engine && isFn(engine.protectedHashes) ? engine.protectedHashes() : []; }
           catch (error) { return []; }
@@ -597,14 +642,18 @@
     }
 
     function attachEngine(token) {
+      state.token = token || null;
+      try { sync = state.token && http ? syncFactory(syncOptions(state.token)) : null; }
+      catch (error) { sync = null; record('sync_init_failed_nonblocking', { code: runtime.errorCode(error) }); }
+      // Re-pairing or transport recovery updates the existing engine in place. Replacing it used to
+      // tear down the active element and duplicate its media handlers during a reconnect.
       if (engine) {
-        try { engine.stop(); } catch (error) { /* a stop failure must not block re-attachment */ }
+        try { if (isFn(engine.setNetwork)) engine.setNetwork(sync, http, state.token); }
+        catch (error) { record('engine_network_update_failed', { code: runtime.errorCode(error) }); }
+        wd('setHasCredential', [Boolean(state.token && http && commandStateReady)]);
+        return engine;
       }
-      // The watchdog must learn about the credential here and nowhere else: a television that pairs
-      // AFTER boot (fresh pairing, credential re-issued by the server) would otherwise never beat,
-      // because the watchdog would still believe there is nothing to authenticate with.
-      wd('setHasCredential', [Boolean(token && http)]);
-      sync = token && http ? syncFactory(syncOptions(token)) : null;
+      wd('setHasCredential', [Boolean(state.token && http && commandStateReady)]);
       engine = engineFactory({
         win: win,
         doc: doc,
@@ -612,7 +661,7 @@
         storage: storage,
         sync: sync,
         http: http,
-        token: token || null,
+        token: state.token,
         Promise: P,
         audioEnabled: state.audioEnabled,
         resume: state.resume || null,
@@ -629,7 +678,6 @@
         },
         onProgress: function (info) {
           persistPlaybackState(info);
-          // Proof of life for the application watchdog: the runtime is still advancing.
           wd('markProgress', []);
         },
         onRecoveryExhausted: function (info) {
@@ -680,10 +728,12 @@
         http = httpFactory(win, { Promise: P, log: record, transport: win.__SIGNAGE_TRANSPORT__ || null });
       } catch (error) {
         http = null;
-        record('runtime_reinit_http_failed', { message: runtime.message(error, 'unknown').slice(0, 160) });
+        record('runtime_reinit_http_failed', { code: runtime.errorCode(error) });
       }
+      try { sync = state.token && http ? syncFactory(syncOptions(state.token)) : null; } catch (error) { sync = null; }
       if (!engine) { attachEngine(state.token); return; }
-      try { if (isFn(engine.ensurePlaying)) engine.ensurePlaying(); } catch (error) { record('runtime_reinit_ensure_failed', { message: runtime.message(error, 'unknown').slice(0, 160) }); }
+      try { if (isFn(engine.setNetwork)) engine.setNetwork(sync, http, state.token); } catch (error) { record('runtime_reinit_engine_network_failed', { code: runtime.errorCode(error) }); }
+      try { if (isFn(engine.ensurePlaying)) engine.ensurePlaying(); } catch (error) { record('runtime_reinit_ensure_failed', { code: runtime.errorCode(error) }); }
       if (reason === 'watchdog_empty_stage' || reason === 'watchdog_runtime_unrecoverable') {
         // The stage is empty although local media exists: re-arm the local playlist.
         if (isFn(engine.recover)) engine.recover(reason);
@@ -691,8 +741,10 @@
       } else {
         try { engine.render(); } catch (error) { record('runtime_reinit_render_failed', { message: runtime.message(error, 'unknown').slice(0, 160) }); }
       }
-      syncLock = false;
-      heartbeatLock = false;
+      if (reason !== 'reload_command') {
+        syncLock = false;
+        heartbeatLock = false;
+      }
     }
 
     /** Drops anything that can no longer succeed: locks and the transport that owns pending calls. */
@@ -702,7 +754,9 @@
       heartbeatLock = false;
       try {
         http = httpFactory(win, { Promise: P, log: record, transport: win.__SIGNAGE_TRANSPORT__ || null });
-      } catch (error) { record('abort_stale_http_failed', { message: runtime.message(error, 'unknown').slice(0, 160) }); }
+      } catch (error) { record('abort_stale_http_failed', { code: runtime.errorCode(error) }); }
+      try { sync = state.token && http ? syncFactory(syncOptions(state.token)) : null; } catch (error) { sync = null; }
+      try { if (engine && isFn(engine.setNetwork)) engine.setNetwork(sync, http, state.token); } catch (error) { record('abort_stale_engine_network_failed', { code: runtime.errorCode(error) }); }
     }
 
     function resetBeatLock(reason) {
@@ -763,9 +817,18 @@
     }
 
     function persistCommandState() {
-      if (!storage || !isFn(storage.setCommandState)) return;
-      try { storage.setCommandState({ appliedSyncVersion: appliedSyncVersion, appliedReloadVersion: appliedReloadVersion }); }
-      catch (error) { record('command_state_persist_failed', { message: runtime.message(error, 'unknown').slice(0, 160) }); }
+      if (!storage || !isFn(storage.setCommandState)) return P.resolve(false);
+      try {
+        return P.resolve(storage.setCommandState({ appliedSyncVersion: appliedSyncVersion, appliedReloadVersion: appliedReloadVersion })).then(function (saved) {
+          return saved !== false;
+        }, function (error) {
+          record('command_state_persist_failed', { code: runtime.errorCode(error) });
+          return false;
+        });
+      } catch (error) {
+        record('command_state_persist_failed', { code: runtime.errorCode(error) });
+        return P.resolve(false);
+      }
     }
 
     function setupWatchdog() {
@@ -784,7 +847,7 @@
               catch (error) { heartbeatFailed(0, runtime.errorCode(error)); }
             },
             sync: function (reason) {
-              if (!state.token) { wd('scheduleSync', [60000]); return; }
+              if (!state.token || !commandStateReady) { wd('scheduleSync', [15000]); return; }
               performSync(state.token).then(null, function () { wd('noteSyncFailure', ['sync_internal_error']); });
             },
             housekeeping: function () {
@@ -819,26 +882,141 @@
 
     /* ------------------------------------------------------------------ sync ---------------------*/
 
-    function applyManifest(manifest) {
-      if (!manifest) return null;
-      var previousHash = state.manifest && state.manifest.manifestHash ? state.manifest.manifestHash : null;
-      var sameContent = Boolean(previousHash && manifest.manifestHash && previousHash === manifest.manifestHash);
-      state.manifest = manifest;
-      state.screenName = (manifest.screen && manifest.screen.name) || state.screenName;
-      var playable = runtime.hasPlayableContent(manifest);
-      if (engine) {
-        engine.setManifest(manifest);
-        engine.setPlaylist(runtime.scheduledPlaylistId(win, manifest, new Date()));
-        // A background synchronization must never interrupt the picture: when the content is
-        // unchanged the engine is left completely alone, and even for a new playlist the engine
-        // keeps the current item on screen until its own transition decides otherwise.
-        if (!sameContent) engine.render();
+    function samePlaybackContent(first, second) {
+      if (!first || !second || !first.screen || !second.screen || first.screen.id !== second.screen.id) return false;
+      if (first.defaultPlaylistId !== second.defaultPlaylistId || first.screen.timezone !== second.screen.timezone) return false;
+      var firstPlaylists = first.playlists || [];
+      var secondPlaylists = second.playlists || [];
+      if (firstPlaylists.length !== secondPlaylists.length) return false;
+      for (var i = 0; i < firstPlaylists.length; i += 1) {
+        var left = firstPlaylists[i];
+        var right = null;
+        for (var j = 0; j < secondPlaylists.length; j += 1) if (secondPlaylists[j].id === left.id) { right = secondPlaylists[j]; break; }
+        if (!right || left.enabled !== right.enabled || left.items.length !== right.items.length) return false;
+        for (var k = 0; k < left.items.length; k += 1) {
+          var a = left.items[k];
+          var b = right.items[k];
+          if (!b || a.mediaId !== b.mediaId || a.hash !== b.hash || a.kind !== b.kind
+            || a.durationMs !== b.durationMs || Boolean(a.loop) !== Boolean(b.loop)) return false;
+        }
       }
-      state.playing = playable;
-      if (playable) state.phase = 'playing';
-      state.message = '';
-      paint();
-      return applyCommands(manifest);
+      var firstSchedules = first.schedules || [];
+      var secondSchedules = second.schedules || [];
+      if (firstSchedules.length !== secondSchedules.length) return false;
+      for (var n = 0; n < firstSchedules.length; n += 1) {
+        var x = firstSchedules[n];
+        var y = secondSchedules[n];
+        if (!y || x.id !== y.id || x.playlistId !== y.playlistId || x.startTime !== y.startTime
+          || x.endTime !== y.endTime || x.timezone !== y.timezone || Number(x.priority || 0) !== Number(y.priority || 0)
+          || Boolean(x.enabled) !== Boolean(y.enabled)) return false;
+        var xd = x.weekdays || [];
+        var yd = y.weekdays || [];
+        if (xd.length !== yd.length) return false;
+        for (var d = 0; d < xd.length; d += 1) if (Number(xd[d]) !== Number(yd[d])) return false;
+      }
+      return true;
+    }
+
+    function applyManifest(manifest, lastSyncAt) {
+      if (!manifest) return P.resolve(false);
+      var previous = state.manifest;
+      var previousHash = previous && previous.manifestHash ? previous.manifestHash : null;
+      var sameManifest = Boolean(previousHash && manifest.manifestHash && previousHash === manifest.manifestHash);
+      var sameContent = samePlaybackContent(previous, manifest);
+      var playable = runtime.hasPlayableContent(manifest);
+      state.latestManifest = manifest;
+      state.screenName = (manifest.screen && manifest.screen.name) || state.screenName;
+
+      function commitStoredManifest(candidate) {
+        if (!storage || !isFn(storage.activateManifest)) return P.resolve(false);
+        return P.resolve(storage.activateManifest(candidate)).then(function (activated) {
+          if (activated === false) return false;
+          state.manifest = candidate;
+          state.latestManifest = candidate;
+          state.screenName = (candidate.screen && candidate.screen.name) || state.screenName;
+          state.playing = playable;
+          if (playable) state.phase = 'playing';
+          state.message = '';
+          state.lastSyncAt = lastSyncAt || new Date().toISOString();
+          var saveSyncAt = isFn(storage.setLastSyncAt) ? storage.setLastSyncAt(state.lastSyncAt) : true;
+          return P.resolve(saveSyncAt).then(function () { paint(); return true; }, function () { paint(); return true; });
+        });
+      }
+
+      function afterCommands(activated) {
+        if (!activated) {
+          state.manifest = previous;
+          state.playing = Boolean(previous && runtime.hasPlayableContent(previous));
+          if (state.playing) state.phase = 'playing';
+          record('manifest_render_rejected', { manifestVersion: manifest.manifestVersion, hash: String(manifest.manifestHash || '').slice(0, 12) });
+        }
+        return P.resolve(applyCommands(manifest)).then(function () {
+          if (activated && storage && engine && isFn(storage.deleteUnreferenced) && isFn(engine.protectedHashes)) {
+            var keep = engine.protectedHashes();
+            var assets = manifest.assets || [];
+            for (var i = 0; i < assets.length; i += 1) if (assets[i].hash && keep.indexOf(assets[i].hash) === -1) keep.push(assets[i].hash);
+            return P.resolve(storage.deleteUnreferenced(keep)).then(function () { return activated; }, function () { return activated; });
+          }
+          return activated;
+        }).then(function (result) { paint(); return result; });
+      }
+
+      if (sameContent) {
+        var at = lastSyncAt || state.lastSyncAt || new Date().toISOString();
+        var updateExisting = function () {
+          state.manifest = manifest;
+          state.latestManifest = manifest;
+          state.lastSyncAt = at;
+          if (engine && isFn(engine.setManifest)) {
+            engine.setManifest(manifest);
+            var scheduled = runtime.scheduledPlaylistId(win, manifest, new Date());
+            if (scheduled && engine.playlistId() !== scheduled) {
+              engine.setPlaylist(scheduled);
+              engine.render();
+            }
+          }
+          state.playing = playable;
+          if (playable) state.phase = 'playing';
+          state.message = '';
+          var savedAt = storage && isFn(storage.setLastSyncAt) ? storage.setLastSyncAt(at) : true;
+          return P.resolve(savedAt).then(function () { paint(); return true; }, function () { paint(); return true; });
+        };
+        var activation = sameManifest ? P.resolve(true) : commitStoredManifest(manifest);
+        return P.resolve(activation).then(function (activated) {
+          if (activated) {
+            try { return updateExisting(); }
+            catch (error) { record('same_content_manifest_update_failed', { code: runtime.errorCode(error) }); return false; }
+          }
+          return false;
+        }, function (error) {
+          record('same_content_manifest_commit_failed', { code: runtime.errorCode(error) });
+          state.latestManifest = manifest;
+          return false;
+        }).then(function (activated) {
+          return P.resolve(applyCommands(manifest)).then(function () { return Boolean(activated); });
+        });
+      }
+
+      if (engine && isFn(engine.switchManifest)) {
+        return engine.switchManifest(manifest, commitStoredManifest).then(function (activated) {
+          return afterCommands(Boolean(activated));
+        }, function (error) {
+          record('manifest_switch_failed', { code: runtime.errorCode(error) });
+          return afterCommands(false);
+        });
+      }
+
+      return commitStoredManifest(manifest).then(function (activated) {
+        if (activated && engine) {
+          engine.setManifest(manifest);
+          engine.setPlaylist(runtime.scheduledPlaylistId(win, manifest, new Date()));
+          engine.render();
+        }
+        return afterCommands(Boolean(activated));
+      }, function (error) {
+        record('manifest_activation_failed', { code: runtime.errorCode(error) });
+        return afterCommands(false);
+      });
     }
 
     /**
@@ -857,75 +1035,94 @@
      */
     function applyCommands(manifest) {
       var commands = (manifest && manifest.commands) || null;
-      if (!commands || !storage) return null;
+      if (!commands || !storage) return P.resolve(true);
       var wantedSync = Number(commands.syncVersion) || 0;
       var wantedReload = Number(commands.reloadVersion) || 0;
-      // The server echoes back the versions it has already seen ACKnowledged by this screen through
-      // an authenticated heartbeat. Adopting them is the only defence against a command running
-      // twice after the local store was lost (cleared cache, factory reset with the same pair code):
-      // if the server knows the command was executed, it must never be executed again. Adoption is
-      // monotonic and only ever skips work, it can never skip a newer command.
       var ack = commands.applied || null;
       var ackSync = ack ? (Number(ack.syncVersion) || 0) : 0;
       var ackReload = ack ? (Number(ack.reloadVersion) || 0) : 0;
+      var adopted = false;
+
+      // A server-echoed ACK is authoritative after local storage loss. Adoption only skips work;
+      // it can never regress a version or execute a command on the server's behalf.
       if (ackSync >= wantedSync && ackSync > appliedSyncVersion) {
         appliedSyncVersion = ackSync;
+        adopted = true;
         wd('markCommand', [ackSync]);
         record('command_adopted_server_ack', { kind: 'sync', version: ackSync });
-        persistCommandState();
       }
       if (ackReload >= wantedReload && ackReload > appliedReloadVersion) {
         appliedReloadVersion = ackReload;
+        adopted = true;
         wd('markCommand', [ackReload]);
         record('command_adopted_server_ack', { kind: 'reload', version: ackReload });
-        persistCommandState();
       }
-      pendingCommandSync = Math.max(0, wantedSync - appliedSyncVersion) + Math.max(0, wantedReload - appliedReloadVersion);
 
-      var chain = P.resolve(null);
-
-      if (wantedReload > appliedReloadVersion) {
-        chain = chain.then(function () {
-          // ACK first: the version is consumed the moment it is picked up, so a reconnect or a
-          // reload mid-execution can never run the same reload command twice.
-          appliedReloadVersion = wantedReload;
-          persistCommandState();
-          wd('markCommand', [wantedReload]);
-          record('reload_command_received', { version: wantedReload });
-          return storage.setSeenReloadVersion(wantedReload)['catch'](function () { return null; });
-        }).then(function () {
-          if (engine && hasPlayableContent()) {
-            // Cached content is playing: reinitialize in place instead of unloading the page. A
-            // remote refresh must never blank a working screen.
-            record('reload_command_softened', { version: wantedReload });
-            try {
-              if (isFn(engine.ensurePlaying)) engine.ensurePlaying();
-              reinitRuntime('reload_command');
-            } catch (error) {
-              record('reload_command_reinit_failed', { message: runtime.message(error, 'unknown').slice(0, 160) });
-            }
-            return null;
+      function consume(kind, version) {
+        var previousSync = appliedSyncVersion;
+        var previousReload = appliedReloadVersion;
+        if (kind === 'sync') appliedSyncVersion = version;
+        else appliedReloadVersion = version;
+        return persistCommandState().then(function (saved) {
+          if (!saved) {
+            appliedSyncVersion = previousSync;
+            appliedReloadVersion = previousReload;
+            record('command_deferred_storage_unavailable', { kind: kind, version: version });
+            return false;
           }
-          reloadNow('command_without_cached_content');
-          return null;
+          wd('markCommand', [version]);
+          record(kind === 'sync' ? 'sync_command_received' : 'reload_command_received', { version: version });
+          return true;
         });
       }
 
-      if (wantedSync > appliedSyncVersion) {
-        chain = chain.then(function () {
-          appliedSyncVersion = wantedSync;
-          persistCommandState();
-          wd('markCommand', [wantedSync]);
-          record('sync_command_received', { version: wantedSync });
-          // Force an immediate synchronization instead of waiting for the next scheduled one.
-          wd('scheduleSync', [0]);
-          return null;
-        });
+      function saveSeenReload(version) {
+        if (!isFn(storage.setSeenReloadVersion)) return P.resolve(true);
+        try { return P.resolve(storage.setSeenReloadVersion(version)).then(function () { return true; }, function () { return false; }); }
+        catch (error) { return P.resolve(false); }
       }
 
-      return chain['catch'](function (error) {
-        record('command_apply_failed', { message: runtime.message(error, 'unknown').slice(0, 160) });
-        return null;
+      var chain = adopted ? persistCommandState() : P.resolve(true);
+      chain = chain.then(function () {
+        if (wantedReload <= appliedReloadVersion) return null;
+        return consume('reload', wantedReload).then(function (saved) {
+          if (!saved) return null;
+          return saveSeenReload(wantedReload).then(function () {
+            wd('scheduleBeat', [0]);
+            if (engine && hasPlayableContent()) {
+              // The version was durably consumed before the soft in-place recovery; if a page restart
+              // happens here, the server ACK prevents this same command from running twice.
+              record('reload_command_softened', { version: wantedReload });
+              try {
+                if (isFn(engine.ensurePlaying)) engine.ensurePlaying();
+                reinitRuntime('reload_command');
+              } catch (error) {
+                record('reload_command_reinit_failed', { code: runtime.errorCode(error) });
+              }
+              return null;
+            }
+            reloadNow('command_without_cached_content');
+            return null;
+          });
+        });
+      }).then(function () {
+        if (wantedSync <= appliedSyncVersion) return null;
+        return consume('sync', wantedSync).then(function (saved) {
+          if (saved) {
+            wd('scheduleBeat', [0]);
+            wd('scheduleSync', [0]);
+          }
+          return null;
+        });
+      });
+
+      return chain.then(function () {
+        pendingCommandSync = Math.max(0, wantedSync - appliedSyncVersion) + Math.max(0, wantedReload - appliedReloadVersion);
+        return true;
+      }, function (error) {
+        pendingCommandSync = Math.max(0, wantedSync - appliedSyncVersion) + Math.max(0, wantedReload - appliedReloadVersion);
+        record('command_apply_failed', { code: runtime.errorCode(error) });
+        return false;
       });
     }
 
@@ -935,12 +1132,16 @@
      * player, a cleared cache, a redirect or a blocking screen.
      */
     function performSync(requestedToken) {
+      if (disposed) return P.resolve(false);
       var token = requestedToken || state.token;
       if (!token || !storage) return P.resolve(false);
+      if (!localStateReady) return P.resolve(false);
+      if (!commandStateReady) { record('sync_waiting_command_state', null); return P.resolve(false); }
       if (syncLock) return P.resolve(false);
       if (!http) {
         state.online = false;
-        if (!state.manifest) state.error = state.lastSyncError || TEXTS.syncFailed;
+        if (!state.manifest) state.error = TEXTS.syncFailed;
+        state.lastErrorCode = 'no_transport';
         syncBackoffMs = Math.min(600000, Math.max(60000, syncBackoffMs * 2));
         record('sync_deferred_no_http', { backoffMs: syncBackoffMs });
         wd('noteSyncFailure', ['no_transport']);
@@ -957,34 +1158,55 @@
         activeSync = syncFactory(syncOptions(token));
       } catch (error) {
         syncLock = false;
-        record('sync_init_failed', { message: runtime.message(error, 'sync init failed') });
+        state.lastErrorCode = runtime.errorCode(error);
+        state.error = TEXTS.syncFailed;
+        record('sync_init_failed', { code: state.lastErrorCode });
         wd('noteSyncFailure', ['sync_init_failed']);
         return P.resolve(false);
       }
-      return activeSync.run().then(function (result) {
+      var syncOperation;
+      try { syncOperation = activeSync.run(); }
+      catch (error) {
         syncLock = false;
+        state.lastErrorCode = runtime.errorCode(error);
+        state.error = TEXTS.syncFailed;
+        wd('noteSyncFailure', [state.lastErrorCode]);
+        record('sync_run_failed', { code: state.lastErrorCode });
+        return P.resolve(false);
+      }
+      return P.resolve(syncOperation).then(function (result) {
+        if (disposed) { syncLock = false; return false; }
         syncFailures = 0;
         syncBackoffMs = 0;
         state.syncFailures = 0;
         state.online = true;
         state.progress = null;
+        state.error = '';
+        state.lastSyncError = '';
+        state.lastErrorCode = '';
+        state.latestManifest = result.manifest || state.latestManifest;
         if (result.lastSyncAt) state.lastSyncAt = result.lastSyncAt;
-        record('sync_ok', { changed: Boolean(result.changed) });
-        // A successful synchronization is proof of real, authenticated connectivity.
+        record('sync_ok', { changed: Boolean(result.changed), candidate: Boolean(result.candidate) });
+        // A successful synchronization is proof of real, authenticated connectivity. The active
+        // manifest pointer is committed later, only after a candidate's first render succeeds.
         wd('markSync', [true]);
-        return P.resolve(applyManifest(result.manifest)).then(function () {
-          return refreshStorageState();
+        return P.resolve(applyManifest(result.manifest, result.lastSyncAt)).then(function (activated) {
+          if (result.candidate && !activated) record('candidate_kept_pending', { hash: String(result.manifest.manifestHash || '').slice(0, 12) });
+          syncLock = false;
+          return refreshStorageState(true);
         }).then(function () { return true; });
       }, function (error) {
         syncLock = false;
+        if (disposed) return false;
         var code = runtime.errorCode(error);
         state.progress = null;
-        state.error = runtime.message(error, TEXTS.syncFailed);
-        state.lastSyncError = state.error;
+        state.error = TEXTS.syncFailed;
+        state.lastSyncError = code;
+        state.lastErrorCode = code;
         syncFailures += 1;
         state.syncFailures = syncFailures;
         syncBackoffMs = Math.min(600000, 60000 * Math.pow(2, Math.min(syncFailures - 1, 4)));
-        record('sync_failed', { code: code, message: String(state.error).slice(0, 200), backoffMs: syncBackoffMs });
+        record('sync_failed', { code: code, backoffMs: syncBackoffMs });
         wd('noteSyncFailure', [code]);
         if (code === 'screen_unauthorized') {
           state.token = null;
@@ -1021,20 +1243,25 @@
       })['catch'](function (error) {
         // The promise chain itself must never produce an unhandled rejection.
         syncLock = false;
-        record('sync_internal_error', { message: runtime.message(error, 'unknown') });
+        if (disposed) return false;
+        record('sync_internal_error', { code: runtime.errorCode(error) });
         wd('noteSyncFailure', ['sync_internal_error']);
         paint();
         return false;
       });
     }
 
-    function refreshStorageState() {
+    function refreshStorageState(force) {
       if (!storage) return P.resolve(true);
+      var now = Date.now();
+      if (!force && lastStorageRefreshAt && now - lastStorageRefreshAt < 300000) return P.resolve(true);
+      lastStorageRefreshAt = now;
       return P.all([
         storage.countCachedAssets().then(function (count) { state.cachedCount = count; }, function () { return null; }),
         storage.getStats().then(function (stats) { state.stats = stats; }, function () { return null; }),
         storage.getLastSyncAt().then(function (at) { if (at) state.lastSyncAt = at; }, function () { return null; })
       ]).then(function () {
+        if (disposed) return false;
         if (state.playing) { renderStatusBar(); paint(); } else paint();
         return true;
       }, function () { return false; });
@@ -1096,6 +1323,7 @@
     }
 
     function retryEverything() {
+      if (disposed) return;
       state.error = '';
       state.notice = '';
       state.emptyTicks = 0;
@@ -1107,17 +1335,13 @@
       }
       if (state.token) {
         try { if (engine && isFn(engine.ensurePlaying)) engine.ensurePlaying(); } catch (error) { record('manual_retry_render_failed', { message: runtime.message(error, 'unknown') }); }
-        wd('requestRecovery', ['manual_retry']);
-        wd('requestSync', ['manual_retry']);
+        startAuthenticatedWork('manual_retry');
         return;
       }
       storage.getCredential().then(function (token) {
         if (token) {
-          state.token = token;
           attachEngine(token);
-          wd('setHasCredential', [true]);
-          wd('requestRecovery', ['manual_retry']);
-          wd('requestSync', ['manual_retry']);
+          startAuthenticatedWork('manual_retry');
           return true;
         }
         if (state.manifest && hasPlayableContent()) {
@@ -1165,6 +1389,7 @@
 
     function heartbeatFailed(status, code) {
       heartbeatLock = false;
+      if (disposed) return;
       heartbeatFailures = Math.min(heartbeatFailures + 1, 7);
       heartbeatBackoffMs = Math.min(600000, 15000 * Math.pow(2, Math.min(heartbeatFailures - 1, 6)));
       state.online = false;
@@ -1174,7 +1399,9 @@
     }
 
     function heartbeat(force) {
+      if (disposed || !localStateReady) return;
       if (!state.token || !http) { wd('scheduleBeat', [60000]); return; }
+      if (!commandStateReady) { wd('scheduleBeat', [15000]); return; }
       if (heartbeatLock) {
         // A beat is already in flight. The watchdog owns the in-flight timeout, so the lock is
         // always released and the next attempt is scheduled by the watchdog itself. Nothing is
@@ -1197,7 +1424,7 @@
         currentPlaylistVersion: playlistVersion,
         currentItemId: item && item.id ? item.id : null,
         syncStatus: syncLock ? 'syncing' : (state.error ? 'failed' : 'ready'),
-        syncError: state.error ? String(state.error).slice(0, 300) : null,
+        syncError: state.error ? String(state.lastErrorCode || 'sync_failed').slice(0, 80) : null,
         cachedMediaCount: state.cachedCount,
         storageUsageBytes: isFiniteNumber(state.stats.usage) ? state.stats.usage : null,
         storageQuotaBytes: isFiniteNumber(state.stats.quota) ? state.stats.quota : null,
@@ -1224,6 +1451,7 @@
       try { request = runtime.sendHeartbeat(http, state.token, payload); }
       catch (error) { heartbeatFailed(0, runtime.errorCode(error)); return; }
       request.then(function (response) {
+        if (disposed) { heartbeatLock = false; return null; }
         if (response.status === 401) {
           var errorPayload = null;
           try { errorPayload = response.json(); } catch (error) { errorPayload = null; }
@@ -1271,67 +1499,73 @@
       record('timers_moved_to_watchdog', null);
     }
 
+    function listen(target, type, handler, capture) {
+      if (!target || !isFn(target.addEventListener)) return;
+      try {
+        target.addEventListener(type, handler, Boolean(capture));
+        eventBindings.push({ target: target, type: type, handler: handler, capture: Boolean(capture) });
+      } catch (error) { record('event_listener_attach_failed', { type: type }); }
+    }
+
     function bindEnvironment() {
-      if (!win.addEventListener) return;
-      win.addEventListener('online', function () {
-        // navigator.onLine is only a hint. The watchdog attempts a real authenticated round trip
-        // immediately; only its success is allowed to report the player online again.
+      if (environmentBound || !win.addEventListener) return;
+      environmentBound = true;
+      listen(win, 'online', function () {
         record('browser_online_event', { onLine: navigatorOnline() });
         wd('requestRecovery', ['browser_online']);
         restorePlayback('online');
-      });
-      win.addEventListener('offline', function () {
+      }, false);
+      listen(win, 'offline', function () {
         state.online = false;
         renderStatusBar();
-        // Nothing else happens here on purpose: the cache keeps the playlist running, and a reload
-        // is never taken because a browser thought the network went away.
         record('browser_offline_event', null);
         wd('markProgress', []);
-      });
-      win.addEventListener('focus', function () { restorePlayback('focus'); }, false);
-      win.addEventListener('pageshow', function () { restorePlayback('pageshow'); wd('requestRecovery', ['pageshow']); }, false);
+      }, false);
+      listen(win, 'focus', function () { restorePlayback('focus'); }, false);
+      listen(win, 'pageshow', function () { restorePlayback('pageshow'); wd('requestRecovery', ['pageshow']); }, false);
       if (doc.addEventListener) {
-        doc.addEventListener('visibilitychange', function () {
+        listen(doc, 'visibilitychange', function () {
           var visible = true;
           try { visible = doc.visibilityState ? doc.visibilityState === 'visible' : !doc.hidden; } catch (error) { visible = true; }
           if (visible) {
             restorePlayback('visible');
-            // A television that wakes from standby is the exact case a wall-clock gap cannot
-            // distinguish from a freeze: prove connectivity now instead of after the next backoff.
             wd('requestRecovery', ['visible']);
           } else record('playback_visibility_hidden', null);
         }, false);
       }
-      win.addEventListener('error', function (event) {
-        var message = event && event.message ? String(event.message).slice(0, 200) : 'unknown';
-        record('window_error', { message: message });
-        // Ten runtime errors without any progress means the runtime is broken, not the network.
+      listen(win, 'error', function (event) {
+        var messageText = event && event.message ? String(event.message).slice(0, 200) : 'unknown';
+        record('window_error', { message: messageText });
         wd('noteError', ['window_error']);
-      });
-      win.onunhandledrejection = function (event) {
-        record('unhandled_rejection', { message: runtime.message(event && event.reason, 'unknown') });
+      }, false);
+      assignedUnhandledRejection = function (event) {
+        record('unhandled_rejection', { code: runtime.errorCode(event && event.reason) });
         wd('noteError', ['unhandled_rejection']);
       };
-      win.addEventListener('keydown', function (event) {
+      try { win.onunhandledrejection = assignedUnhandledRejection; } catch (error) { assignedUnhandledRejection = null; }
+      listen(win, 'keydown', function (event) {
         requestFullscreen(win);
         var target = event && event.target;
         var inField = target && target.tagName === 'INPUT';
         var key = event ? (event.key || event.keyCode) : null;
         if (!inField && (key === 'i' || key === 'I' || key === 457)) openDiagnostics('manual');
       }, false);
-      win.addEventListener('click', function () { requestFullscreen(win); }, false);
+      listen(win, 'click', function () { requestFullscreen(win); }, false);
     }
 
     /* ------------------------------------------------------------------ boot ---------------------*/
 
     function start() {
+      if (startPromise) return startPromise;
+      if (disposed) return P.resolve(false);
       try {
         buildShell();
         paint();
         win.__signageBooted = true;
       } catch (error) {
-        record('shell_failed', { message: runtime.message(error, 'unknown') });
-        return P.resolve(false);
+        record('shell_failed', { code: runtime.errorCode(error) });
+        startPromise = P.resolve(false);
+        return startPromise;
       }
       record('boot', { chromium: caps.chromium, webos: caps.webos.version });
       bindEnvironment();
@@ -1340,61 +1574,63 @@
       } catch (error) {
         http = null;
         state.online = false;
-        state.error = runtime.message(error, TEXTS.unexpected);
-        record('http_init_failed_nonblocking', { message: String(state.error).slice(0, 200) });
+        state.error = TEXTS.unexpected;
+        state.lastErrorCode = runtime.errorCode(error);
+        record('http_init_failed_nonblocking', { code: state.lastErrorCode });
       }
       if (wantsDiagnostics(win)) win.setTimeout(function () { openDiagnostics('manual'); }, 0);
-      // The watchdog is started before storage resolves so the player is supervised from the very
-      // first frame; its actions are all safe when the credential or the storage is not ready yet.
+      // The watchdog is created once and remains credential-gated until command/recovery state has
+      // been restored from disk. It never applies a command using a speculative zero version.
       setupWatchdog();
       var storagePromise;
       try {
         storagePromise = storageFactory(win, { Promise: P, log: record });
       } catch (error) {
         fatal(error, 'storage_init_failed');
-        return P.resolve(false);
+        startPromise = P.resolve(false);
+        return startPromise;
       }
-      return storagePromise.then(function (adapter) {
-        storage = adapter;
-        state.storage = adapter;
-        state.online = navigatorOnline();
-        record('storage', { backend: adapter.backend });
-        // Startup priority: the local playlist and the cached media are the only things in the
-        // critical path. Statistics, sync bookkeeping and the audio preference are all read in the
-        // background (see backgroundWork) because none of them can put pixels on the screen.
-        //
-        // The acknowledged command versions are in the critical path instead: they must be known
-        // BEFORE the first synchronization can apply a command, otherwise a reload would re-run the
-        // command that was already executed before it.
-        return P.all([
-          adapter.getCredential(),
-          adapter.getActiveManifest(),
-          typeof adapter.getPlaybackState === 'function' ? adapter.getPlaybackState() : P.resolve(null),
-          typeof adapter.getRecoveryState === 'function' ? adapter.getRecoveryState() : P.resolve(null),
-          typeof adapter.countCachedAssets === 'function'
-            ? adapter.countCachedAssets().then(function (count) { return count; }, function () { return 0; })
-            : P.resolve(0),
-          typeof adapter.getCommandState === 'function' ? adapter.getCommandState() : P.resolve(null),
-          typeof adapter.getRecoveryMeta === 'function' ? adapter.getRecoveryMeta() : P.resolve(null),
-          typeof adapter.getSeenReloadVersion === 'function' ? adapter.getSeenReloadVersion() : P.resolve(0)
-        ]);
-      }).then(function (values) {
-        var token = values[0];
-        var manifest = values[1];
-        var playback = values[2];
-        var recovery = values[3];
-        var commandState = values[5];
-        var recoveryStored = values[6];
-        var seenReload = Number(values[7]) || 0;
-        state.cachedCount = Number(values[4]) || 0;
-        state.token = token || null;
-        state.manifest = manifest || null;
-        state.resume = playback || null;
-        state.playbackInfo = playback || null;
-        state.screenName = (manifest && manifest.screen && manifest.screen.name) || '';
+
+      function readOptional(adapter, name, fallback) {
+        if (!adapter || !isFn(adapter[name])) return P.resolve(fallback);
+        try { return P.resolve(adapter[name]()).then(function (value) { return value; }, function () { return fallback; }); }
+        catch (error) { return P.resolve(fallback); }
+      }
+      function readOperational(adapter, name, fallback) {
+        if (!adapter || !isFn(adapter[name])) return P.resolve(fallback);
+        try { return P.resolve(adapter[name]()); }
+        catch (error) { return P.reject(error); }
+      }
+      function settleWithin(promise, timeoutMs, fallback) {
+        return new P(function (resolve) {
+          var settled = false;
+          var timer = win.setTimeout(function () {
+            if (settled) return;
+            settled = true;
+            resolve(fallback);
+          }, timeoutMs);
+          P.resolve(promise).then(function (value) {
+            if (settled) return;
+            settled = true;
+            win.clearTimeout(timer);
+            resolve(value);
+          }, function () {
+            if (settled) return;
+            settled = true;
+            win.clearTimeout(timer);
+            resolve(fallback);
+          });
+        });
+      }
+      function applyOperationalState(values) {
+        if (disposed || commandStateReady) return;
+        if (operationalRetryTimer) { win.clearTimeout(operationalRetryTimer); operationalRetryTimer = null; }
+        var commandState = values[0];
+        var recovery = values[1];
+        var recoveryStored = values[2];
+        var seenReload = Number(values[3]) || 0;
         appliedSyncVersion = Number(commandState && commandState.appliedSyncVersion) || 0;
         appliedReloadVersion = Number(commandState && commandState.appliedReloadVersion) || 0;
-        // A television that was updated before this build only persisted the reload counter.
         if (!appliedReloadVersion && seenReload) appliedReloadVersion = seenReload;
         if (recoveryStored && typeof recoveryStored === 'object') {
           recoveryMeta = recoveryStored;
@@ -1408,68 +1644,193 @@
         if (recovery && recovery.at && (Date.now() - Number(recovery.at)) < RECOVERY_WINDOW_MS) {
           recoveryBlockedUntil = Math.max(recoveryBlockedUntil, Number(recovery.at) + RECOVERY_WINDOW_MS);
         }
-        record('boot_state', {
-          paired: Boolean(state.token),
+        commandStateReady = true;
+        record('boot_operational_state', {
           appliedSyncVersion: appliedSyncVersion,
           appliedReloadVersion: appliedReloadVersion,
           recoveryCount: Number(recoveryMeta.count) || 0,
           recoveryReason: String(recoveryMeta.reason || '').slice(0, 60)
         });
-        wd('setHasCredential', [Boolean(state.token)]);
-        var playable = runtime.hasPlayableContent(manifest);
-        // A: local manifest, B: cached media, C: playback. No network request has been awaited yet.
-        attachEngine(state.token);
-        startTimers();
-        if (playable) {
+        if (localStateReady) {
+          attachEngine(state.token);
+          if (state.token) startAuthenticatedWork('boot');
+        }
+      }
+      function readOperationalState(adapter) {
+        var loads = P.all([
+          readOperational(adapter, 'getCommandState', null),
+          readOperational(adapter, 'getRecoveryState', null),
+          readOperational(adapter, 'getRecoveryMeta', null),
+          readOperational(adapter, 'getSeenReloadVersion', 0)
+        ]);
+        loads.then(applyOperationalState, function (error) {
+          record('boot_operational_state_unavailable', { code: runtime.errorCode(error) });
+          if (!disposed && !commandStateReady && !operationalRetryTimer) {
+            operationalRetryTimer = win.setTimeout(function () {
+              operationalRetryTimer = null;
+              readOperationalState(adapter);
+            }, 30000);
+          }
+        });
+      }
+
+      startPromise = P.resolve(storagePromise).then(function (adapter) {
+        if (disposed) return false;
+        storage = adapter;
+        state.storage = adapter;
+        state.online = false; // network hints never claim a confirmed heartbeat or authenticated sync
+        record('storage', { backend: adapter.backend });
+
+        // Credentials and command bookkeeping are read in parallel with the cached playlist, but
+        // neither can delay local playback. Only the cached manifest + a bounded resume lookup are
+        // on the first-frame path; a slow telemetry query can never keep an offline TV blank.
+        var manifestPromise = readOptional(adapter, 'getActiveManifest', null);
+        var localBootstrapped = false;
+        manifestPromise.then(function (lateManifest) {
+          if (!localBootstrapped || state.manifest || disposed || !lateManifest) return;
+          if (isFn(runtime.validateManifest) && !runtime.validateManifest(lateManifest)) return;
+          if (!runtime.hasPlayableContent(lateManifest)) return;
+          state.manifest = lateManifest;
+          state.latestManifest = lateManifest;
+          state.screenName = (lateManifest.screen && lateManifest.screen.name) || state.screenName;
+          if (engine) {
+            engine.setManifest(lateManifest);
+            engine.setPlaylist(runtime.scheduledPlaylistId(win, lateManifest, new Date()));
+            engine.render();
+          }
           state.playing = true;
           state.phase = 'playing';
-          if (!state.token) state.notice = TEXTS.unpairedNotice;
-        } else if (!state.token) {
-          state.phase = 'pair';
-          state.showPairForm = true;
-        } else {
-          state.phase = 'syncing';
-        }
-        paint();
-        // E: background synchronization, only after playback has started (or when there is nothing
-        // to play, in which case synchronization is the only way to get content).
-        backgroundWork();
-        if (playable || state.token) return true;
-        return false;
+          paint();
+          record('late_cached_manifest_restored', { version: lateManifest.manifestVersion });
+        });
+        var playbackPromise = readOptional(adapter, 'getPlaybackState', null);
+        var credentialPromise = readOptional(adapter, 'getCredential', null);
+        credentialPromise.then(function (token) {
+          if (disposed || credentialReadCancelled) return;
+          state.token = token || null;
+          if (localStateReady) attachEngine(state.token);
+          if (state.token && localStateReady) {
+            if (!state.pairFormExplicit) state.showPairForm = false;
+            if (state.phase === 'pair' && !state.manifest) state.phase = 'syncing';
+            if (commandStateReady) startAuthenticatedWork('boot');
+            paint();
+          }
+        }, function (error) { record('credential_restore_failed', { code: runtime.errorCode(error) }); });
+        readOperationalState(adapter);
+        operationalWarningTimer = win.setTimeout(function () {
+          operationalWarningTimer = null;
+          if (!commandStateReady) record('boot_command_state_still_loading', null);
+        }, 5000);
+
+        return P.all([
+          settleWithin(manifestPromise, 2500, null),
+          settleWithin(playbackPromise, 1200, null)
+        ]).then(function (local) {
+          if (disposed) return false;
+          if (operationalWarningTimer) { win.clearTimeout(operationalWarningTimer); operationalWarningTimer = null; }
+          localBootstrapped = true;
+          var manifest = local[0];
+          var playback = local[1];
+          if (manifest && isFn(runtime.validateManifest) && !runtime.validateManifest(manifest)) {
+            record('cached_manifest_rejected', { reason: 'integrity_or_schema' });
+            manifest = null;
+          }
+          state.manifest = manifest || null;
+          state.latestManifest = manifest || null;
+          state.resume = playback || null;
+          state.playbackInfo = playback || null;
+          state.screenName = (manifest && manifest.screen && manifest.screen.name) || '';
+          localStateReady = true;
+          var playable = runtime.hasPlayableContent(manifest);
+          // Start and render the local engine before optional storage statistics, credential restore,
+          // network sync, or command hydration finish.
+          attachEngine(state.token);
+          if (playable && engine) {
+            engine.setManifest(state.manifest);
+            engine.setPlaylist(runtime.scheduledPlaylistId(win, state.manifest, new Date()));
+            engine.render();
+          }
+          startTimers();
+          if (playable) {
+            state.playing = true;
+            state.phase = 'playing';
+            if (!state.token) state.notice = TEXTS.unpairedNotice;
+          } else if (!state.token) {
+            state.phase = 'pair';
+            state.showPairForm = true;
+          } else {
+            state.phase = 'syncing';
+          }
+          paint();
+          backgroundWork();
+          return true;
+        }, function (error) {
+          if (operationalWarningTimer) { win.clearTimeout(operationalWarningTimer); operationalWarningTimer = null; }
+          throw error;
+        });
+      }).then(function (result) {
+        return result;
       }, function (error) {
         fatal(error, 'boot_failed');
         return false;
       });
+      return startPromise;
     }
 
     /**
      * Everything that is optional for playback. Each call is individually guarded: a failure here
      * is a diagnostic, never a stopped player.
      */
+    function startAuthenticatedWork(reason) {
+      if (!state.token || !commandStateReady || !localStateReady) return false;
+      wd('setHasCredential', [Boolean(state.token && http)]);
+      var firstStart = !backgroundStarted;
+      backgroundStarted = true;
+      if (!firstStart && (!reason || reason === 'boot')) return true;
+      // requestRecovery owns the single immediate heartbeat + synchronization path.
+      wd('requestRecovery', [reason || 'boot']);
+      if (wd('isRunning', []) !== true) {
+        // Compatibility fallback for an older cached shell without watchdog.js; player-level locks
+        // still ensure only one request of each type can be in flight.
+        try { heartbeat(true); } catch (error) { heartbeatFailed(0, runtime.errorCode(error)); }
+        performSync(state.token).then(function () { return null; }, function () { return null; });
+      }
+      return true;
+    }
+
     function backgroundWork() {
-      try { refreshStorageState(); } catch (error) { record('storage_state_failed', { message: runtime.message(error, 'unknown') }); }
+      if (disposed) return;
+      try { refreshStorageState(true); } catch (error) { record('storage_state_failed', { code: runtime.errorCode(error) }); }
       if (storage && isFn(storage.getAudioEnabled)) {
         storage.getAudioEnabled().then(function (value) {
           state.audioEnabled = Boolean(value);
         }, function () { return null; });
       }
-      if (!state.token) return;
-      // The first heartbeat and the first synchronization after a boot are driven through the
-      // central watchdog, so they are covered by the same backoff, in-flight and bookkeeping rules
-      // as every later attempt instead of being a second, unsupervised code path.
-      wd('requestRecovery', ['boot']);
-      wd('requestSync', ['boot']);
-      if (wd('isRunning', []) !== true) {
-        // watchdog.js did not load (an old cached player shell): fall back to a direct attempt so
-        // the television still announces itself.
-        try { heartbeat(true); }
-        catch (error) { heartbeatFailed(0, runtime.errorCode(error)); }
-        performSync(state.token).then(function () { return null; }, function () { return null; });
+      startAuthenticatedWork('boot');
+    }
+
+    function destroy() {
+      if (disposed) return;
+      disposed = true;
+      if (operationalRetryTimer) { win.clearTimeout(operationalRetryTimer); operationalRetryTimer = null; }
+      if (operationalWarningTimer) { win.clearTimeout(operationalWarningTimer); operationalWarningTimer = null; }
+      for (var i = eventBindings.length - 1; i >= 0; i -= 1) {
+        var binding = eventBindings[i];
+        try { binding.target.removeEventListener(binding.type, binding.handler, binding.capture); } catch (error) { /* best effort */ }
       }
+      eventBindings = [];
+      if (assignedUnhandledRejection && win.onunhandledrejection === assignedUnhandledRejection) {
+        try { win.onunhandledrejection = previousUnhandledRejection || null; } catch (error) { /* best effort */ }
+      }
+      try { if (watchdog && isFn(watchdog.destroy)) watchdog.destroy(); else if (watchdog && isFn(watchdog.stop)) watchdog.stop(); } catch (error) { record('watchdog_destroy_failed', { code: runtime.errorCode(error) }); }
+      try { if (engine && isFn(engine.stop)) engine.stop(); } catch (error) { record('engine_destroy_failed', { code: runtime.errorCode(error) }); }
+      try { if (storage && isFn(storage.close)) storage.close(); } catch (error) { record('storage_close_failed', { code: runtime.errorCode(error) }); }
+      if (win.SignagePlayerInstance && win.SignagePlayerInstance.state === state) win.SignagePlayerInstance = null;
     }
 
     return {
       start: start,
+      destroy: destroy,
       state: state,
       record: record,
       paint: paint,
@@ -1491,6 +1852,7 @@
   function autoBoot() {
     if (!root || !root.document || root.__SIGNAGE_NO_AUTOBOOT) return null;
     if (!root.SignagePlayerRuntime) return null;
+    if (root.SignagePlayerInstance && isFn(root.SignagePlayerInstance.start)) return root.SignagePlayerInstance;
     var player = createPlayer({ win: root, runtime: root.SignagePlayerRuntime });
     root.SignagePlayerInstance = player;
     try {
