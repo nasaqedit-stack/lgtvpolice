@@ -13,6 +13,7 @@ import {
   createPage,
   createTransport,
   installBlobUrls,
+  jsonResponse,
   networkError,
   settle,
   stripModernApis,
@@ -305,6 +306,78 @@ describe('navigator.onLine and background failures', () => {
     expect(player.state.online).toBe(false);
     expect(target.media.pause.length).toBe(pausesBefore);
     expect(player.log().some((entry: any) => entry.event === 'reload')).toBe(false);
+  });
+
+  it('backs off heartbeat HTTP failures and retries automatically without clearing the credential', async () => {
+    const fixture = buildFixture({ imageDurationMs: 600000 });
+    const options: Parameters<typeof createTransport>[1] = { heartbeatStatus: 503 };
+    const plan = createTransport(fixture, options);
+    const target = page({ indexedDb: new IDBFactory(), transport: plan.transport });
+    await seedCache(target, fixture);
+    const player = await boot(target);
+
+    expect(plan.count('/api/player/heartbeat')).toBe(1);
+    expect(await player.storage().getCredential()).toBe('credential-1');
+    expect(player.log().filter((entry: any) => entry.event === 'heartbeat_retry_scheduled')[0].data.retryInMs).toBe(15000);
+    target.clock.advance(16000);
+    await settle(target.win, target.clock, 100);
+    expect(plan.count('/api/player/heartbeat')).toBe(2);
+    const retries = player.log().filter((entry: any) => entry.event === 'heartbeat_retry_scheduled');
+    expect(retries[1].data.retryInMs).toBe(30000);
+
+    options.heartbeatStatus = 200;
+    target.win.dispatchEvent(new target.win.Event('online'));
+    await settle(target.win, target.clock, 100);
+    expect(plan.count('/api/player/heartbeat')).toBe(3);
+    expect(player.state.token).toBe('credential-1');
+    expect(await player.storage().getCredential()).toBe('credential-1');
+    expect(target.win.document.querySelector('#signage-pair-code')).toBeNull();
+  });
+
+  it('sends heartbeat immediately when connectivity returns and preserves cached playback', async () => {
+    const fixture = buildFixture({ imageDurationMs: 600000 });
+    const options: Parameters<typeof createTransport>[1] = { heartbeatStatus: 503 };
+    const plan = createTransport(fixture, options);
+    const target = page({ indexedDb: new IDBFactory(), transport: plan.transport });
+    await seedCache(target, fixture);
+    const player = await boot(target);
+    const image: any = await mediaElement(target);
+    image.onload();
+    await settle(target.win, target.clock, 20);
+    expect(plan.count('/api/player/heartbeat')).toBe(1);
+
+    options.heartbeatStatus = 200;
+    target.win.dispatchEvent(new target.win.Event('online'));
+    await settle(target.win, target.clock, 100);
+
+    expect(plan.count('/api/player/heartbeat')).toBe(2);
+    expect(player.state.token).toBe('credential-1');
+    expect(await player.storage().getCredential()).toBe('credential-1');
+    expect(target.win.document.querySelector('img.sp-media')).toBe(image);
+    expect(image.style.display).toBe('block');
+    expect(overlay(target).style.display).toBe('none');
+  });
+
+  it('retains the credential when heartbeat or manifest 401 lacks explicit screen_unauthorized evidence', async () => {
+    const fixture = buildFixture({ imageDurationMs: 600000 });
+    const plan = createTransport(fixture);
+    const transport: Transport = (spec) => (spec.url === '/api/player/heartbeat' || spec.url === '/api/player/manifest')
+      ? Promise.resolve(jsonResponse(401, { error: 'temporary gateway response', code: 'internal_error' }))
+      : plan.transport(spec);
+    const target = page({ indexedDb: new IDBFactory(), transport });
+    await seedCache(target, fixture);
+    const player = await boot(target);
+    const image: any = await mediaElement(target);
+    image.onload();
+    await settle(target.win, target.clock, 20);
+
+    expect(player.state.token).toBe('credential-1');
+    expect(await player.storage().getCredential()).toBe('credential-1');
+    expect(target.win.document.querySelector('#signage-pair-code')).toBeNull();
+    expect(player.log().some((entry: any) => entry.event === 'heartbeat_retry_scheduled')).toBe(true);
+    expect(player.log().some((entry: any) => entry.event === 'sync_failed' && entry.data.code === 'network_offline')).toBe(true);
+    expect(target.win.document.querySelector('img.sp-media')).toBe(image);
+    expect(overlay(target).style.display).toBe('none');
   });
 
   it('softens a remote reload command while a locally cached playlist is active', async () => {

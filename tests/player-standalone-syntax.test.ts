@@ -245,11 +245,16 @@ describe('the optional offline shell (service worker)', () => {
   const sw = readFileSync(path.join(process.cwd(), 'public', 'sw.js'), 'utf8');
 
   it('never touches APIs, storage URLs or older shell caches', () => {
-    expect(sw).toContain("signage-player-shell-v4");
+    expect(sw).toContain("signage-player-shell-v5");
     expect(sw).toContain("name.startsWith('signage-player-shell-')");
     expect(sw).toContain("url.pathname.startsWith('/api/')");
     expect(sw).toContain("url.pathname.startsWith('/storage/')");
     expect(sw).not.toContain('/_next/static/');
+  });
+
+  it('does not read or clear a TV credential when the shell cache is updated', () => {
+    expect(sw).not.toMatch(/indexedDB|localStorage|signage\.screenToken|clearCredential/);
+    expect(sw).toContain("request.method !== 'GET'");
   });
 
   it('serves /player navigations network-first with a cached fallback', () => {

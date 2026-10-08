@@ -179,6 +179,9 @@
     var syncFailures = 0;
     var syncBackoffMs = 0;
     var lastSyncAttemptAt = 0;
+    var heartbeatFailures = 0;
+    var heartbeatBackoffMs = 0;
+    var heartbeatRetryRequested = false;
 
     function record(event, data) {
       log.push({ event: event, data: data || null, at: Date.now() });
@@ -506,7 +509,13 @@
         state.online = true;
         record('pair_ok', { screen: state.screenName });
         attachEngine(result.credential);
-        return performSync(result.credential);
+        return performSync(result.credential).then(function (ready) {
+          heartbeat(true);
+          return ready;
+        }, function () {
+          heartbeat(true);
+          return false;
+        });
       }, function (error) {
         state.pairing = false;
         state.pairError = runtime.message(error, TEXTS.pairingFailed);
@@ -801,6 +810,7 @@
       }
       if (state.token) {
         try { if (engine) engine.render(); } catch (error) { /* the sync below is the real retry */ }
+        heartbeat(true);
         performSync(state.token).then(function () { paint(); });
         return;
       }
@@ -808,7 +818,13 @@
         if (token) {
           state.token = token;
           attachEngine(token);
-          return performSync(token);
+          return performSync(token).then(function (ready) {
+            heartbeat(true);
+            return ready;
+          }, function () {
+            heartbeat(true);
+            return false;
+          });
         }
         if (state.manifest && hasPlayableContent()) {
           // Cached content keeps playing: pairing is offered through the diagnostics panel.
@@ -853,8 +869,37 @@
       }
     }
 
-    function heartbeat() {
-      if (!state.token || heartbeatLock || !http) return;
+    function scheduleHeartbeat(delayMs) {
+      if (heartbeatTimer) win.clearTimeout(heartbeatTimer);
+      if (!state.token || !http) { heartbeatTimer = null; return; }
+      var delay = Math.max(0, Number(delayMs) || 0);
+      if (heartbeatRetryRequested) {
+        heartbeatRetryRequested = false;
+        delay = 0;
+      }
+      heartbeatTimer = win.setTimeout(function () {
+        heartbeatTimer = null;
+        heartbeat(false);
+      }, delay);
+    }
+
+    function heartbeatFailed(status, code) {
+      heartbeatLock = false;
+      heartbeatFailures = Math.min(heartbeatFailures + 1, 7);
+      heartbeatBackoffMs = Math.min(600000, 15000 * Math.pow(2, Math.min(heartbeatFailures - 1, 6)));
+      state.online = false;
+      record('heartbeat_retry_scheduled', { status: status || 0, code: code || 'heartbeat_failed', retryInMs: heartbeatBackoffMs });
+      renderStatusBar();
+      scheduleHeartbeat(heartbeatBackoffMs);
+    }
+
+    function heartbeat(force) {
+      if (!state.token || !http) return;
+      if (heartbeatLock) {
+        if (force) heartbeatRetryRequested = true;
+        return;
+      }
+      if (heartbeatTimer) { win.clearTimeout(heartbeatTimer); heartbeatTimer = null; }
       heartbeatLock = true;
       var item = engine ? engine.currentItem() : null;
       var playlistId = engine ? engine.playlistId() : null;
@@ -877,9 +922,19 @@
         lastSyncAt: state.lastSyncAt || null,
         deviceInfo: runtime.deviceInfo(win)
       };
-      runtime.sendHeartbeat(http, state.token, payload).then(function (response) {
-        heartbeatLock = false;
+      var request;
+      try { request = runtime.sendHeartbeat(http, state.token, payload); }
+      catch (error) { heartbeatFailed(0, runtime.errorCode(error)); return; }
+      request.then(function (response) {
         if (response.status === 401) {
+          var errorPayload = null;
+          try { errorPayload = response.json(); } catch (error) { errorPayload = null; }
+          if (!errorPayload || errorPayload.code !== 'screen_unauthorized') {
+            heartbeatFailed(response.status, 'unconfirmed_unauthorized');
+            return;
+          }
+          heartbeatLock = false;
+          heartbeatRetryRequested = false;
           state.token = null;
           return storage.clearCredential().then(function () {
             if (!state.manifest || !hasPlayableContent()) { state.showPairForm = true; state.phase = 'pair'; }
@@ -888,21 +943,24 @@
             return null;
           }, function () { return null; });
         }
-        if (response.ok && !state.online) {
+        if (!response.ok) { heartbeatFailed(response.status, 'http_error'); return; }
+        heartbeatLock = false;
+        heartbeatFailures = 0;
+        heartbeatBackoffMs = 0;
+        if (!state.online) {
           state.online = true;
           renderStatusBar();
         }
+        scheduleHeartbeat(60000);
         return null;
-      }, function () {
-        heartbeatLock = false;
-        state.online = false;
-        renderStatusBar();
+      }, function (error) {
+        heartbeatFailed(0, runtime.errorCode(error));
       });
     }
 
     function startTimers() {
       if (syncTimer) win.clearInterval(syncTimer);
-      if (heartbeatTimer) win.clearInterval(heartbeatTimer);
+      if (heartbeatTimer) win.clearTimeout(heartbeatTimer);
       if (scheduleTimer) win.clearInterval(scheduleTimer);
       if (watchdogTimer) win.clearInterval(watchdogTimer);
       syncTimer = win.setInterval(function () {
@@ -912,8 +970,9 @@
         if (Date.now() - lastSyncAttemptAt < syncBackoffMs) return;
         performSync(state.token);
       }, 60000);
-      heartbeatTimer = win.setInterval(function () {
-        try { heartbeat(); } catch (error) { record('heartbeat_failed', { message: runtime.message(error, 'unknown') }); }
+      heartbeatTimer = win.setTimeout(function () {
+        heartbeatTimer = null;
+        try { heartbeat(); } catch (error) { heartbeatFailed(0, runtime.errorCode(error)); }
       }, 60000);
       scheduleTimer = win.setInterval(function () {
         try { tickSchedule(); } catch (error) { record('schedule_failed', { message: runtime.message(error, 'unknown') }); }
@@ -928,9 +987,15 @@
         syncFailures = 0;
         syncBackoffMs = 0;
         state.syncFailures = 0;
+        heartbeatFailures = 0;
+        heartbeatBackoffMs = 0;
         renderStatusBar();
-        // The network came back: synchronization resumes, playback was never paused for it.
-        if (state.token) performSync(state.token);
+        // Force an authorized pulse immediately; an in-flight failure queues exactly one retry.
+        if (state.token) {
+          try { heartbeat(true); }
+          catch (error) { heartbeatFailed(0, runtime.errorCode(error)); }
+          performSync(state.token);
+        }
       });
       win.addEventListener('offline', function () {
         state.online = false;
@@ -1064,9 +1129,8 @@
         }, function () { return null; });
       }
       if (!state.token) return;
-      try {
-        heartbeat();
-      } catch (error) { record('heartbeat_failed', { message: runtime.message(error, 'unknown') }); }
+      try { heartbeat(true); }
+      catch (error) { heartbeatFailed(0, runtime.errorCode(error)); }
       performSync(state.token).then(function (ready) {
         if (!ready && !hasPlayableContent()) paint();
         return null;

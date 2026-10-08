@@ -362,7 +362,9 @@ export function createTransport(fixture: Fixture, plan: TransportPlan = {}) {
     successes += 1;
 
     if (spec.url === '/api/player/manifest') {
-      if (plan.manifestStatus) return Promise.resolve(jsonResponse(plan.manifestStatus, { error: 'boom' }));
+      if (plan.manifestStatus) return Promise.resolve(jsonResponse(plan.manifestStatus, {
+        error: 'boom', code: plan.manifestStatus === 401 ? 'screen_unauthorized' : 'temporary_error'
+      }));
       if (plan.manifestInvalid) return Promise.resolve(jsonResponse(200, { schemaVersion: 1, playlists: 'nope' }));
       const etag = `"${fixture.manifest.manifestHash}"`;
       if (headers['If-None-Match'] === etag) return Promise.resolve(emptyResponse(304, { ETag: etag }));
@@ -399,8 +401,10 @@ export function createTransport(fixture: Fixture, plan: TransportPlan = {}) {
     if (sameOrigin) {
       const file = files.get(sameOrigin[1]);
       if (!file) return Promise.resolve(emptyResponse(404));
-      if (!headers.Authorization) return Promise.resolve(emptyResponse(401));
-      if (plan.sameOriginStatus && plan.sameOriginStatus !== 200) return Promise.resolve(emptyResponse(plan.sameOriginStatus));
+      if (!headers.Authorization) return Promise.resolve(jsonResponse(401, { error: 'unauthorized', code: 'screen_unauthorized' }));
+      if (plan.sameOriginStatus && plan.sameOriginStatus !== 200) return Promise.resolve(jsonResponse(plan.sameOriginStatus, {
+        error: 'media request failed', code: plan.sameOriginStatus === 401 ? 'screen_unauthorized' : 'temporary_error'
+      }));
       return Promise.resolve(sliceResponse(file.bytes, range, file.mimeType, plan));
     }
 
@@ -414,7 +418,12 @@ export function createTransport(fixture: Fixture, plan: TransportPlan = {}) {
     }
 
     if (spec.url === '/api/player/heartbeat') {
-      if (plan.heartbeatStatus && plan.heartbeatStatus !== 200) return Promise.resolve(emptyResponse(plan.heartbeatStatus));
+      if (plan.heartbeatStatus && plan.heartbeatStatus !== 200) {
+        return Promise.resolve(jsonResponse(plan.heartbeatStatus, {
+          error: 'heartbeat failed',
+          code: plan.heartbeatStatus === 401 ? 'screen_unauthorized' : 'temporary_error'
+        }));
+      }
       return Promise.resolve(jsonResponse(200, { ok: true, serverTime: '2026-10-08T00:00:00.000Z' }));
     }
 

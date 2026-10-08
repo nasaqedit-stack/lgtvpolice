@@ -1701,12 +1701,21 @@
       return headers;
     }
 
+    function authorizationResponseError(response) {
+      var payload = null;
+      try { payload = response && isFn(response.json) ? response.json() : null; } catch (error) { payload = null; }
+      if (payload && payload.code === 'screen_unauthorized') {
+        return PlayerError('تم رفض اعتماد هذه الشاشة من الخادم.', 'screen_unauthorized');
+      }
+      return PlayerError('تعذر التحقق مؤقتاً من اعتماد الشاشة. يستمر العرض المحلي.', 'network_offline');
+    }
+
     function authorizedRequest(spec) {
       var finalSpec = extend({}, spec);
       finalSpec.headers = authHeaders(spec.headers);
       if (!finalSpec.timeoutMs) finalSpec.timeoutMs = 20000;
       return http.request(finalSpec).then(function (response) {
-        if (response.status === 401) throw PlayerError('تم إلغاء ربط هذه الشاشة. أعد ربطها من لوحة الإدارة.', 'screen_unauthorized');
+        if (response.status === 401) throw authorizationResponseError(response);
         if (response.status === 403) throw PlayerError('الشاشة معطّلة على الخادم. يستمر المحتوى المحلي حتى يتوفر اتصال.', 'screen_disabled');
         return response;
       }, function (error) {
@@ -1857,7 +1866,7 @@
               }
               return rangeRequest(sameOriginUrl(asset.mediaId), offset, end, true);
             }).then(function (response) {
-              if (response.status === 401) throw PlayerError('تم إلغاء ربط هذه الشاشة. أعد ربطها من لوحة الإدارة.', 'screen_unauthorized');
+              if (response.status === 401) throw authorizationResponseError(response);
               if (response.status === 403) throw PlayerError('رفض الخادم تنزيل الوسيط لهذه الشاشة.', 'download_rejected');
               if (response.status === 206) {
                 var bytes = response.bytes ? toUint8(response.bytes) : new Uint8Array(0);
@@ -1984,7 +1993,7 @@
         return response;
       }).then(function (response) {
         if (response && response.manifest) return response;
-        if (response.status === 401) throw PlayerError('تم إلغاء ربط هذه الشاشة. أعد ربطها من لوحة الإدارة.', 'screen_unauthorized');
+        if (response.status === 401) throw authorizationResponseError(response);
         if (response.status === 403) throw PlayerError('هذه الشاشة معطّلة من لوحة الإدارة، وسيستمر عرض المحتوى المحفوظ.', 'screen_disabled');
         if (!response.ok) throw PlayerError('تعذر قراءة بيان المحتوى من الخادم.', 'manifest_unavailable');
         var incoming;
