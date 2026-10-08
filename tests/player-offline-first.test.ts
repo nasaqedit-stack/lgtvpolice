@@ -15,6 +15,7 @@ import {
   installBlobUrls,
   jsonResponse,
   networkError,
+  refreshManifestHash,
   settle,
   stripModernApis,
   undefine,
@@ -110,7 +111,7 @@ function overlay(target: FakePage): any {
 }
 
 describe('cached playback never depends on the network', () => {
-  it('reuses a returning screen credential from same-origin localStorage when IndexedDB has none', async () => {
+  it('never reuses a legacy localStorage credential when IndexedDB has none', async () => {
     const fixture = buildFixture();
     const plan = createTransport(fixture);
     const target = page({ indexedDb: new IDBFactory(), transport: plan.transport });
@@ -119,15 +120,13 @@ describe('cached playback never depends on the network', () => {
     const player = await boot(target);
     await settle(target.win, target.clock, 400);
 
-    expect(player.state.token).toBe('existing-screen-credential');
-    expect(target.win.document.querySelector('#signage-pair-code')).toBeNull();
-    expect(plan.calls.some((call) => call.url === '/api/player/pair')).toBe(false);
-    const manifestRequest = plan.calls.find((call) => call.url === '/api/player/manifest');
-    expect(manifestRequest?.headers.Authorization).toBe('Bearer existing-screen-credential');
-    expect(target.win.document.querySelector('img.sp-media, video.sp-video')).toBeTruthy();
+    expect(player.state.token).toBeNull();
+    expect(target.win.localStorage.getItem('signage.screenToken')).toBeNull();
+    expect(target.win.document.querySelector('#signage-pair-code')).toBeTruthy();
+    expect(plan.calls.some((call) => call.url === '/api/player/manifest' || call.url === '/api/player/heartbeat')).toBe(false);
   });
 
-  it('prefers the existing IndexedDB credential and leaves a legacy localStorage value untouched', async () => {
+  it('prefers IndexedDB and removes a legacy localStorage credential without using it', async () => {
     const fixture = buildFixture();
     const factory = new IDBFactory();
     const seeded = page({ indexedDb: factory });
@@ -142,7 +141,7 @@ describe('cached playback never depends on the network', () => {
     await settle(target.win, target.clock, 400);
 
     expect(player.state.token).toBe('current-indexeddb-credential');
-    expect(target.win.localStorage.getItem('signage.screenToken')).toBe('older-localstorage-credential');
+    expect(target.win.localStorage.getItem('signage.screenToken')).toBeNull();
     expect(target.win.document.querySelector('#signage-pair-code')).toBeNull();
     expect(plan.calls.some((call) => call.url === '/api/player/pair')).toBe(false);
   });
@@ -230,7 +229,7 @@ describe('cached playback never depends on the network', () => {
   });
 
   it('never lets a failing manifest interrupt or cover the media on screen', async () => {
-    const fixture = buildFixture();
+    const fixture = buildFixture({ imageDurationMs: 600000 });
     const planOptions: Parameters<typeof createTransport>[1] = {};
     const plan = createTransport(fixture, planOptions);
     const target = page({ indexedDb: new IDBFactory(), transport: plan.transport });
@@ -264,6 +263,7 @@ describe('cached playback never depends on the network', () => {
     const target = page({ indexedDb: factory, transport: deadNetwork });
     const player = await boot(target);
     const engine = player.engine();
+    engine.displayStatus = () => ({ healthy: false, hasLocal: true, playable: true });
     engine.isMounted = () => false;
     engine.isPending = () => false;
     engine.hasLocalMedia = () => true;
@@ -283,7 +283,7 @@ describe('cached playback never depends on the network', () => {
   });
 
   it('keeps showing cached media when the credential is revoked (no pairing takeover)', async () => {
-    const fixture = buildFixture();
+    const fixture = buildFixture({ imageDurationMs: 600000 });
     const plan = createTransport(fixture, { heartbeatStatus: 401 });
     const target = page({ indexedDb: new IDBFactory(), transport: plan.transport });
     await seedCache(target, fixture);
@@ -412,6 +412,7 @@ describe('navigator.onLine and background failures', () => {
   it('softens a remote reload command while a locally cached playlist is active', async () => {
     const fixture = buildFixture();
     fixture.manifest.commands.reloadVersion = 1;
+    refreshManifestHash(fixture.manifest);
     const plan = createTransport(fixture);
     const target = page({ indexedDb: new IDBFactory(), transport: plan.transport });
     await seedCache(target, fixture);
@@ -438,7 +439,7 @@ describe('atomic playlist activation', () => {
 
     // A new revision whose image arrives corrupted from storage.
     const next = buildFixture({ imageBytes: 'image-two-corrupt-me' });
-    next.manifest.manifestHash = 'b'.repeat(64);
+    refreshManifestHash(next.manifest);
     const plan = createTransport(next, { corruptedImage: true });
 
     const target = page({ indexedDb: factory, transport: plan.transport });
@@ -461,7 +462,7 @@ describe('atomic playlist activation', () => {
     seeded.dom.window.close();
 
     const next = buildFixture({ imageBytes: 'image-two-unreachable' });
-    next.manifest.manifestHash = 'c'.repeat(64);
+    refreshManifestHash(next.manifest);
     const plan = createTransport(next, { failMediaTimes: 100 });
 
     const target = page({ indexedDb: factory, transport: plan.transport });
@@ -486,7 +487,7 @@ describe('atomic playlist activation', () => {
 
     // A brand new revision that no longer references the image that is playing right now.
     const next = buildFixture({ imageBytes: 'image-two-new-content' });
-    next.manifest.manifestHash = 'd'.repeat(64);
+    refreshManifestHash(next.manifest);
     const plan = createTransport(next);
     const http = target.runtime.createHttp(target.win, { Promise: target.win.Promise, transport: plan.transport });
     const sync = target.runtime.createSync({
@@ -512,7 +513,7 @@ describe('atomic playlist activation', () => {
     seeded.dom.window.close();
 
     const next = buildFixture({ imageBytes: 'next revision media bytes' });
-    next.manifest.manifestHash = 'e'.repeat(64);
+    refreshManifestHash(next.manifest);
     const stale = buildFixture({ imageBytes: 'unreferenced old cache bytes' });
     const plan = createTransport(next);
     const target = page({ indexedDb: factory, transport: plan.transport });
@@ -552,6 +553,82 @@ describe('atomic playlist activation', () => {
     expect(await storage.getCredential()).toBe('existing-screen-identity');
   });
 
+  it('keeps the active display when candidate render preflight fails before activation', async () => {
+    const current = buildFixture({ imageDurationMs: 600000 });
+    const next = buildFixture({ imageBytes: 'candidate image cannot be decoded', imageDurationMs: 600000 });
+    refreshManifestHash(next.manifest);
+    const failure = { manifestStatus: 503 };
+    const plan = createTransport(next, failure);
+    const factory = new IDBFactory();
+    const seeded = page({ indexedDb: factory });
+    await seedCache(seeded, current);
+    seeded.dom.window.close();
+
+    const target = page({ indexedDb: factory, transport: plan.transport });
+    const player = await boot(target);
+    const oldImage: any = await mediaElement(target);
+    oldImage.onload();
+    await settle(target.win, target.clock, 30);
+    await waitFor(target.win, target.clock, () => player.log().some((entry: any) => entry.event === 'sync_failed'), 400);
+
+    target.win.__SIGNAGE_PREFLIGHT_ASSET__ = (asset: any) => asset.hash === next.imageHash
+      ? target.win.Promise.reject(Object.assign(new Error('decoder rejected candidate'), { code: 'render_preflight_failed' }))
+      : target.win.Promise.resolve(true);
+    failure.manifestStatus = 0;
+    target.clock.advance(16000);
+    await settle(target.win, target.clock, 20);
+    player.watchdog().requestSync('candidate_preflight_test');
+    await waitFor(target.win, target.clock, () => player.log().some((entry: any) => entry.event === 'sync_failed' && entry.data.code === 'render_preflight_failed'), 600);
+
+    const check = await openStorage(target);
+    expect((await check.getActiveManifest()).manifestHash).toBe(current.manifest.manifestHash);
+    expect(player.state.manifest.manifestHash).toBe(current.manifest.manifestHash);
+    expect(oldImage.style.display).toBe('block');
+    expect(target.win.document.querySelectorAll('img.sp-media').length).toBe(1);
+    expect(overlay(target).style.display).toBe('none');
+  });
+
+  it('rolls back a prepared candidate whose first rendered image fails, without blanking the old frame', async () => {
+    const current = buildFixture({ imageDurationMs: 600000 });
+    const next = buildFixture({ imageBytes: 'candidate image fails during mount', imageDurationMs: 600000 });
+    refreshManifestHash(next.manifest);
+    const failure = { manifestStatus: 503 };
+    const plan = createTransport(next, failure);
+    const factory = new IDBFactory();
+    const seeded = page({ indexedDb: factory });
+    await seedCache(seeded, current);
+    seeded.dom.window.close();
+
+    const target = page({ indexedDb: factory, transport: plan.transport });
+    const player = await boot(target);
+    const oldImage: any = await mediaElement(target);
+    oldImage.onload();
+    await settle(target.win, target.clock, 30);
+    await waitFor(target.win, target.clock, () => player.log().some((entry: any) => entry.event === 'sync_failed'), 400);
+
+    failure.manifestStatus = 0;
+    target.clock.advance(16000);
+    await settle(target.win, target.clock, 20);
+    player.watchdog().requestSync('candidate_render_test');
+    await waitFor(target.win, target.clock, () => {
+      const images = Array.from(target.win.document.querySelectorAll('img.sp-media')) as any[];
+      return images.some((image) => image !== oldImage);
+    }, 600);
+    const candidate: any = Array.from(target.win.document.querySelectorAll('img.sp-media')).find((image: any) => image !== oldImage);
+    expect(candidate).toBeTruthy();
+    expect((await (await openStorage(target)).getActiveManifest()).manifestHash).toBe(current.manifest.manifestHash);
+    candidate.onerror();
+    await settle(target.win, target.clock, 80);
+
+    const check = await openStorage(target);
+    expect((await check.getActiveManifest()).manifestHash).toBe(current.manifest.manifestHash);
+    expect(player.state.manifest.manifestHash).toBe(current.manifest.manifestHash);
+    expect(oldImage.style.display).toBe('block');
+    expect(target.win.document.querySelector('img.sp-media')).toBe(oldImage);
+    expect(overlay(target).style.display).toBe('none');
+    expect(player.log().some((entry: any) => entry.event === 'manifest_switch_rolled_back')).toBe(true);
+  });
+
   it('keeps the current manifest and credential when quota remains exhausted after one safe cleanup retry', async () => {
     const current = buildFixture();
     const factory = new IDBFactory();
@@ -560,7 +637,7 @@ describe('atomic playlist activation', () => {
     seeded.dom.window.close();
 
     const next = buildFixture({ imageBytes: 'media that cannot fit in storage' });
-    next.manifest.manifestHash = 'f'.repeat(64);
+    refreshManifestHash(next.manifest);
     const plan = createTransport(next);
     const target = page({ indexedDb: factory, transport: plan.transport });
     const storage = await openStorage(target);
@@ -707,7 +784,7 @@ describe('watchdog and crash recovery', () => {
     // 14 virtual days of hourly image/video transitions while every network request fails.
     for (let hour = 0; hour < 14 * 24; hour += 1) {
       target.clock.advance(3600000);
-      await settle(target.win, target.clock, 3);
+      await waitFor(target.win, target.clock, () => Boolean(target.win.document.querySelector('video.sp-video')), 120);
       const video: any = target.win.document.querySelector('video.sp-video');
       expect(video).toBeTruthy();
       video.oncanplay();
@@ -829,7 +906,7 @@ describe('synchronization resumes without interrupting playback', () => {
     seeded.dom.window.close();
 
     const next = buildFixture({ imageBytes: 'image-two-new-revision' });
-    next.manifest.manifestHash = 'e'.repeat(64);
+    refreshManifestHash(next.manifest);
     const plan = createTransport(next);
 
     const target = page({ indexedDb: factory, transport: plan.transport });
@@ -840,7 +917,7 @@ describe('synchronization resumes without interrupting playback', () => {
 
     await settle(target.win, target.clock, 400);
     const check = await openStorage(target);
-    expect((await check.getActiveManifest()).manifestHash).toBe('e'.repeat(64));
+    expect((await check.getActiveManifest()).manifestHash).toBe(next.manifest.manifestHash);
     expect(await check.hasCompleteAsset(next.imageHash, next.imageBytes.length, 'image/png')).toBe(true);
 
     // The picture was never blanked: an element was on screen for the whole synchronization.
@@ -853,7 +930,7 @@ describe('production acceptance walkthrough', () => {
   it('plays cached content offline through several transitions, resumes sync, and activates a new playlist only when it is fully cached', async () => {
     const fixture = buildFixture();
     const published = buildFixture({ imageBytes: 'acceptance-image-two' });
-    published.manifest.manifestHash = 'f'.repeat(64);
+    refreshManifestHash(published.manifest);
     const firstPlan = createTransport(fixture);
     const secondPlan = createTransport(published);
     let online = true;
@@ -870,7 +947,12 @@ describe('production acceptance walkthrough', () => {
     setPairCode(first, 'ABCD-1234');
     await settle(first.win, first.clock, 500);
     expect(firstPlayer.state.token).toBe('credential-1');
+    const firstImage: any = first.win.document.querySelector('img.sp-media');
+    expect(firstImage).toBeTruthy();
+    firstImage.onload();
+    await settle(first.win, first.clock, 40);
     expect(await firstPlayer.storage().countCachedAssets()).toBe(2);
+    expect(await firstPlayer.storage().getActiveManifest()).toBeTruthy();
     first.dom.window.close();
 
     // 3-5. The TV reboots with the internet completely gone: the cached playlist must start
@@ -910,22 +992,29 @@ describe('production acceptance walkthrough', () => {
     online = true;
     second.win.dispatchEvent(new second.win.Event('online'));
     await settle(second.win, second.clock, 200);
-    const playing = second.win.document.querySelector('video.sp-video') as any;
-    const playingSource = playing ? playing.getAttribute('src') : null;
     expect(secondPlayer.state.error).toBe('');
 
     // 8-12. A new playlist is published: it is downloaded in the background and activated only
     // after every required asset is cached and validated — the picture is never interrupted.
     publishPlan = secondPlan;
-    second.clock.advance(61000);
-    await settle(second.win, second.clock, 600);
+    const displayBeforePublish: any = second.win.document.querySelector('img.sp-media, video.sp-video');
+    second.clock.advance(16000);
+    secondPlayer.watchdog().requestSync('acceptance_publish');
+    await waitFor(second.win, second.clock, () => secondPlayer.log().some((entry: any) => entry.event === 'sync_ok' && entry.data.candidate), 600);
+    await waitFor(second.win, second.clock, () =>
+      Array.from(second.win.document.querySelectorAll('img.sp-media, video.sp-video')).some((element: any) => element !== displayBeforePublish), 120);
+    const prepared: any = Array.from(second.win.document.querySelectorAll('img.sp-media, video.sp-video'))
+      .find((element: any) => element !== displayBeforePublish);
+    expect(prepared).toBeTruthy();
+    expect(displayBeforePublish.style.display).toBe('block');
+    if (prepared.tagName.toLowerCase() === 'img') prepared.onload();
+    else prepared.oncanplay();
+    await settle(second.win, second.clock, 80);
 
     const check = await openStorage(second);
-    expect((await check.getActiveManifest()).manifestHash).toBe('f'.repeat(64));
+    expect((await check.getActiveManifest()).manifestHash).toBe(published.manifest.manifestHash);
     expect(await check.hasCompleteAsset(published.imageHash, published.imageBytes.length, 'image/png')).toBe(true);
     expect(await check.hasCompleteAsset(fixture.videoHash, fixture.videoBytes.length, 'video/mp4')).toBe(true);
-    const stillPlaying = second.win.document.querySelector('video.sp-video') as any;
-    if (playingSource && stillPlaying) expect(stillPlaying.getAttribute('src')).toBe(playingSource);
     expect(second.win.document.querySelector('img.sp-media, video.sp-video')).toBeTruthy();
     expect(overlay(second).style.display).toBe('none');
     expect(secondPlayer.log().some((entry: any) => entry.event === 'reload')).toBe(false);

@@ -83,6 +83,22 @@ describe('booting on a TV browser without modern APIs', () => {
     expect(player.state.phase).toBe('pair');
   });
 
+  it('starts idempotently and tears down the one watchdog, engine, storage and browser listeners', async () => {
+    const target = page();
+    const player = target.ui.create({ win: target.win, runtime: target.runtime });
+    const first = player.start();
+    const second = player.start();
+    expect(first).toBe(second);
+    await runToCompletion(target, first);
+    expect(player.watchdog().isRunning()).toBe(true);
+    expect(target.clock.pending()).toBeGreaterThan(0);
+
+    player.destroy();
+    expect(player.watchdog().isRunning()).toBe(false);
+    expect(target.clock.pending()).toBe(0);
+    expect(target.win.SignagePlayerInstance).toBeUndefined();
+  });
+
   it('auto-boots when the shell loads the scripts the normal way', async () => {
     const target = page({ autoBoot: true });
     await waitFor(target.win, target.clock, () => Boolean(target.win.SignagePlayerInstance));
@@ -164,7 +180,8 @@ describe('blank-screen protection', () => {
 
     const panel = target.win.document.querySelector('.sp-ui-diagnostics') as any;
     expect(panel).toBeTruthy();
-    expect(panel.textContent).toContain('storage exploded');
+    expect(panel.textContent).not.toContain('storage exploded');
+    expect(panel.textContent).toContain('storage_init_failed');
     expect(panel.textContent).toContain('آخر خطأ');
     const buttons = Array.from(panel.querySelectorAll('button')).map((node: any) => node.textContent);
     expect(buttons).toContain('إعادة المحاولة');
@@ -238,16 +255,16 @@ describe('pairing, downloading and playing through the UI', () => {
 
     expect(player.state.token).toBe('credential-1');
     expect(await player.storage().getCredential()).toBe('credential-1');
-    expect((await player.storage().getActiveManifest()).manifestHash).toBe(fixture.manifest.manifestHash);
     expect(await player.storage().countCachedAssets()).toBe(2);
 
     const image: any = target.win.document.querySelector('img.sp-media');
     expect(image).toBeTruthy();
     expect(image.getAttribute('src')).toContain('blob:');
+    image.onload();
+    await settle(target.win, target.clock, 30);
+    expect((await player.storage().getActiveManifest()).manifestHash).toBe(fixture.manifest.manifestHash);
     expect(target.win.document.body.textContent).toContain('تشغيل محلي');
     expect(target.win.document.body.textContent).toContain('Test screen');
-
-    image.onload();
     target.clock.advance(5200);
     await settle(target.win, target.clock, 100);
     const video: any = target.win.document.querySelector('video.sp-video');
@@ -279,6 +296,7 @@ describe('pairing, downloading and playing through the UI', () => {
     const image: any = target.win.document.querySelector('img.sp-media');
     expect(image).toBeTruthy();
     image.onload();
+    await settle(target.win, target.clock, 30);
     target.clock.advance(5200);
     await settle(target.win, target.clock, 100);
 
@@ -306,6 +324,10 @@ describe('pairing, downloading and playing through the UI', () => {
     const player = await boot(target);
     setPairCode(target, 'ABCD-1234');
     await settle(target.win, target.clock, 400);
+    const firstImage: any = target.win.document.querySelector('img.sp-media');
+    expect(firstImage).toBeTruthy();
+    firstImage.onload();
+    await settle(target.win, target.clock, 40);
     expect(await player.storage().countCachedAssets()).toBe(2);
 
     offline = true;
@@ -362,7 +384,12 @@ describe('offline cold start', () => {
     const firstPlayer = await boot(first);
     setPairCode(first, 'ABCD-1234');
     await settle(first.win, first.clock, 400);
+    const firstImage: any = first.win.document.querySelector('img.sp-media');
+    expect(firstImage).toBeTruthy();
+    firstImage.onload();
+    await settle(first.win, first.clock, 40);
     expect(await firstPlayer.storage().countCachedAssets()).toBe(2);
+    expect(await firstPlayer.storage().getActiveManifest()).toBeTruthy();
     first.dom.window.close();
 
     // The TV reboots with no Wi-Fi: same persistent storage, every request fails.

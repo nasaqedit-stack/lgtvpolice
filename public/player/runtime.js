@@ -26,7 +26,7 @@
 })(typeof self !== 'undefined' ? self : (typeof window !== 'undefined' ? window : this), function (root) {
   'use strict';
 
-  var VERSION = '2.1.0';
+  var VERSION = '2.1.1';
   var DB_NAME = 'digital-signage-player';  // unchanged: TVs already paired keep their data
   var DB_VERSION = 1;
   var DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024;
@@ -537,17 +537,18 @@
   };
   IdbAdapter.prototype.getCredential = function () {
     var self = this;
-    function legacyCredential() {
-      // Older fallback storage kept the same opaque screen credential in localStorage. Reuse it
-      // only when IndexedDB has no credential; never replace or clear existing player identity.
-      var local = localStorageSafe(self.win);
-      if (!local) return null;
-      var token = local.getItem('signage.screenToken');
-      return typeof token === 'string' && token ? token : null;
+    // Older builds wrote the opaque screen credential to localStorage. Remove that legacy value
+    // without ever reading or reusing it: persistent player identity belongs in IndexedDB only.
+    function clearLegacyCredential() {
+      try { if (self.win.localStorage) self.win.localStorage.removeItem('signage.screenToken'); } catch (error) { noop(); }
     }
     return this._get('credentials', 'screen').then(function (row) {
-      return (row && row.token) || legacyCredential();
-    }, function () { return legacyCredential(); });
+      clearLegacyCredential();
+      return (row && row.token) || null;
+    }, function () {
+      clearLegacyCredential();
+      return null;
+    });
   };
   IdbAdapter.prototype.setCredential = function (token) {
     return this._put('credentials', { key: 'screen', token: token, savedAt: nowIso() }).then(function () { return true; });
@@ -560,6 +561,13 @@
       return self._get('manifests', pointer.value).then(function (row) { return (row && row.manifest) || null; }, function () { return null; });
     }, function () { return null; });
   };
+  IdbAdapter.prototype.prepareManifest = function (manifest) {
+    var self = this;
+    return this.completeHashes(manifest).then(function (missing) {
+      if (missing.length) throw PlayerError('لا يمكن تجهيز قائمة ناقصة: الملف ' + safeString(missing[0], 8) + ' غير مكتمل.', 'partial_sync');
+      return self._put('meta', { key: 'candidateManifest', value: manifest });
+    });
+  };
   IdbAdapter.prototype.activateManifest = function (manifest) {
     var self = this;
     var P = this.P;
@@ -571,6 +579,7 @@
         try {
           tx.objectStore('manifests').put({ manifestHash: manifest.manifestHash, manifest: manifest, activatedAt: nowIso() });
           tx.objectStore('meta').put({ key: 'activeManifest', value: manifest.manifestHash });
+          tx.objectStore('meta').delete('candidateManifest');
         } catch (error) { reject(error); return; }
         idbTransactionDone(P, tx).then(function () { resolve(true); }, reject);
       });
@@ -856,16 +865,6 @@
     return this.P.resolve(true);
   };
 
-  function localStorageSafe(win) {
-    try {
-      var storage = win.localStorage;
-      if (!storage) return null;
-      storage.setItem('__signage_probe', '1');
-      storage.removeItem('__signage_probe');
-      return storage;
-    } catch (error) { return null; }
-  }
-
   /** Cache API backend: used only when IndexedDB is unavailable but CacheStorage exists. */
   function CacheAdapter(win, cache, P) {
     this.win = win;
@@ -920,28 +919,33 @@
     }.bind(this));
   };
   CacheAdapter.prototype.getCredential = function () {
-    var storage = localStorageSafe(this.win);
-    if (storage) return this.P.resolve(storage.getItem('signage.screenToken'));
+    try { if (this.win.localStorage) this.win.localStorage.removeItem('signage.screenToken'); } catch (error) { noop(); }
     return this._getJson(this._metaUrl('credential')).then(function (value) { return (value && value.token) || null; });
   };
   CacheAdapter.prototype.setCredential = function (token) {
-    var storage = localStorageSafe(this.win);
-    if (storage) { storage.setItem('signage.screenToken', token); return this.P.resolve(true); }
     return this._putJson(this._metaUrl('credential'), { token: token });
   };
   CacheAdapter.prototype.clearCredential = function () {
-    var storage = localStorageSafe(this.win);
-    if (storage) storage.removeItem('signage.screenToken');
+    try { if (this.win.localStorage) this.win.localStorage.removeItem('signage.screenToken'); } catch (error) { noop(); }
     return this._putJson(this._metaUrl('credential'), { token: null });
   };
   CacheAdapter.prototype.getActiveManifest = function () {
     return this._getJson(this._metaUrl('activeManifest')).then(function (value) { return (value && value.manifest) || null; });
   };
+  CacheAdapter.prototype.prepareManifest = function (manifest) {
+    var self = this;
+    return this.completeHashes(manifest).then(function (missing) {
+      if (missing.length) throw PlayerError('لا يمكن تجهيز قائمة ناقصة: الملف ' + safeString(missing[0], 8) + ' غير مكتمل.', 'partial_sync');
+      return self._putJson(self._metaUrl('candidateManifest'), { manifest: manifest });
+    });
+  };
   CacheAdapter.prototype.activateManifest = function (manifest) {
     var self = this;
     return this.completeHashes(manifest).then(function (missing) {
       if (missing.length) throw PlayerError('لا يمكن تفعيل قائمة ناقصة: الملف ' + safeString(missing[0], 8) + ' غير مكتمل.', 'partial_sync');
-      return self._putJson(self._metaUrl('activeManifest'), { manifest: manifest });
+      return self._putJson(self._metaUrl('activeManifest'), { manifest: manifest }).then(function () {
+        return self.cache.delete(self._metaUrl('candidateManifest')).then(function () { return true; }, function () { return true; });
+      });
     });
   };
   CacheAdapter.prototype.completeHashes = function (manifest) {
@@ -1182,19 +1186,13 @@
     this.usage = 0;
   }
   MemoryAdapter.prototype.getCredential = function () {
-    var storage = localStorageSafe(this.win);
-    if (storage) return this.P.resolve(storage.getItem('signage.screenToken'));
     return this.P.resolve(this.meta.credential || null);
   };
   MemoryAdapter.prototype.setCredential = function (token) {
-    var storage = localStorageSafe(this.win);
-    if (storage) storage.setItem('signage.screenToken', token);
     this.meta.credential = token;
     return this.P.resolve(true);
   };
   MemoryAdapter.prototype.clearCredential = function () {
-    var storage = localStorageSafe(this.win);
-    if (storage) storage.removeItem('signage.screenToken');
     this.meta.credential = null;
     return this.P.resolve(true);
   };
@@ -1202,12 +1200,21 @@
     var hash = this.meta.activeManifest;
     return this.P.resolve(hash && this.manifests[hash] ? this.manifests[hash].manifest : null);
   };
+  MemoryAdapter.prototype.prepareManifest = function (manifest) {
+    var self = this;
+    return this.completeHashes(manifest).then(function (missing) {
+      if (missing.length) throw PlayerError('لا يمكن تجهيز قائمة ناقصة: الملف ' + safeString(missing[0], 8) + ' غير مكتمل.', 'partial_sync');
+      self.meta.candidateManifest = manifest;
+      return true;
+    });
+  };
   MemoryAdapter.prototype.activateManifest = function (manifest) {
     var self = this;
     return this.completeHashes(manifest).then(function (missing) {
       if (missing.length) throw PlayerError('لا يمكن تفعيل قائمة ناقصة: الملف ' + safeString(missing[0], 8) + ' غير مكتمل.', 'partial_sync');
       self.manifests[manifest.manifestHash] = { manifest: manifest, activatedAt: nowIso() };
       self.meta.activeManifest = manifest.manifestHash;
+      self.meta.candidateManifest = null;
       return true;
     });
   };
@@ -1687,9 +1694,135 @@
    * 6. Sync engine — the same protocol as the admin-facing app, re-implemented compatibly.
    * ------------------------------------------------------------------------------------------ */
 
+  function isRecord(value) {
+    return Boolean(value && Object.prototype.toString.call(value) === '[object Object]');
+  }
+
+  function finiteInteger(value, minimum, maximum) {
+    var number = Number(value);
+    return isFinite(number) && Math.floor(number) === number && number >= minimum && number <= maximum;
+  }
+
+  function stableJson(value) {
+    if (isArray(value)) {
+      var entries = [];
+      for (var i = 0; i < value.length; i += 1) entries.push(stableJson(value[i]));
+      return '[' + entries.join(',') + ']';
+    }
+    if (isRecord(value)) {
+      var keys = [];
+      for (var key in value) if (hasOwn(value, key)) keys.push(key);
+      keys.sort();
+      var pairs = [];
+      for (var j = 0; j < keys.length; j += 1) pairs.push(JSON.stringify(keys[j]) + ':' + stableJson(value[keys[j]]));
+      return '{' + pairs.join(',') + '}';
+    }
+    var encoded = JSON.stringify(value);
+    if (encoded === undefined) throw PlayerError('البيان يحتوي على قيمة غير قابلة للتحقق.', 'invalid_manifest');
+    return encoded;
+  }
+
+  function utf8Bytes(text) {
+    var bytes = [];
+    for (var i = 0; i < text.length; i += 1) {
+      var code = text.charCodeAt(i);
+      if (code >= 55296 && code <= 56319 && i + 1 < text.length) {
+        var low = text.charCodeAt(i + 1);
+        if (low >= 56320 && low <= 57343) {
+          code = 65536 + ((code - 55296) << 10) + (low - 56320);
+          i += 1;
+        }
+      }
+      if (code < 128) bytes.push(code);
+      else if (code < 2048) {
+        bytes.push(192 | (code >> 6), 128 | (code & 63));
+      } else if (code < 65536) {
+        bytes.push(224 | (code >> 12), 128 | ((code >> 6) & 63), 128 | (code & 63));
+      } else {
+        bytes.push(240 | (code >> 18), 128 | ((code >> 12) & 63), 128 | ((code >> 6) & 63), 128 | (code & 63));
+      }
+    }
+    return new Uint8Array(bytes);
+  }
+
+  function manifestBase(value) {
+    var base = {};
+    for (var key in value) {
+      if (hasOwn(value, key) && key !== 'manifestVersion' && key !== 'manifestHash' && key !== 'generatedAt') base[key] = value[key];
+    }
+    return base;
+  }
+
   function isManifest(value) {
-    return Boolean(value && value.schemaVersion === 1 && value.screen && value.screen.id &&
-      typeof value.manifestHash === 'string' && isArray(value.playlists) && isArray(value.assets) && isArray(value.schedules));
+    if (!isRecord(value) || value.schemaVersion !== 1 || !isRecord(value.screen) ||
+        typeof value.screen.id !== 'string' || !value.screen.id || value.screen.id.length > 128 ||
+        typeof value.screen.name !== 'string' || typeof value.screen.timezone !== 'string' ||
+        !finiteInteger(value.manifestVersion, 1, 2147483647) || !/^[a-f0-9]{64}$/.test(String(value.manifestHash || '')) ||
+        typeof value.generatedAt !== 'string' || !isFinite(Date.parse(value.generatedAt)) ||
+        !(value.defaultPlaylistId === null || (typeof value.defaultPlaylistId === 'string' && value.defaultPlaylistId.length > 0)) ||
+        !isArray(value.playlists) || !isArray(value.assets) || !isArray(value.schedules) || !isRecord(value.commands) ||
+        !finiteInteger(value.commands.syncVersion, 0, 2147483647) || !finiteInteger(value.commands.reloadVersion, 0, 2147483647)) return false;
+    if (value.commands.applied !== undefined && (!isRecord(value.commands.applied) ||
+        !finiteInteger(value.commands.applied.syncVersion, 0, 2147483647) || !finiteInteger(value.commands.applied.reloadVersion, 0, 2147483647))) return false;
+
+    var ids = {};
+    var references = {};
+    var playlistIds = {};
+    for (var i = 0; i < value.playlists.length; i += 1) {
+      var playlist = value.playlists[i];
+      if (!isRecord(playlist) || typeof playlist.id !== 'string' || !playlist.id || playlist.id.length > 128 ||
+          playlistIds[playlist.id] || typeof playlist.name !== 'string' ||
+          !finiteInteger(playlist.version, 1, 2147483647) || typeof playlist.enabled !== 'boolean' || !isArray(playlist.items)) return false;
+      playlistIds[playlist.id] = true;
+      for (var j = 0; j < playlist.items.length; j += 1) {
+        var item = playlist.items[j];
+        if (!isRecord(item) || typeof item.id !== 'string' || !item.id || typeof item.mediaId !== 'string' || !item.mediaId ||
+            typeof item.name !== 'string' || !/^[a-f0-9]{64}$/.test(String(item.hash || '')) ||
+            !finiteInteger(item.size, 1, 2147483648) || !finiteInteger(item.position, 0, 2147483647) ||
+            typeof item.loop !== 'boolean' || (item.durationMs !== null && (!finiteInteger(item.durationMs, 1, 86400000))) ||
+            (item.kind !== 'image' && item.kind !== 'video')) return false;
+        if (item.kind === 'image' && !/^image\/(jpeg|png|webp)$/.test(String(item.mimeType || ''))) return false;
+        if (item.kind === 'video' && !/^video\/(mp4|quicktime)$/.test(String(item.mimeType || ''))) return false;
+        if (item.kind === 'image' && item.durationMs === null) return false;
+        if (item.kind === 'video' && item.durationMs !== null) return false;
+        if (ids[item.id]) return false;
+        ids[item.id] = true;
+        references[item.mediaId] = { hash: item.hash, size: Number(item.size), mimeType: item.mimeType, name: item.name };
+      }
+    }
+
+    var assetIds = {};
+    for (var k = 0; k < value.assets.length; k += 1) {
+      var asset = value.assets[k];
+      if (!isRecord(asset) || typeof asset.mediaId !== 'string' || !asset.mediaId || assetIds[asset.mediaId] ||
+          typeof asset.name !== 'string' || !/^[a-f0-9]{64}$/.test(String(asset.hash || '')) ||
+          !finiteInteger(asset.size, 1, 2147483648) ||
+          !/^(image\/(jpeg|png|webp)|video\/(mp4|quicktime))$/.test(String(asset.mimeType || ''))) return false;
+      assetIds[asset.mediaId] = true;
+      var reference = references[asset.mediaId];
+      if (!reference || reference.hash !== asset.hash || reference.size !== Number(asset.size) || reference.mimeType !== asset.mimeType) return false;
+    }
+    for (var mediaId in references) if (hasOwn(references, mediaId) && !assetIds[mediaId]) return false;
+
+    for (var s = 0; s < value.schedules.length; s += 1) {
+      var rule = value.schedules[s];
+      if (!isRecord(rule) || typeof rule.id !== 'string' || !rule.id || typeof rule.playlistId !== 'string' ||
+          !playlistIds[rule.playlistId] || !isArray(rule.weekdays) || typeof rule.startTime !== 'string' ||
+          !/^([01][0-9]|2[0-3]):[0-5][0-9]$/.test(rule.startTime) || typeof rule.endTime !== 'string' ||
+          !/^([01][0-9]|2[0-3]):[0-5][0-9]$/.test(rule.endTime) || rule.startTime === rule.endTime ||
+          typeof rule.timezone !== 'string' || typeof rule.enabled !== 'boolean') return false;
+      for (var w = 0; w < rule.weekdays.length; w += 1) if (!finiteInteger(rule.weekdays[w], 1, 7)) return false;
+    }
+    if (value.defaultPlaylistId && (!playlistIds[value.defaultPlaylistId] || !value.playlists.some(function (entry) { return entry.id === value.defaultPlaylistId && entry.enabled; }))) return false;
+    return true;
+  }
+
+  function verifyManifestHash(value, shaModule) {
+    try {
+      var digest = createHasher(root, shaModule);
+      digest.update(utf8Bytes(stableJson(manifestBase(value))));
+      return digest.digestHex() === value.manifestHash;
+    } catch (error) { return false; }
   }
 
   function hasPlayableContent(manifest) {
@@ -1737,6 +1870,13 @@
     var shaModule = resolveSha(win, options.sha);
     var preferSameOrigin = Boolean(options.preferSameOrigin);
     var signedUrlCache = {};
+    var preflightAsset = isFn(options.preflightAsset) ? options.preflightAsset : null;
+    var deferActivation = Boolean(options.deferActivation);
+    var verifiedAssetHashes = {};
+    var verifiedAssetOrder = [];
+    var integrityFailures = {};
+    var preflightedAssetHashes = {};
+    var preflightedAssetOrder = [];
     // Hashes the player itself protects: whatever is on the screen right now, plus every asset of
     // the manifest being played. Garbage collection must never delete active media, even when the
     // incoming manifest no longer references it.
@@ -1854,7 +1994,7 @@
     var FATAL_CODES = {
       screen_unauthorized: true, screen_disabled: true, download_rejected: true,
       range_size_mismatch: true, range_rejected: true, file_too_large_for_browser: true,
-      invalid_manifest: true, hash_mismatch: true, size_mismatch: true, storage_quota: true
+      invalid_manifest: true, manifest_integrity: true, hash_mismatch: true, size_mismatch: true, storage_quota: true
     };
     function transientError(error) {
       var code = errorCode(error);
@@ -1894,7 +2034,10 @@
 
     function downloadAsset(asset, onBytes, persistChunk) {
       var chunkCount = Math.ceil(asset.size / chunkSize);
-      return storage.getPartialInfo(asset.hash).then(function (info) {
+      var resetCorrupt = integrityFailures[asset.hash]
+        ? storage.clearAsset(asset.hash).then(function () { delete integrityFailures[asset.hash]; })
+        : P.resolve(true);
+      return resetCorrupt.then(function () { return storage.getPartialInfo(asset.hash); }).then(function (info) {
         if (info && !info.cleared && (Number(info.expectedSize) !== asset.size || info.mimeType !== asset.mimeType || Number(info.chunkSize) !== chunkSize)) {
           return storage.clearAsset(asset.hash);
         }
@@ -2019,14 +2162,26 @@
       });
     }
 
+    function rememberVerifiedHash(hash) {
+      if (!verifiedAssetHashes[hash]) {
+        verifiedAssetHashes[hash] = true;
+        verifiedAssetOrder.push(hash);
+      }
+      while (verifiedAssetOrder.length > 2048) delete verifiedAssetHashes[verifiedAssetOrder.shift()];
+    }
+
     function verifyAsset(asset) {
+      if (verifiedAssetHashes[asset.hash] && !integrityFailures[asset.hash]) return P.resolve(true);
       // Incremental SHA-256 over the stored parts, yielding to the event loop between parts so the
-      // TV never freezes while a large video is verified.
+      // TV never freezes while a large video is verified. This also audits bytes restored from IDB.
       var digest = createHasher(win, shaModule);
       var total = 0;
       return storage.getAssetParts(asset.hash).then(function (parts) {
         function next(index) {
           if (index >= parts.length) return P.resolve(total);
+          if (!parts[index] || parts[index].index !== index || !parts[index].bytes || parts[index].size !== parts[index].bytes.length) {
+            throw PlayerError('أجزاء الملف المحلي غير متسلسلة أو ناقصة.', 'size_mismatch');
+          }
           digest.update(toUint8(parts[index].bytes));
           total += parts[index].size;
           return new P(function (resolve) { win.setTimeout(function () { resolve(next(index + 1)); }, 0); });
@@ -2036,8 +2191,58 @@
         if (size !== asset.size) throw PlayerError('فشل فحص حجم الملف بعد التنزيل.', 'size_mismatch');
         var hex = digest.digestHex();
         if (hex !== String(asset.hash)) throw PlayerError('فشل التحقق من بصمة الملف. يحتفظ المشغل بالقائمة السابقة.', 'hash_mismatch');
+        delete integrityFailures[asset.hash];
+        rememberVerifiedHash(asset.hash);
         return true;
+      }, function (error) {
+        if (errorCode(error) === 'hash_mismatch' || errorCode(error) === 'size_mismatch') integrityFailures[asset.hash] = true;
+        throw error;
       });
+    }
+
+    function verifyManifestAssets(manifest) {
+      var assets = uniqueAssets(manifest);
+      var invalid = [];
+      function next(index) {
+        if (index >= assets.length) return P.resolve(invalid);
+        var asset = assets[index];
+        return storage.hasCompleteAsset(asset.hash, asset.size, asset.mimeType).then(function (complete) {
+          if (!complete) { invalid.push(asset); return next(index + 1); }
+          return verifyAsset(asset).then(function () { return next(index + 1); }, function () {
+            integrityFailures[asset.hash] = true;
+            invalid.push(asset);
+            return next(index + 1);
+          });
+        });
+      }
+      return next(0);
+    }
+
+    function rememberPreflightedHash(hash) {
+      if (!preflightedAssetHashes[hash]) {
+        preflightedAssetHashes[hash] = true;
+        preflightedAssetOrder.push(hash);
+      }
+      while (preflightedAssetOrder.length > 1000) delete preflightedAssetHashes[preflightedAssetOrder.shift()];
+    }
+
+    function preflightManifestAssets(assets) {
+      if (!preflightAsset) return P.resolve(true);
+      function next(index) {
+        if (index >= assets.length) return P.resolve(true);
+        var asset = assets[index];
+        if (preflightedAssetHashes[asset.hash]) return next(index + 1);
+        var result;
+        try { result = preflightAsset(asset); } catch (error) { return P.reject(error); }
+        return P.resolve(result).then(function (prepared) {
+          if (prepared === false) throw PlayerError('تعذر تجهيز الوسيط الجديد للتشغيل؛ بقي المحتوى الحالي نشطاً.', 'render_preflight_failed');
+          rememberPreflightedHash(asset.hash);
+          return next(index + 1);
+        }, function (error) {
+          throw PlayerError('تعذر تجهيز الوسيط الجديد للتشغيل؛ بقي المحتوى الحالي نشطاً.', 'render_preflight_failed');
+        });
+      }
+      return next(0);
     }
 
     function quantity(list) {
@@ -2076,20 +2281,26 @@
       }
 
       return storage.getActiveManifest().then(function (saved) {
-        previous = saved;
+        previous = saved && isManifest(saved) && verifyManifestHash(saved, shaModule) ? saved : null;
+        if (saved && !previous) log('cached_manifest_rejected', { reason: 'integrity_or_schema' });
         var headers = {};
         if (previous && previous.manifestHash) headers['If-None-Match'] = '"' + previous.manifestHash + '"';
         return authorizedRequest({ method: 'GET', url: '/api/player/manifest', responseType: 'text', timeoutMs: 20000, headers: headers });
       }).then(function (response) {
         if (response.status === 304 && previous) {
-          return storage.completeHashes(previous).then(function (missingHashes) {
-            if (!missingHashes.length) {
+          return verifyManifestAssets(previous).then(function (invalidAssets) {
+            if (!invalidAssets.length) {
               progress('ready', 'المحتوى المحلي محدث.');
-              // Nothing changed: this is the right moment to drop media that neither the active
-              // manifest nor the player itself references any more (never the active media).
+              // A 304 is not permission to trust persistent bytes blindly: every local asset is
+              // hashed once after a cold start before the player considers the cache complete.
               return storage.deleteUnreferenced(protection(previous)).then(function () {
-                return storage.getLastSyncAt().then(function (at) {
-                  return { manifest: previous, changed: false, lastSyncAt: at || previous.generatedAt || nowIso() };
+                return storage.getLastSyncAt().then(function (oldAt) {
+                  var at = nowIso();
+                  return P.resolve(storage.setLastSyncAt(at)).then(function () {
+                    return { manifest: previous, changed: false, lastSyncAt: at };
+                  }, function () {
+                    return { manifest: previous, changed: false, lastSyncAt: oldAt || previous.generatedAt || at };
+                  });
                 });
               }, function () {
                 return storage.getLastSyncAt().then(function (at) {
@@ -2097,6 +2308,7 @@
                 });
               });
             }
+            log('cached_asset_integrity_failed', { count: invalidAssets.length });
             return authorizedRequest({ method: 'GET', url: '/api/player/manifest', responseType: 'text', timeoutMs: 20000 });
           });
         }
@@ -2110,6 +2322,7 @@
         try { incoming = response.json(); }
         catch (error) { throw PlayerError('بيان المحتوى غير صالح.', 'invalid_manifest'); }
         if (!isManifest(incoming)) throw PlayerError('بيان المحتوى غير مكتمل أو غير صالح.', 'invalid_manifest');
+        if (!verifyManifestHash(incoming, shaModule)) throw PlayerError('تعذر التحقق من سلامة بيان المحتوى؛ بقيت القائمة السابقة نشطة.', 'manifest_integrity');
         if (!hasPlayableContent(incoming)) {
           if (previous) {
             return storage.getLastSyncAt().then(function (at) {
@@ -2129,8 +2342,18 @@
             if (index >= assets.length) return P.resolve(pending);
             var asset = assets[index];
             return storage.hasCompleteAsset(asset.hash, asset.size, asset.mimeType).then(function (ok) {
-              if (!ok) pending.push(asset);
-              return checkNext(index + 1);
+              if (!ok || integrityFailures[asset.hash]) {
+                pending.push(asset);
+                return checkNext(index + 1);
+              }
+              return verifyAsset(asset).then(function () {
+                return checkNext(index + 1);
+              }, function (error) {
+                if (errorCode(error) !== 'hash_mismatch' && errorCode(error) !== 'size_mismatch') throw error;
+                integrityFailures[asset.hash] = true;
+                pending.push(asset);
+                return checkNext(index + 1);
+              });
             });
           }
           return checkNext(0).then(function (list) {
@@ -2194,16 +2417,31 @@
                   }
                   return verifyAll(0).then(function (missing) {
                     if (missing.length) throw PlayerError('لم تكتمل مزامنة كل الوسائط. تبقى قائمة التشغيل السابقة نشطة.', 'partial_sync');
-                    return writeWithQuotaRecovery(function () { return storage.activateManifest(incoming); }).then(function () {
+                    return preflightManifestAssets(assets).then(function () {
+                      return writeWithQuotaRecovery(function () {
+                        return deferActivation ? storage.prepareManifest(incoming) : storage.activateManifest(incoming);
+                      });
+                    }).then(function () {
                       var at = nowIso();
-                      return storage.setLastSyncAt(at).then(function () {
-                        // `activeHashes()` still reports the manifest the engine is showing: media
-                        // that is on screen survives this pass and is collected on the next sync.
+                      var result = {
+                        manifest: incoming,
+                        changed: !previous || previous.manifestHash !== incoming.manifestHash,
+                        lastSyncAt: at,
+                        candidate: deferActivation
+                      };
+                      if (deferActivation) {
+                        progress('ready', 'اكتملت مزامنة القائمة وتجهيزها بأمان.', { totalBytes: totalBytes, downloadedBytes: totalBytes });
+                        return result;
+                      }
+                      return P.resolve(storage.setLastSyncAt(at)).then(function () {
+                        // Direct consumers retain the original eager-activation behavior. The
+                        // shipped TV player opts into deferred activation and commits only after
+                        // the first candidate frame has rendered successfully.
                         return storage.deleteUnreferenced(targets.concat(activeHashes())).then(function () {
                           progress('ready', 'اكتملت المزامنة. يمكن الآن التشغيل دون إنترنت.', { totalBytes: totalBytes, downloadedBytes: totalBytes });
-                          return { manifest: incoming, changed: !previous || previous.manifestHash !== incoming.manifestHash, lastSyncAt: at };
-                        });
-                      });
+                          return result;
+                        }, function () { return result; });
+                      }, function () { return result; });
                     });
                   });
                 });
@@ -2224,6 +2462,94 @@
     };
   }
 
+  function preflightAsset(win, storage, asset, options) {
+    var P = resolvePromise(options && options.Promise, win);
+    var settings = options || {};
+    var urlApi = win && (win.URL || win.webkitURL);
+    if (!win || !win.document || !urlApi || !isFn(urlApi.createObjectURL)) return P.resolve(true);
+    return storage.getAssetBlob(asset.hash).then(function (blob) {
+      if (!blob) throw PlayerError('تعذر تجهيز ملف محلي مكتمل.', 'asset_missing');
+      var url;
+      try { url = urlApi.createObjectURL(blob); } catch (error) { throw PlayerError('تعذر إنشاء مصدر محلي للوسيط.', 'render_preflight_failed'); }
+      if (!url) throw PlayerError('تعذر إنشاء مصدر محلي للوسيط.', 'render_preflight_failed');
+      return new P(function (resolve, reject) {
+        var element = null;
+        var settled = false;
+        var timeout = null;
+        function finish(error) {
+          if (settled) return;
+          settled = true;
+          if (timeout) { win.clearTimeout(timeout); timeout = null; }
+          if (element) {
+            element.onload = null;
+            element.onerror = null;
+            element.oncanplay = null;
+            element.onloadedmetadata = null;
+            try { if (element.tagName && element.tagName.toLowerCase() === 'video') element.pause(); } catch (pauseError) { noop(); }
+            try { element.removeAttribute('src'); if (isFn(element.load)) element.load(); } catch (loadError) { noop(); }
+            if (element.parentNode) { try { element.parentNode.removeChild(element); } catch (removeError) { noop(); } }
+          }
+          try { urlApi.revokeObjectURL(url); } catch (revokeError) { noop(); }
+          if (error) reject(error);
+          else resolve(true);
+        }
+        try {
+          if (asset.mimeType && asset.mimeType.indexOf('image/') === 0) {
+            element = win.document.createElement('img');
+            element.className = 'sp-preflight-image';
+            element.alt = '';
+            element.style.position = 'absolute';
+            element.style.left = '-10000px';
+            element.style.top = '0';
+            element.style.width = '1px';
+            element.style.height = '1px';
+            element.style.opacity = '0';
+            element.onload = function () {
+              var width = Number(element.naturalWidth || element.width || 0);
+              if (width <= 0) { finish(PlayerError('تعذر فك ترميز الصورة الجديدة.', 'render_preflight_failed')); return; }
+              finish(null);
+            };
+            element.onerror = function () { finish(PlayerError('تعذر فك ترميز الصورة الجديدة.', 'render_preflight_failed')); };
+          } else {
+            element = win.document.createElement('video');
+            element.className = 'sp-preflight-video';
+            element.preload = 'auto';
+            element.muted = true;
+            element.playsInline = true;
+            element.setAttribute('playsinline', 'playsinline');
+            element.setAttribute('webkit-playsinline', 'webkit-playsinline');
+            element.style.position = 'absolute';
+            element.style.left = '-10000px';
+            element.style.top = '0';
+            element.style.width = '1px';
+            element.style.height = '1px';
+            element.style.opacity = '0';
+            var canPlay = '';
+            try { if (isFn(element.canPlayType)) canPlay = element.canPlayType(asset.mimeType) || ''; } catch (canPlayError) { canPlay = ''; }
+            if (asset.mimeType === 'video/mp4' && canPlay === '') {
+              finish(PlayerError('هذا المتصفح لا يعلن دعمه لصيغة الفيديو المطلوبة.', 'render_preflight_failed'));
+              return;
+            }
+            element.oncanplay = function () { finish(null); };
+            element.onloadedmetadata = function () {
+              if (Number(element.readyState) >= 3) finish(null);
+            };
+            element.onerror = function () { finish(PlayerError('تعذر فك ترميز الفيديو الجديد.', 'render_preflight_failed')); };
+          }
+          timeout = win.setTimeout(function () {
+            finish(PlayerError('انتهت مهلة تجهيز الوسيط الجديد؛ بقي المحتوى الحالي نشطاً.', 'render_preflight_failed'));
+          }, settings.timeoutMs || (asset.mimeType && asset.mimeType.indexOf('video/') === 0 ? 30000 : 15000));
+          win.document.body.appendChild(element);
+          element.src = url;
+          if (element.tagName && element.tagName.toLowerCase() === 'video' && isFn(element.load)) element.load();
+          else if (element.complete && Number(element.naturalWidth || element.width || 0) > 0) finish(null);
+        } catch (error) {
+          finish(PlayerError('تعذر تهيئة وسيط التشغيل الجديد.', 'render_preflight_failed'));
+        }
+      });
+    });
+  }
+
   /* ---------------------------------------------------------------------------------------------
    * 7. Playback engine (DOM-injected so it is testable and so a failure never blanks the screen)
    * ------------------------------------------------------------------------------------------ */
@@ -2235,6 +2561,7 @@
     var storage = options.storage;
     var sync = options.sync;
     var http = options.http;
+    var token = options.token || null;
     var P = resolvePromise(options.Promise, win);
     var log = isFn(options.log) ? options.log : noop;
     var notice = isFn(options.onNotice) ? options.onNotice : noop;
@@ -2246,11 +2573,14 @@
     var onRecoveryExhausted = isFn(options.onRecoveryExhausted) ? options.onRecoveryExhausted : noop;
     var state = {
       manifest: null, playlistId: null, index: 0, item: null, element: null, objectUrl: null,
-      source: null, mounted: false, mountedHash: null, mountedKind: null, videoElement: null, videoSourceUrl: null,
+      source: null, mounted: false, mountedHash: null, mountedKind: null, mountedItem: null,
+      mountedPlaylistId: null, mountedManifestHash: null, videoElement: null, videoSourceUrl: null,
+      videoElements: [], pendingManifestSwitch: null, pendingMediaSince: 0,
       pendingImage: null, pendingImageUrl: null, playbackGeneration: 0, renderRequest: 0,
       audioEnabled: Boolean(options.audioEnabled), audioBlocked: false,
       pendingSeek: null, stallAttempts: 0, emptyStreak: 0, hasLocalMedia: false,
-      pauseRecoveryAt: 0, suppressMediaEvents: false, recoveryEventTimer: null, lastVideoPosition: null
+      pauseRecoveryAt: 0, suppressMediaEvents: false, recoveryEventTimer: null, lastVideoPosition: null,
+      lastVideoProgressAt: 0
     };
     var imageTimer = null;
     var stallTimer = null;
@@ -2262,6 +2592,10 @@
     var networkRetry = {};
     var missAttempts = {};
     var resume = options.resume || null;
+    var shaModule = resolveSha(win, options.sha);
+    var locallyVerified = {};
+    var locallyVerifiedOrder = [];
+    var renderTimeoutMs = options.renderTimeoutMs || watchdogMs * 2;
     // Object URLs are owned by this cache so a repeated item (or a re-render triggered by a sync)
     // never re-reads the whole file from IndexedDB and never restarts the video element.
     var sourceCache = {};
@@ -2293,6 +2627,15 @@
       if (image && image.parentNode) {
         try { image.parentNode.removeChild(image); } catch (error) { noop(); }
       }
+    }
+    function elementRenderable(element) {
+      if (!element || !element.parentNode || element.parentNode !== stage) return false;
+      var style = element.style || {};
+      if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+      if (element.tagName && element.tagName.toLowerCase() === 'img'
+          && element.__signageDecoded !== true && element.complete === true && Number(element.naturalWidth) === 0) return false;
+      try { if (element.error) return false; } catch (error) { noop(); }
+      return true;
     }
 
     /* ---------------------------------------------------------------- source cache --------------*/
@@ -2355,7 +2698,6 @@
     /* ---------------------------------------------------------------- media elements ------------*/
 
     function createVideoElement() {
-      if (state.videoElement) return state.videoElement;
       var video = doc.createElement('video');
       video.className = 'sp-video';
       video.setAttribute('autoplay', 'autoplay');
@@ -2372,9 +2714,17 @@
       video.style.opacity = '1';
       video.style.filter = 'none';
       video.style.webkitFilter = 'none';
+      video.__signageSourceUrl = null;
       stage.appendChild(video);
-      state.videoElement = video;
+      state.videoElements.push(video);
       return video;
+    }
+    function videoForRender() {
+      for (var i = 0; i < state.videoElements.length; i += 1) {
+        if (state.videoElements[i] !== state.element) return state.videoElements[i];
+      }
+      if (state.videoElements.length < 2) return createVideoElement();
+      return state.videoElements[0] || createVideoElement();
     }
     function setVideoVisible(video, visible) {
       if (!video || !video.style) return;
@@ -2402,14 +2752,15 @@
       video.onerror = null;
       try { video.pause(); } catch (error) { noop(); }
       setVideoVisible(video, false);
-      if (state.videoSourceUrl) {
+      if (video.__signageSourceUrl || video === state.videoElement) {
         try { video.removeAttribute('src'); } catch (error) { noop(); }
-        state.videoSourceUrl = null;
+        video.__signageSourceUrl = null;
+        if (video === state.videoElement) state.videoSourceUrl = null;
         try { if (isFn(video.load)) video.load(); } catch (error) { noop(); }
       }
     }
     function removeElement() {
-      if (state.element === state.videoElement) clearVideoSource(state.videoElement);
+      if (state.element && state.element.tagName && state.element.tagName.toLowerCase() === 'video') clearVideoSource(state.element);
       else removeImage(state.element);
       state.element = null;
     }
@@ -2419,6 +2770,126 @@
       if (state.pendingImageUrl && !isCachedUrl(state.pendingImageUrl)) releaseObjectUrl(state.pendingImageUrl);
       state.pendingImage = null;
       state.pendingImageUrl = null;
+    }
+    function switchManifest(manifest, commit) {
+      if (!manifest || !hasPlayableContent(manifest)) return P.resolve(false);
+      if (state.pendingManifestSwitch) rollbackManifestSwitch('superseded');
+      var previous = {
+        manifest: state.manifest,
+        playlistId: state.playlistId,
+        index: state.index,
+        item: state.item,
+        mountedItem: state.mountedItem,
+        mountedPlaylistId: state.mountedPlaylistId,
+        mountedManifestHash: state.mountedManifestHash,
+        element: state.element,
+        source: state.source,
+        mounted: state.mounted,
+        mountedHash: state.mountedHash,
+        mountedKind: state.mountedKind,
+        videoElement: state.videoElement,
+        videoSourceUrl: state.videoSourceUrl,
+        objectUrl: state.objectUrl,
+        videoPosition: 0
+      };
+      try {
+        if (previous.element && previous.element.tagName && previous.element.tagName.toLowerCase() === 'video') {
+          previous.videoPosition = Number(previous.element.currentTime) || 0;
+        }
+      } catch (error) { previous.videoPosition = 0; }
+      var next = {
+        manifest: manifest,
+        commit: commit,
+        previous: previous,
+        commitStarted: false,
+        resolve: null,
+        startedAt: Date.now()
+      };
+      var result = new P(function (resolve) { next.resolve = resolve; });
+      state.pendingManifestSwitch = next;
+      state.manifest = manifest;
+      var preferred = scheduledPlaylistId(win, manifest, new Date());
+      var oldPlaylistExists = false;
+      var playlists = manifest.playlists || [];
+      for (var i = 0; i < playlists.length; i += 1) {
+        if (playlists[i] && playlists[i].id === previous.playlistId && playlists[i].enabled !== false && playlists[i].items.length) {
+          oldPlaylistExists = true;
+          break;
+        }
+      }
+      state.playlistId = preferred || (oldPlaylistExists ? previous.playlistId : manifest.defaultPlaylistId);
+      if (state.playlistId === previous.playlistId) state.index = previous.index;
+      else state.index = 0;
+      state.pendingMediaSince = Date.now();
+      render();
+      return result;
+    }
+    function commitPendingManifestSwitch(finalize) {
+      var pending = state.pendingManifestSwitch;
+      if (!pending) { finalize(); return; }
+      if (pending.commitStarted) return;
+      pending.commitStarted = true;
+      var committed;
+      try { committed = isFn(pending.commit) ? pending.commit(pending.manifest) : true; }
+      catch (error) { rollbackManifestSwitch('activation_failed'); return; }
+      P.resolve(committed).then(function (ok) {
+        if (ok === false) { rollbackManifestSwitch('activation_rejected'); return; }
+        if (state.pendingManifestSwitch !== pending) return;
+        state.pendingManifestSwitch = null;
+        state.pendingMediaSince = 0;
+        try { finalize(); } catch (error) { log('manifest_switch_finalize_failed', { code: errorCode(error) }); }
+        if (pending.resolve) pending.resolve(true);
+      }, function (error) {
+        log('manifest_switch_commit_failed', { code: errorCode(error) });
+        rollbackManifestSwitch('activation_failed');
+      });
+    }
+    function rollbackManifestSwitch(reason) {
+      var pending = state.pendingManifestSwitch;
+      if (!pending) return;
+      var previous = pending.previous;
+      state.pendingManifestSwitch = null;
+      state.pendingMediaSince = 0;
+      state.renderRequest += 1;
+      state.playbackGeneration += 1;
+      cancelPendingImage();
+      for (var i = 0; i < state.videoElements.length; i += 1) {
+        var candidateVideo = state.videoElements[i];
+        if (candidateVideo && candidateVideo !== previous.element) {
+          clearVideoSource(candidateVideo);
+          setVideoVisible(candidateVideo, false);
+        }
+      }
+      state.manifest = previous.manifest;
+      state.playlistId = previous.playlistId;
+      state.index = previous.index;
+      state.item = previous.item;
+      state.mountedItem = previous.mountedItem;
+      state.mountedPlaylistId = previous.mountedPlaylistId;
+      state.mountedManifestHash = previous.mountedManifestHash;
+      state.element = previous.element;
+      state.source = previous.source;
+      state.mounted = previous.mounted;
+      state.mountedHash = previous.mountedHash;
+      state.mountedKind = previous.mountedKind;
+      state.videoElement = previous.videoElement;
+      state.videoSourceUrl = previous.videoSourceUrl;
+      state.objectUrl = previous.objectUrl;
+      clearTimers();
+      if (previous.mounted && previous.item && previous.source) {
+        if (previous.mountedKind === 'video' && previous.videoPosition > 2) {
+          state.pendingSeek = { hash: previous.mountedHash, position: previous.videoPosition };
+        }
+        // Rebind old media handlers through the same double-buffered path; the previously decoded
+        // frame remains visible until that known-good item is ready again.
+        mount(previous.item, previous.source);
+      } else if (previous.manifest) {
+        state.manifest = previous.manifest;
+        render();
+      }
+      log('manifest_switch_rolled_back', { reason: reason || 'render_failed' });
+      if (pending.resolve) pending.resolve(false);
+      try { onState({ item: previous.item || null, source: previous.source && previous.source.kind, index: previous.index, playlistId: previous.playlistId }); } catch (error) { noop(); }
     }
     function objectUrl(blob) {
       var urlApi = win.URL || win.webkitURL;
@@ -2435,8 +2906,8 @@
       progressAt = now;
       try {
         onProgress({
-          manifestHash: (state.manifest && state.manifest.manifestHash) || null,
-          playlistId: state.playlistId,
+          manifestHash: state.mountedManifestHash || (state.manifest && state.manifest.manifestHash) || null,
+          playlistId: state.mountedPlaylistId || state.playlistId,
           index: state.index,
           hash: state.mountedHash || (state.item && state.item.hash) || null,
           kind: state.mountedKind || (state.item && state.item.kind) || null,
@@ -2466,9 +2937,10 @@
       }, watchdogMs);
     }
     function recoverMedia() {
-      var kind = state.item && state.item.kind ? state.item.kind : (state.mountedKind || 'media');
-      if (kind === 'video' && state.videoElement && state.element === state.videoElement) {
-        var video = state.videoElement;
+      var mountedItem = state.mountedItem;
+      var kind = mountedItem && mountedItem.kind ? mountedItem.kind : (state.item && state.item.kind ? state.item.kind : 'media');
+      if (kind === 'video' && state.element && state.element.tagName && state.element.tagName.toLowerCase() === 'video') {
+        var video = state.element;
         var position = 0;
         try { position = Number(video.currentTime) || 0; } catch (error) { position = 0; }
         if (position > 2 && state.mountedHash) state.pendingSeek = { hash: state.mountedHash, position: position };
@@ -2476,7 +2948,7 @@
         try { if (isFn(video.pause)) video.pause(); } catch (error) { noop(); }
         try {
           if (isFn(video.load)) video.load();
-          else if (state.source && state.source.url) { video.src = state.source.url; state.videoSourceUrl = state.source.url; }
+          else if (state.source && state.source.url) { video.src = state.source.url; video.__signageSourceUrl = state.source.url; state.videoSourceUrl = state.source.url; }
         } catch (error) { noop(); }
         armStall(kind);
         tryPlay(video, state.playbackGeneration);
@@ -2502,7 +2974,15 @@
       }, function () { state.stallAttempts = 0; advance(); });
     }
     function handleStall(reason) {
-      var kind = state.item && state.item.kind ? state.item.kind : null;
+      if (state.pendingManifestSwitch && !state.pendingManifestSwitch.commitStarted) {
+        if (Date.now() - state.pendingManifestSwitch.startedAt >= renderTimeoutMs) {
+          rollbackManifestSwitch('candidate_render_timeout');
+          return;
+        }
+        armStall(reason || 'candidate_render_pending', true);
+        return;
+      }
+      var kind = state.mountedItem && state.mountedItem.kind ? state.mountedItem.kind : (state.item && state.item.kind ? state.item.kind : null);
       if (kind && state.stallAttempts < 2) {
         state.stallAttempts += 1;
         log('stall_recovery', { reason: reason, attempt: state.stallAttempts, kind: kind, hash: safeString(state.mountedHash, 12) });
@@ -2591,7 +3071,7 @@
     function resumeVideo(video, generation, reason) {
       if (!video || generation !== state.playbackGeneration || state.suppressMediaEvents) return;
       if (video.ended) {
-        if (state.item && state.item.loop) {
+        if (state.mountedItem && state.mountedItem.loop) {
           try { video.currentTime = 0; } catch (error) { noop(); }
           tryPlay(video, generation);
         } else advance();
@@ -2621,15 +3101,22 @@
     function activateVideo(item, source, video, generation) {
       if (generation !== state.playbackGeneration) return;
       if (state.element && state.element !== video) {
-        if (state.element === state.videoElement) clearVideoSource(state.videoElement);
+        if (state.element.tagName && state.element.tagName.toLowerCase() === 'video') clearVideoSource(state.element);
         else removeImage(state.element);
       }
       state.element = video;
+      state.videoElement = video;
+      state.videoSourceUrl = video.__signageSourceUrl || source.url;
       state.source = source;
       state.objectUrl = source.objectUrl || null;
       state.mounted = true;
+      state.mountedItem = item;
+      state.mountedPlaylistId = state.playlistId;
+      state.mountedManifestHash = state.manifest && state.manifest.manifestHash;
       state.mountedHash = item.hash;
       state.mountedKind = item.kind;
+      state.pendingMediaSince = 0;
+      state.lastVideoProgressAt = Date.now();
       state.stallAttempts = 0;
       state.emptyStreak = 0;
       if (source.kind === 'local') state.hasLocalMedia = true;
@@ -2642,7 +3129,8 @@
     function mount(item, source) {
       clearTimers();
       cancelPendingImage();
-      state.mounted = false;
+      state.pendingMediaSince = Date.now();
+      if (state.pendingManifestSwitch) state.pendingManifestSwitch.startedAt = state.pendingMediaSince;
       var generation = state.playbackGeneration + 1;
       state.playbackGeneration = generation;
       state.pauseRecoveryAt = 0;
@@ -2662,37 +3150,45 @@
       img.style.filter = 'none';
       img.style.webkitFilter = 'none';
       img.onload = function () {
+        // The load event is the browser's confirmation that this image has decoded successfully.
+        img.__signageDecoded = true;
         if (generation !== state.playbackGeneration || state.pendingImage !== img) {
           removeImage(img);
           discardSource(source);
           return;
         }
-        if (state.element && state.element !== img) {
-          if (state.element === state.videoElement) clearVideoSource(state.videoElement);
-          else removeImage(state.element);
-        }
-        img.style.display = 'block';
-        img.style.visibility = 'visible';
-        state.element = img;
-        state.pendingImage = null;
-        state.pendingImageUrl = null;
-        state.source = source;
-        state.objectUrl = source.objectUrl || null;
-        state.mounted = true;
-        state.mountedHash = item.hash;
-        state.mountedKind = item.kind;
-        state.stallAttempts = 0;
-        state.emptyStreak = 0;
-        if (source.kind === 'local') state.hasLocalMedia = true;
-        if (stallTimer) { win.clearTimeout(stallTimer); stallTimer = null; }
-        var duration = Number(item.durationMs);
-        if (!isFinite(duration) || duration < 1000) duration = imageDurationDefaultMs;
-        if (duration > 86400000) duration = 86400000;
-        if (imageTimer) win.clearTimeout(imageTimer);
-        imageTimer = win.setTimeout(function () { imageTimer = null; advance(); }, duration);
-        onItem(item, source);
-        onState({ item: item, source: source.kind, index: state.index, playlistId: state.playlistId });
-        reportProgress(0);
+        commitPendingManifestSwitch(function () {
+          if (state.element && state.element !== img) {
+            if (state.element.tagName && state.element.tagName.toLowerCase() === 'video') clearVideoSource(state.element);
+            else removeImage(state.element);
+          }
+          img.style.display = 'block';
+          img.style.visibility = 'visible';
+          state.element = img;
+          state.pendingImage = null;
+          state.pendingImageUrl = null;
+          state.source = source;
+          state.objectUrl = source.objectUrl || null;
+          state.mounted = true;
+          state.mountedItem = item;
+          state.mountedPlaylistId = state.playlistId;
+          state.mountedManifestHash = state.manifest && state.manifest.manifestHash;
+          state.mountedHash = item.hash;
+          state.mountedKind = item.kind;
+          state.pendingMediaSince = 0;
+          state.stallAttempts = 0;
+          state.emptyStreak = 0;
+          if (source.kind === 'local') state.hasLocalMedia = true;
+          if (stallTimer) { win.clearTimeout(stallTimer); stallTimer = null; }
+          var duration = Number(item.durationMs);
+          if (!isFinite(duration) || duration < 1000) duration = imageDurationDefaultMs;
+          if (duration > 86400000) duration = 86400000;
+          if (imageTimer) win.clearTimeout(imageTimer);
+          imageTimer = win.setTimeout(function () { imageTimer = null; advance(); }, duration);
+          onItem(item, source);
+          onState({ item: item, source: source.kind, index: state.index, playlistId: state.playlistId });
+          reportProgress(0);
+        });
       };
       img.onerror = function () { handleMediaFailure(item, source, 'image', img, generation); };
       state.pendingImage = img;
@@ -2703,7 +3199,7 @@
     }
 
     function renderVideo(item, source, generation) {
-      var video = createVideoElement();
+      var video = videoForRender();
       if (state.element !== video) setVideoVisible(video, false);
       video.setAttribute('autoplay', 'autoplay');
       video.setAttribute('playsinline', 'playsinline');
@@ -2718,10 +3214,12 @@
       else video.removeAttribute('loop');
       video.oncanplay = function () {
         if (generation !== state.playbackGeneration) return;
-        applyPendingSeek(video, item);
-        activateVideo(item, source, video, generation);
-        armStall('video');
-        tryPlay(video, generation);
+        commitPendingManifestSwitch(function () {
+          applyPendingSeek(video, item);
+          activateVideo(item, source, video, generation);
+          armStall('video');
+          tryPlay(video, generation);
+        });
       };
       video.oncanplaythrough = function () {
         if (generation !== state.playbackGeneration) return;
@@ -2729,9 +3227,11 @@
       };
       video.onplaying = function () {
         if (generation !== state.playbackGeneration) return;
-        activateVideo(item, source, video, generation);
-        if (!video.muted) { state.audioBlocked = false; onAudioReady(); }
-        armStall('video');
+        commitPendingManifestSwitch(function () {
+          activateVideo(item, source, video, generation);
+          if (!video.muted) { state.audioBlocked = false; onAudioReady(); }
+          armStall('video');
+        });
       };
       video.onplay = function () { if (generation === state.playbackGeneration) armStall('video'); };
       video.onpause = function () {
@@ -2749,6 +3249,7 @@
         try { position = (Number(video.currentTime) || 0) * 1000; } catch (error) { position = 0; }
         if (state.lastVideoPosition === null || position !== state.lastVideoPosition) {
           state.lastVideoPosition = position;
+          state.lastVideoProgressAt = Date.now();
           armStall('video');
         } else armStall('video_timeupdate', true);
         reportProgress(position);
@@ -2762,11 +3263,12 @@
         advance();
       };
       video.onerror = function () { handleMediaFailure(item, source, 'video', video, generation); };
-      if (state.videoSourceUrl !== source.url) {
+      if (video.__signageSourceUrl !== source.url) {
         suppressProgrammaticMediaEvents();
         try { video.pause(); } catch (error) { noop(); }
         video.src = source.url;
-        state.videoSourceUrl = source.url;
+        video.__signageSourceUrl = source.url;
+        if (video === state.videoElement) state.videoSourceUrl = source.url;
         try { if (isFn(video.load)) video.load(); } catch (error) { noop(); }
       }
       armStall('video');
@@ -2776,21 +3278,39 @@
     function handleMediaFailure(item, source, kind, failedElement, generation) {
       if (generation !== state.playbackGeneration) return;
       log('media_error', { hash: safeString(item.hash, 12), kind: kind, source: source && source.kind });
+      if (state.pendingManifestSwitch && !state.pendingManifestSwitch.commitStarted && failedElement !== state.element) {
+        rollbackManifestSwitch('candidate_media_error');
+        return;
+      }
       if (failedElement && failedElement !== state.element) {
         if (failedElement === state.pendingImage) {
           removeImage(failedElement);
           state.pendingImage = null;
           state.pendingImageUrl = null;
+        } else if (failedElement.tagName && failedElement.tagName.toLowerCase() === 'video') {
+          clearVideoSource(failedElement);
         }
-      } else if (failedElement === state.videoElement) {
-        // Keep the last decoded frame visible while the engine advances to another cached item.
+        state.pendingMediaSince = 0;
+        if (state.mounted && elementRenderable(state.element)) {
+          state.item = state.mountedItem;
+          clearTimers();
+          notice(kind === 'video' ? 'تعذر تجهيز الفيديو التالي؛ يستمر العرض الحالي.' : 'تعذر تجهيز الصورة التالية؛ يستمر العرض الحالي.');
+          advanceLater(source && source.kind === 'local' ? 60000 : 0);
+          return;
+        }
+      } else if (failedElement && failedElement.tagName && failedElement.tagName.toLowerCase() === 'video') {
+        // Keep a decoded frame visible while recovering a failing active video element.
         state.element = failedElement;
       } else if (failedElement) {
         removeImage(failedElement);
         state.element = null;
       }
       clearTimers();
+      state.pendingMediaSince = 0;
       state.mounted = false;
+      state.mountedItem = null;
+      state.mountedPlaylistId = null;
+      state.mountedManifestHash = null;
       state.mountedHash = null;
       state.mountedKind = null;
       state.source = null;
@@ -2805,14 +3325,47 @@
       advanceLater(source && source.kind === 'local' ? 60000 : 0);
     }
 
+    function verifyLocalAsset(item) {
+      if (locallyVerified[item.hash]) return P.resolve(true);
+      var digest;
+      try { digest = createHasher(win, shaModule); } catch (error) { return P.reject(error); }
+      return storage.getAssetParts(item.hash).then(function (parts) {
+        var total = 0;
+        function next(index) {
+          if (index >= parts.length) {
+            if (total !== Number(item.size) || digest.digestHex() !== String(item.hash)) {
+              throw PlayerError('تعذر التحقق من سلامة الوسيط المحفوظ.', 'local_asset_integrity');
+            }
+            locallyVerified[item.hash] = true;
+            locallyVerifiedOrder.push(item.hash);
+            while (locallyVerifiedOrder.length > 2048) delete locallyVerified[locallyVerifiedOrder.shift()];
+            return P.resolve(true);
+          }
+          var part = parts[index];
+          if (!part || part.index !== index || !part.bytes || part.size !== part.bytes.length) {
+            throw PlayerError('أجزاء الوسيط المحلي ناقصة أو تالفة.', 'local_asset_integrity');
+          }
+          digest.update(toUint8(part.bytes));
+          total += part.size;
+          return new P(function (resolve) { win.setTimeout(function () { resolve(next(index + 1)); }, 0); });
+        }
+        return next(0);
+      });
+    }
+
     function resolveLocalSource(item) {
       var cached = cachedSource(item.hash);
       if (cached) return P.resolve(cached);
       return storage.getAssetBlob(item.hash).then(function (blob) {
         if (!blob) return null;
-        var url = objectUrl(blob);
-        if (!url) return null;
-        return cacheSource(item.hash, { kind: 'local', url: url, objectUrl: url, mimeType: item.mimeType });
+        return verifyLocalAsset(item).then(function () {
+          var url = objectUrl(blob);
+          if (!url) return null;
+          return cacheSource(item.hash, { kind: 'local', url: url, objectUrl: url, mimeType: item.mimeType });
+        }, function (error) {
+          log('local_asset_integrity_failed', { hash: safeString(item.hash, 12), code: errorCode(error) });
+          return P.resolve(storage.clearAsset(item.hash)).then(function () { return null; }, function () { return null; });
+        });
       }, function () { return null; });
     }
 
@@ -2822,7 +3375,7 @@
       if (Number(item.size) > limit) return P.resolve(null);
       return http.request({
         method: 'GET', url: sync.sameOriginUrl(item.mediaId), responseType: 'arraybuffer', timeoutMs: 180000,
-        headers: { Authorization: options.token ? 'Bearer ' + options.token : null }
+        headers: { Authorization: token ? 'Bearer ' + token : null }
       }).then(function (response) {
         if (!response.ok || !response.bytes || !isFn(win.Blob)) return null;
         var blob = new win.Blob([response.bytes], { type: item.mimeType || 'application/octet-stream' });
@@ -2874,8 +3427,12 @@
       state.objectUrl = null;
       clearTimers();
       state.mounted = false;
+      state.mountedItem = null;
+      state.mountedPlaylistId = null;
+      state.mountedManifestHash = null;
       state.mountedHash = null;
       state.mountedKind = null;
+      state.pendingMediaSince = 0;
       state.item = null;
       state.source = null;
       state.stallAttempts = 0;
@@ -2898,12 +3455,25 @@
       var item = current.item;
       state.index = current.index;
       state.item = item;
-      // The item that is already on screen stays untouched: a background sync or a repeated item
-      // must never restart, reload or re-decode the media that is currently playing.
-      if (state.mounted && state.mountedHash === item.hash && state.mountedKind === item.kind) {
+      // A prepared candidate containing the exact frame already on screen can commit without
+      // touching the media element or resetting its dwell/playback position.
+      if (state.mounted && state.mountedHash === item.hash && state.mountedKind === item.kind && elementRenderable(state.element)) {
         state.emptyStreak = 0;
-        onState({ item: item, source: state.source ? state.source.kind : null, index: state.index, playlistId: state.playlistId });
+        commitPendingManifestSwitch(function () {
+          state.mountedItem = item;
+          state.mountedPlaylistId = state.playlistId;
+          state.mountedManifestHash = state.manifest && state.manifest.manifestHash;
+          onState({ item: item, source: state.source ? state.source.kind : null, index: state.index, playlistId: state.playlistId });
+        });
         return;
+      }
+      if (state.mounted && !elementRenderable(state.element)) {
+        state.mounted = false;
+        state.mountedItem = null;
+        state.mountedPlaylistId = null;
+        state.mountedManifestHash = null;
+        state.mountedHash = null;
+        state.mountedKind = null;
       }
       var cached = cachedSource(item.hash);
       if (cached) { mount(item, cached); return; }
@@ -2940,6 +3510,26 @@
       }
     }
 
+    function displayStatus() {
+      var element = state.element;
+      if (state.mounted && elementRenderable(element)) {
+        if (state.mountedKind === 'video' && element && element.tagName && element.tagName.toLowerCase() === 'video') {
+          if (element.ended && !(state.mountedItem && state.mountedItem.loop)) return { healthy: false, reason: 'video_ended', pending: false };
+          var position = Number(element.currentTime) || 0;
+          if (state.lastVideoPosition === null || position !== state.lastVideoPosition) {
+            state.lastVideoPosition = position;
+            state.lastVideoProgressAt = Date.now();
+          }
+          if (Date.now() - (state.lastVideoProgressAt || Date.now()) > Math.max(renderTimeoutMs, watchdogMs * 3)) {
+            return { healthy: false, reason: 'video_frozen', pending: false };
+          }
+        }
+        return { healthy: true, reason: null, pending: Boolean(state.pendingManifestSwitch) };
+      }
+      var pending = Boolean(state.pendingImage || (state.pendingMediaSince && Date.now() - state.pendingMediaSince <= renderTimeoutMs));
+      return { healthy: pending, reason: pending ? null : 'empty_or_hidden_stage', pending: pending };
+    }
+
     function enableAudio() {
       var video = state.videoElement;
       if (!video) return P.resolve(false);
@@ -2973,7 +3563,15 @@
     }
 
     return {
+      setNetwork: function (nextSync, nextHttp, nextToken) {
+        sync = nextSync || null;
+        http = nextHttp || null;
+        token = nextToken || null;
+        return true;
+      },
+      switchManifest: switchManifest,
       setManifest: function (manifest) {
+        if (state.pendingManifestSwitch) rollbackManifestSwitch('manifest_reset');
         state.manifest = manifest;
         applyResume(manifest);
         if (!state.playlistId) state.playlistId = scheduledPlaylistId(win, manifest, new Date());
@@ -2988,24 +3586,31 @@
         }
         return state;
       },
-      playlistId: function () { return state.playlistId; },
+      playlistId: function () { return state.mountedPlaylistId || state.playlistId; },
       index: function () { return state.index; },
-      currentItem: function () { return state.item; },
+      currentItem: function () { return state.mountedItem || state.item; },
       currentSource: function () { return state.source; },
       currentPositionMs: function () {
         var element = state.element;
         if (!element || state.mountedKind !== 'video') return 0;
         try { return Math.max(0, Math.round((Number(element.currentTime) || 0) * 1000)); } catch (error) { return 0; }
       },
-      isMounted: function () { return state.mounted; },
-      isPending: function () { return Boolean(state.pendingImage); },
+      isMounted: function () { return state.mounted && elementRenderable(state.element); },
+      isPending: function () { return Boolean(state.pendingImage || (state.pendingMediaSince && Date.now() - state.pendingMediaSince <= renderTimeoutMs)); },
+      displayStatus: displayStatus,
       hasLocalMedia: function () { return state.hasLocalMedia || sourceOrder.length > 0; },
       ensurePlaying: function () {
         if (state.element === state.videoElement && state.mounted && state.videoElement && state.videoElement.paused && !state.videoElement.ended) {
           resumeVideo(state.videoElement, state.playbackGeneration, 'watchdog');
           return true;
         }
-        if (!state.mounted && !state.pendingImage) { render(); return false; }
+        var health = displayStatus();
+        if (!health.healthy) {
+          if (state.mountedKind === 'video') handleStall(health.reason || 'watchdog_display_health');
+          else render();
+          return false;
+        }
+        if (!state.mounted && !state.pendingImage && !state.pendingMediaSince) { render(); return false; }
         return true;
       },
       recover: function (reason) {
@@ -3031,6 +3636,7 @@
       advance: advance,
       render: render,
       stop: function () {
+        if (state.pendingManifestSwitch) rollbackManifestSwitch('engine_stopped');
         state.renderRequest += 1;
         state.playbackGeneration += 1;
         clearTimers();
@@ -3038,16 +3644,23 @@
         removeElement();
         forgetAllSources();
         state.objectUrl = null;
-        if (state.videoElement && state.videoElement.parentNode) {
-          try { state.videoElement.parentNode.removeChild(state.videoElement); } catch (error) { noop(); }
+        for (var i = 0; i < state.videoElements.length; i += 1) {
+          var video = state.videoElements[i];
+          clearVideoSource(video);
+          if (video && video.parentNode) { try { video.parentNode.removeChild(video); } catch (error) { noop(); } }
         }
+        state.videoElements = [];
         state.videoElement = null;
         state.videoSourceUrl = null;
         state.item = null;
+        state.mountedItem = null;
+        state.mountedPlaylistId = null;
+        state.mountedManifestHash = null;
         state.source = null;
         state.mounted = false;
         state.mountedHash = null;
         state.mountedKind = null;
+        state.pendingMediaSince = 0;
       }
     };
   }
@@ -3105,7 +3718,8 @@
   function collectDiagnostics(win, info) {
     var caps = detectCapabilities(win);
     var lines = [];
-    lines.push('الرابط: ' + safeString(win.location && win.location.href, 200));
+    // Query strings can contain operator-supplied values; diagnostics need only the local path.
+    lines.push('المسار: ' + safeString(win.location && win.location.pathname || '/', 120));
     lines.push('المتصفح: ' + (caps.userAgent || 'غير معروف'));
     lines.push('Chromium: ' + (caps.chromium === null ? 'غير معروف' : caps.chromium));
     lines.push('webOS: ' + (caps.webos.detected ? (caps.webos.version || 'مكتشف بدون رقم') : 'غير مكتشف'));
@@ -3132,6 +3746,19 @@
     createStorage: createStorage,
     createHttp: createHttp,
     createSync: createSync,
+    preflightAsset: preflightAsset,
+    validateManifest: function (manifest, sha) { return isManifest(manifest) && verifyManifestHash(manifest, sha); },
+    verifyManifestIntegrity: function (manifest, sha) { return isManifest(manifest) && verifyManifestHash(manifest, sha); },
+    verifyAssetIntegrity: function (bytes, asset, sha) {
+      try {
+        if (!asset || typeof asset.hash !== 'string' || !finiteInteger(Number(asset.size), 1, 2147483648)) return false;
+        var data = toUint8(bytes);
+        if (data.length !== Number(asset.size)) return false;
+        var digest = createHasher(root, sha);
+        digest.update(data);
+        return digest.digestHex() === asset.hash;
+      } catch (error) { return false; }
+    },
     createEngine: createEngine,
     resolveSha: resolveSha,
     createHasher: createHasher,
