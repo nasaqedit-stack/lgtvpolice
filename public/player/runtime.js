@@ -1782,21 +1782,33 @@
     var FATAL_CODES = {
       screen_unauthorized: true, screen_disabled: true, download_rejected: true,
       range_size_mismatch: true, range_rejected: true, file_too_large_for_browser: true,
-      invalid_manifest: true, hash_mismatch: true, size_mismatch: true
+      invalid_manifest: true, hash_mismatch: true, size_mismatch: true, storage_quota: true
     };
     function transientError(error) {
       var code = errorCode(error);
       return !hasOwn(FATAL_CODES, code);
     }
 
-    function saveWhole(asset, bytes) {
+    function isQuotaError(error) {
+      var name = safeString(error && error.name, 80).toLowerCase();
+      var code = Number(error && error.code);
+      var text = safeString(error && error.message, 160).toLowerCase();
+      return errorCode(error) === 'storage_quota' || name === 'quotaexceedederror' || name === 'ns_error_dom_quota_reached' ||
+        code === 22 || code === 1014 || /quota|storage.{0,12}full|disk.{0,12}full/.test(text);
+    }
+
+    function storageQuotaError() {
+      return PlayerError('المساحة المحلية غير كافية. استمر تشغيل القائمة الحالية وستُعاد محاولة التحديث لاحقاً.', 'storage_quota');
+    }
+
+    function saveWhole(asset, bytes, persistChunk) {
       if (bytes.length > MAX_FULL_BUFFER_BYTES) {
         throw PlayerError('حجم الملف كبير على متصفح التلفاز ولا يدعم الخادم تنزيل النطاقات.', 'file_too_large_for_browser');
       }
       function next(position, index) {
         if (position >= bytes.length) return P.resolve(bytes.length);
         var part = sliceBytes(bytes, position, Math.min(position + chunkSize, bytes.length));
-        return storage.saveChunk(asset.hash, index, part, {
+        return persistChunk(asset, index, part, {
           expectedSize: asset.size, mimeType: asset.mimeType, chunkSize: chunkSize
         }).then(function () {
           if (index % 8 === 7) {
@@ -1808,7 +1820,7 @@
       return next(0, 0);
     }
 
-    function downloadAsset(asset, onBytes) {
+    function downloadAsset(asset, onBytes, persistChunk) {
       var chunkCount = Math.ceil(asset.size / chunkSize);
       return storage.getPartialInfo(asset.hash).then(function (info) {
         if (info && !info.cleared && (Number(info.expectedSize) !== asset.size || info.mimeType !== asset.mimeType || Number(info.chunkSize) !== chunkSize)) {
@@ -1873,7 +1885,7 @@
                 var expected = end - offset + 1;
                 if (bytes.length > expected) bytes = sliceBytes(bytes, 0, expected);
                 if (bytes.length !== expected) throw PlayerError('حجم جزء التنزيل غير مطابق.', 'range_size_mismatch');
-                return storage.saveChunk(asset.hash, index, bytes, {
+                return persistChunk(asset, index, bytes, {
                   expectedSize: asset.size, mimeType: asset.mimeType, chunkSize: chunkSize
                 }).then(function () {
                   offset += bytes.length;
@@ -1894,7 +1906,7 @@
               if (response.status === 200) {
                 var whole = response.bytes ? toUint8(response.bytes) : new Uint8Array(0);
                 if (whole.length !== asset.size) throw PlayerError('حجم الملف الذي تم تنزيله غير مكتمل.', 'size_mismatch');
-                return saveWhole(asset, whole).then(function (count) {
+                return saveWhole(asset, whole, persistChunk).then(function (count) {
                   onBytes(count);
                   offset = asset.size;
                   index = chunkCount;
@@ -1965,6 +1977,32 @@
     function run() {
       progress('manifest', 'التحقق من تحديثات المحتوى…');
       var previous = null;
+      var incomingHashes = [];
+      var quotaRecoveryTried = false;
+
+      function writeWithQuotaRecovery(writeOperation) {
+        function write() {
+          try { return P.resolve(writeOperation()); }
+          catch (error) { return P.reject(error); }
+        }
+        return write()['catch'](function (error) {
+          if (!isQuotaError(error)) throw error;
+          if (quotaRecoveryTried) throw storageQuotaError();
+          quotaRecoveryTried = true;
+          log('storage_quota_gc_attempt', { backend: storage.backend || 'unknown' });
+          return storage.deleteUnreferenced(protection(previous, incomingHashes)).then(function () {
+            return write()['catch'](function (retryError) {
+              if (isQuotaError(retryError)) throw storageQuotaError();
+              throw retryError;
+            });
+          }, function () { throw storageQuotaError(); });
+        });
+      }
+
+      function persistChunk(asset, index, bytes, meta) {
+        return writeWithQuotaRecovery(function () { return storage.saveChunk(asset.hash, index, bytes, meta); });
+      }
+
       return storage.getActiveManifest().then(function (saved) {
         previous = saved;
         var headers = {};
@@ -2011,6 +2049,7 @@
         var assets = uniqueAssets(incoming);
         var targets = [];
         for (var i = 0; i < assets.length; i += 1) targets.push(assets[i].hash);
+        incomingHashes = targets.slice(0);
         return storage.deleteUnreferenced(protection(previous, targets)).then(function () {
           progress('checking', 'فحص التخزين المحلي والوسائط المطلوبة…');
           var pending = [];
@@ -2058,12 +2097,14 @@
                     progress('downloading', 'تنزيل الوسائط إلى التخزين المحلي…', {
                       totalBytes: totalBytes, downloadedBytes: completed, currentName: asset.name
                     });
-                  }).then(function () {
+                  }, persistChunk).then(function () {
                     progress('verifying', 'التحقق من بصمة الملف…', {
                       totalBytes: totalBytes, downloadedBytes: completed, currentName: asset.name
                     });
                     return verifyAsset(asset).then(function () {
-                      return storage.finalizeAsset(asset.hash, asset.size, asset.mimeType, Math.ceil(asset.size / chunkSize), chunkSize);
+                      return writeWithQuotaRecovery(function () {
+                        return storage.finalizeAsset(asset.hash, asset.size, asset.mimeType, Math.ceil(asset.size / chunkSize), chunkSize);
+                      });
                     }, function (error) {
                       return storage.clearAsset(asset.hash).then(function () { throw error; });
                     });
@@ -2081,7 +2122,7 @@
                   }
                   return verifyAll(0).then(function (missing) {
                     if (missing.length) throw PlayerError('لم تكتمل مزامنة كل الوسائط. تبقى قائمة التشغيل السابقة نشطة.', 'partial_sync');
-                    return storage.activateManifest(incoming).then(function () {
+                    return writeWithQuotaRecovery(function () { return storage.activateManifest(incoming); }).then(function () {
                       var at = nowIso();
                       return storage.setLastSyncAt(at).then(function () {
                         // `activeHashes()` still reports the manifest the engine is showing: media

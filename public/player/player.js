@@ -176,6 +176,8 @@
     var WATCHDOG_INTERVAL_MS = 15000;
     var recoveryBlockedUntil = 0;
     var reloadInFlight = false;
+    var watchdogRecoveryFailures = 0;
+    var watchdogReloadTimer = null;
     var syncFailures = 0;
     var syncBackoffMs = 0;
     var lastSyncAttemptAt = 0;
@@ -778,7 +780,12 @@
         if (!engine || !state.manifest) return;
         if (!hasPlayableContent()) { state.emptyTicks = 0; return; }
         if (isFn(engine.ensurePlaying)) engine.ensurePlaying();
-        if (engineStageVisible()) { state.emptyTicks = 0; return; }
+        if (engineStageVisible()) {
+          state.emptyTicks = 0;
+          watchdogRecoveryFailures = 0;
+          if (watchdogReloadTimer) { win.clearTimeout(watchdogReloadTimer); watchdogReloadTimer = null; }
+          return;
+        }
         state.emptyTicks += 1;
         record('watchdog_empty_stage', { ticks: state.emptyTicks, offline: !state.online });
         if (state.emptyTicks === 2) {
@@ -787,11 +794,26 @@
           paint();
           try { engine.render(); } catch (error) { record('watchdog_render_failed', { message: runtime.message(error, 'unknown') }); }
         } else if (state.emptyTicks >= 4 && isFn(engine.hasLocalMedia) && engine.hasLocalMedia()) {
-          // Local media is available: ask the engine to reinitialize/advance locally, never reload
-          // the document underneath a cached playlist.
+          // Local media is available: repeatedly try in-place recovery first. Only after three
+          // unsuccessful local cycles do we reinitialize from cache and arm one final page reload.
           state.emptyTicks = 0;
-          if (isFn(engine.recover)) engine.recover('watchdog_empty_stage');
-          else engine.render();
+          watchdogRecoveryFailures += 1;
+          if (watchdogRecoveryFailures < 3) {
+            if (isFn(engine.recover)) engine.recover('watchdog_empty_stage');
+            else engine.render();
+          } else {
+            record('watchdog_runtime_reinitialize', { failures: watchdogRecoveryFailures });
+            heartbeat(true);
+            try { engine.render(); } catch (renderError) { record('watchdog_runtime_reinitialize_failed', { message: runtime.message(renderError, 'unknown') }); }
+            if (!watchdogReloadTimer) {
+              watchdogReloadTimer = win.setTimeout(function () {
+                watchdogReloadTimer = null;
+                if (engineStageVisible()) { watchdogRecoveryFailures = 0; return; }
+                record('watchdog_page_reload_final', { failures: watchdogRecoveryFailures });
+                reloadNow('watchdog_runtime_unrecoverable');
+              }, 5000);
+            }
+          }
         }
       } catch (error) {
         record('watchdog_failed', { message: runtime.message(error, 'unknown') });

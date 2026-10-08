@@ -255,6 +255,33 @@ describe('cached playback never depends on the network', () => {
     expect(player.log().some((entry: any) => entry.event === 'reload')).toBe(false);
   });
 
+  it('arms one bounded page reload only after repeated local watchdog recovery failures', async () => {
+    const fixture = buildFixture();
+    const factory = new IDBFactory();
+    const seeded = page({ indexedDb: factory });
+    await seedCache(seeded, fixture);
+    seeded.dom.window.close();
+    const target = page({ indexedDb: factory, transport: deadNetwork });
+    const player = await boot(target);
+    const engine = player.engine();
+    engine.isMounted = () => false;
+    engine.isPending = () => false;
+    engine.hasLocalMedia = () => true;
+    engine.ensurePlaying = () => true;
+    engine.render = () => true;
+    engine.recover = () => true;
+
+    for (let tick = 0; tick < 12; tick += 1) {
+      target.clock.advance(15000);
+      await settle(target.win, target.clock, 2);
+    }
+    expect(player.log().some((entry: any) => entry.event === 'reload')).toBe(false);
+    target.clock.advance(5000);
+    await settle(target.win, target.clock, 20);
+    expect(player.log().filter((entry: any) => entry.event === 'reload')).toHaveLength(1);
+    expect(player.log().some((entry: any) => entry.event === 'watchdog_page_reload_final')).toBe(true);
+  });
+
   it('keeps showing cached media when the credential is revoked (no pairing takeover)', async () => {
     const fixture = buildFixture();
     const plan = createTransport(fixture, { heartbeatStatus: 401 });
@@ -473,6 +500,89 @@ describe('atomic playlist activation', () => {
     await runToCompletion(target, sync2.run());
     expect(await storage.hasCompleteAsset(fixture.imageHash, fixture.imageBytes.length, 'image/png')).toBe(false);
     expect(await storage.hasCompleteAsset(next.imageHash, next.imageBytes.length, 'image/png')).toBe(true);
+  });
+
+  it('recovers one QuotaExceededError by collecting only stale media and preserves active/pending content and identity', async () => {
+    const current = buildFixture();
+    const factory = new IDBFactory();
+    const seeded = page({ indexedDb: factory });
+    await seedCache(seeded, current, 'existing-screen-identity');
+    seeded.dom.window.close();
+
+    const next = buildFixture({ imageBytes: 'next revision media bytes' });
+    next.manifest.manifestHash = 'e'.repeat(64);
+    const stale = buildFixture({ imageBytes: 'unreferenced old cache bytes' });
+    const plan = createTransport(next);
+    const target = page({ indexedDb: factory, transport: plan.transport });
+    const storage = await openStorage(target);
+    const originalSave = storage.saveChunk.bind(storage);
+    let failedOnce = false;
+    let pendingImageWriteAttempts = 0;
+    storage.saveChunk = (hash: string, index: number, bytes: Uint8Array, meta: any) => {
+      if (hash === next.imageHash && index === 0) {
+        pendingImageWriteAttempts += 1;
+        if (!failedOnce) {
+          failedOnce = true;
+          return originalSave(stale.imageHash, 0, stale.imageBytes, {
+            expectedSize: stale.imageBytes.length, mimeType: 'image/png', chunkSize: 4 * 1024 * 1024
+          }).then(() => storage.finalizeAsset(stale.imageHash, stale.imageBytes.length, 'image/png', 1, 4 * 1024 * 1024))
+            .then(() => {
+              const error: any = new Error('storage quota exceeded');
+              error.name = 'QuotaExceededError';
+              throw error;
+            });
+        }
+      }
+      return originalSave(hash, index, bytes, meta);
+    };
+    const http = target.runtime.createHttp(target.win, { Promise: target.win.Promise, transport: plan.transport });
+    const sync = target.runtime.createSync({
+      win: target.win, storage, http, token: 'existing-screen-identity', Promise: target.win.Promise,
+      protectHashes: () => [current.imageHash]
+    });
+
+    await runToCompletion(target, sync.run());
+    expect(pendingImageWriteAttempts).toBe(2);
+    expect(await storage.hasCompleteAsset(stale.imageHash, stale.imageBytes.length, 'image/png')).toBe(false);
+    expect(await storage.hasCompleteAsset(current.imageHash, current.imageBytes.length, 'image/png')).toBe(true);
+    expect(await storage.hasCompleteAsset(next.imageHash, next.imageBytes.length, 'image/png')).toBe(true);
+    expect((await storage.getActiveManifest()).manifestHash).toBe(next.manifest.manifestHash);
+    expect(await storage.getCredential()).toBe('existing-screen-identity');
+  });
+
+  it('keeps the current manifest and credential when quota remains exhausted after one safe cleanup retry', async () => {
+    const current = buildFixture();
+    const factory = new IDBFactory();
+    const seeded = page({ indexedDb: factory });
+    await seedCache(seeded, current, 'existing-screen-identity');
+    seeded.dom.window.close();
+
+    const next = buildFixture({ imageBytes: 'media that cannot fit in storage' });
+    next.manifest.manifestHash = 'f'.repeat(64);
+    const plan = createTransport(next);
+    const target = page({ indexedDb: factory, transport: plan.transport });
+    const storage = await openStorage(target);
+    let writeAttempts = 0;
+    const quotaFailure = () => {
+      const error: any = new Error('quota exceeded');
+      error.name = 'QuotaExceededError';
+      return target.win.Promise.reject(error);
+    };
+    storage.saveChunk = (hash: string, index: number) => {
+      if (hash === next.imageHash && index === 0) { writeAttempts += 1; return quotaFailure(); }
+      return target.win.Promise.reject(new Error('unexpected media write'));
+    };
+    const http = target.runtime.createHttp(target.win, { Promise: target.win.Promise, transport: plan.transport });
+    const sync = target.runtime.createSync({
+      win: target.win, storage, http, token: 'existing-screen-identity', Promise: target.win.Promise,
+      protectHashes: () => [current.imageHash]
+    });
+
+    await expect(runToCompletion(target, sync.run())).rejects.toMatchObject({ code: 'storage_quota' });
+    expect(writeAttempts).toBe(2);
+    expect((await storage.getActiveManifest()).manifestHash).toBe(current.manifest.manifestHash);
+    expect(await storage.hasCompleteAsset(current.imageHash, current.imageBytes.length, 'image/png')).toBe(true);
+    expect(await storage.getCredential()).toBe('existing-screen-identity');
   });
 });
 
