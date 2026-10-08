@@ -668,11 +668,13 @@ describe('playback engine', () => {
     expect(target.media.load.length).toBe(loadsBeforeRepeat);
   });
 
-  it('keeps video unmuted and persists audio after a one-time user activation', async () => {
+  it('falls back to muted video automatically when audible autoplay is denied', async () => {
     const { fixture, target, storage, http, sync } = await readyPage();
-    let rejectAutoplay = true;
-    target.win.HTMLMediaElement.prototype.play = function () {
-      if (!rejectAutoplay) return target.win.Promise.resolve();
+    const rejectAutoplay = true;
+    const playAttempts: boolean[] = [];
+    target.win.HTMLMediaElement.prototype.play = function (this: any) {
+      playAttempts.push(Boolean(this.muted));
+      if (!rejectAutoplay || this.muted) return target.win.Promise.resolve();
       const error: any = new Error('play requires a user gesture');
       error.name = 'NotAllowedError';
       return target.win.Promise.reject(error);
@@ -688,18 +690,18 @@ describe('playback engine', () => {
     await settle(target.win, target.clock, 30);
 
     const video: any = await waitForElement(target, 'video.sp-video');
+    video.oncanplay();
     await settle(target.win, target.clock, 20);
-    expect(video.muted).toBe(false);
-    expect(video.getAttribute('muted')).toBeNull();
+    expect(video.muted).toBe(true);
+    expect(video.getAttribute('muted')).toBe('muted');
     expect(blocked.length).toBeGreaterThan(0);
-
-    rejectAutoplay = false;
-    expect(await engine.enableAudio()).toBe(true);
-    expect(await storage.getAudioEnabled()).toBe(true);
-    expect(video.muted).toBe(false);
+    expect(playAttempts).toContain(false);
+    expect(playAttempts).toContain(true);
+    expect(engine.isMounted()).toBe(true);
+    void storage;
   });
 
-  it('retries locally-failed media over the network before skipping it', async () => {
+  it('skips locally-failed media to the next cached item without requesting a signed URL', async () => {
     const { fixture, target, storage, http, sync } = await readyPage();
     const notices: string[] = [];
     const engine = startEngine(target, { storage, sync, http, options: { onNotice: (text: string) => notices.push(text) } });
@@ -713,14 +715,10 @@ describe('playback engine', () => {
     image.onerror();
     await settle(target.win, target.clock);
 
-    const retried: any = await waitForElement(target, 'img.sp-media');
-    expect(retried.getAttribute('src')).toContain('https://objects.example.test/');
-    expect(notices.join(' ')).toContain('الشبكة');
-
-    retried.onerror();
-    target.clock.advance(1500);
-    await settle(target.win, target.clock);
-    await waitForElement(target, 'video.sp-video');
+    const video: any = await waitForElement(target, 'video.sp-video');
+    expect(video.getAttribute('src')).toContain('blob:');
+    expect(notices.join(' ')).toContain('الانتقال');
+    expect(target.win.document.querySelector('img.sp-media')).toBeNull();
   });
 
   it('reinitializes a stalled video before advancing (watchdog recovery, then skip)', async () => {

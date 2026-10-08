@@ -115,12 +115,13 @@ describe('player scripts are ES5', () => {
     expect(sha).toContain('digestHex');
   });
 
-  it('never mutes video and reuses a persistent video element', () => {
+  it('falls back to muted autoplay and reuses a persistent video element', () => {
     const runtime = stripComments(readScript('runtime.js'));
     expect(runtime).toContain('function createVideoElement()');
     expect(runtime).toContain('if (state.videoElement) return state.videoElement;');
-    expect(runtime).not.toMatch(/setAttribute\(['"]muted/);
-    expect(runtime).not.toMatch(/video\.muted\s*=\s*true/);
+    expect(runtime).toMatch(/setAttribute\(['"]muted/);
+    expect(runtime).toMatch(/video\.muted\s*=\s*true/);
+    expect(runtime).toContain('video_auto_resume');
   });
 });
 
@@ -144,16 +145,16 @@ describe('the /player shell document', () => {
     expect(srcs.every((src) => src.startsWith('/player/'))).toBe(true);
   });
 
-  it('paints visible content and a pure-HTML retry before any script runs', () => {
+  it('paints an automatic-recovery status without a manual link before scripts run', () => {
     expect(html).toContain('مشغل الشاشة');
     expect(html).toContain('جارٍ تشغيل المشغل…');
-    expect(html).toContain('href="/player?diag=1"');
-    expect(html).toContain('href="/player"');
+    expect(html).toContain('يحاول المشغل استعادة ملفات التشغيل تلقائياً');
+    expect(html).not.toContain('<a ');
     expect(html).toContain('<noscript>');
   });
 
-  it('contains the required Arabic incompatibility message with runtime diagnostics', () => {
-    expect(html).toContain('مشغل الشاشة غير متوافق مع إصدار المتصفح الحالي');
+  it('contains the automatic-recovery message with runtime diagnostics', () => {
+    expect(html).toContain('المشغل يحاول استعادة التشغيل تلقائياً');
     expect(html).toContain('id="signage-fatal-reason"');
     expect(html).toContain('id="signage-fatal-ua"');
     expect(html).toContain('__signageGuard');
@@ -169,6 +170,7 @@ describe('the /player shell document', () => {
   });
 
   it('uses only CSS that Chromium 38 understands', () => {
+    const css = html.split('<style>')[1].split('</style>')[0];
     const banned = [
       { name: 'CSS custom properties', pattern: /var\(--/ },
       { name: 'grid layout', pattern: /display:\s*grid/ },
@@ -179,8 +181,8 @@ describe('the /player shell document', () => {
       { name: 'position: sticky', pattern: /position:\s*sticky/ }
     ];
     for (const rule of banned) {
-      const match = rule.pattern.exec(html);
-      const context = match ? html.slice(Math.max(0, match.index - 50), match.index + 50) : '';
+      const match = rule.pattern.exec(css);
+      const context = match ? css.slice(Math.max(0, match.index - 50), match.index + 50) : '';
       expect(match, `shell CSS uses ${rule.name} near: ${context}`).toBeNull();
     }
   });
@@ -231,9 +233,10 @@ describe('the deployed /player document', () => {
     }
   });
 
-  it.skipIf(!built)('keeps the visible boot panel and the HTML retry link before any script runs', () => {
+  it.skipIf(!built)('keeps the visible auto-recovery boot panel before any script runs', () => {
     expect(built).toContain('جارٍ تشغيل المشغل…');
-    expect(built).toContain('href="/player?diag=1"');
+    expect(built).toContain('يحاول المشغل استعادة ملفات التشغيل تلقائياً');
+    expect(built).not.toContain('<a ');
     expect(built).toContain('id="signage-fatal"');
   });
 });
@@ -273,7 +276,7 @@ describe('the /player route response', () => {
     expect(cacheControl).toContain('stale-if-error=604800');
     const body = await response.text();
     expect(body).toContain('/player/runtime.js?v=' + PLAYER_VERSION);
-    expect(body).toContain('مشغل الشاشة غير متوافق مع إصدار المتصفح الحالي');
+    expect(body).toContain('المشغل يحاول استعادة التشغيل تلقائياً');
   });
 
   it('never removes the security headers the rest of the site relies on', () => {

@@ -10,13 +10,12 @@
  * whose chunks require ES2022 syntax (`globalThis`, `?.`, `??`, arrow functions), so the TV aborted
  * with a SyntaxError/ReferenceError before React mounted and the page stayed a dead screenshot.
  *
- * Guarantees this shell provides on its own, without any JavaScript succeeding:
- *   1. A visible panel (logo, title, Arabic status text) is painted from static HTML.
- *   2. A pure-HTML retry link (`<a href="/player">`) always works.
- *   3. `window.__signageGuard` reveals the diagnostic panel with the browser report if the runtime
- *      never signals `__signageBooted`, or if a player script fails to load (onerror).
+ * Guarantees this shell provides:
+ *   1. A visible static status is painted immediately while the ES5 player assets load.
+ *   2. `window.__signageGuard` shows a diagnostic and retries missing assets automatically without
+ *      requiring a remote-control action or reloading the page.
  */
-export const PLAYER_VERSION = '2.2.0-1';
+export const PLAYER_VERSION = '2.2.0-2';
 
 export const PLAYER_ASSETS = ['/player/sha256.js', '/player/runtime.js', '/player/player.js'] as const;
 
@@ -63,9 +62,6 @@ p { line-height: 1.8; margin: 0 0 12px; color: #c3d2e3; }
 .sp-status { position: absolute; left: 3%; bottom: 3%; z-index: 3; max-width: 94%; padding: 6px 10px;
   background: rgba(0, 0, 0, .72); border-radius: 8px; font-size: 12px; color: #cfdceb;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: left; cursor: pointer; }
-.sp-audio-control { position: fixed; left: 50%; bottom: 3%; z-index: 4; min-height: 46px; padding: 0 24px;
-  border: 0; border-radius: 10px; background: #28b9a8; color: #061d22; font-size: 16px; font-family: inherit;
-  font-weight: bold; cursor: pointer; -webkit-transform: translateX(-50%); transform: translateX(-50%); }
 .sp-dot { color: #7d8ea3; margin-left: 6px; }
 .sp-dot-on { color: #2dd4bf; }
 .sp-notice { color: #ffd9a0; }
@@ -105,6 +101,35 @@ const GUARD_SCRIPT = `
     } catch (e) { }
     return 'unknown';
   }
+  var recoveryAttempt = 0;
+  var recoveryInFlight = false;
+  function nextMissingScript() {
+    if (!w.SignageSha256) return '/player/sha256.js';
+    if (!w.SignagePlayerRuntime) return '/player/runtime.js';
+    if (!w.SignagePlayerUI) return '/player/player.js';
+    return '/player/player.js';
+  }
+  function scheduleScriptRecovery() {
+    if (w.__signageBooted || recoveryInFlight) return;
+    recoveryAttempt += 1;
+    var delay = Math.min(300000, 5000 * Math.pow(2, Math.min(recoveryAttempt - 1, 6)));
+    w.setTimeout(function () {
+      if (w.__signageBooted || recoveryInFlight) return;
+      recoveryInFlight = true;
+      var script = document.createElement('script');
+      script.src = nextMissingScript() + '?v=${PLAYER_VERSION}&retry=' + recoveryAttempt;
+      script.onload = function () {
+        recoveryInFlight = false;
+        if (!w.__signageBooted) scheduleScriptRecovery();
+      };
+      script.onerror = function () {
+        recoveryInFlight = false;
+        setText('signage-fatal-reason', 'تعذر تحميل ملف التشغيل؛ تستمر المحاولة تلقائياً.');
+        scheduleScriptRecovery();
+      };
+      (document.head || document.body).appendChild(script);
+    }, delay);
+  }
   w.__signageGuard = function (reason) {
     try {
       if (w.__signageBooted) return;
@@ -118,10 +143,11 @@ const GUARD_SCRIPT = `
       details.push('player.js: ' + (w.SignagePlayerUI ? 'loaded' : 'missing'));
       details.push('indexedDB: ' + (w.indexedDB ? 'yes' : 'no') + ' / fetch: ' + (w.fetch ? 'yes' : 'no') +
         ' / XMLHttpRequest: ' + (w.XMLHttpRequest ? 'yes' : 'no') + ' / Promise: ' + (w.Promise ? 'yes' : 'no'));
-      setText('signage-fatal-reason', reason || 'script execution stopped before the player reported readiness');
       setText('signage-fatal-ua', details.join(' | '));
       setText('signage-fatal-href', (w.location && w.location.href) || '');
+      setText('signage-fatal-reason', (reason || 'تعذر بدء المشغل') + ' — تتم إعادة المحاولة تلقائياً.');
       panel.style.display = 'block';
+      scheduleScriptRecovery();
     } catch (e) { }
   };
   setTimeout(function () { try { w.__signageGuard('the player did not report readiness within 15 seconds'); } catch (e) { } }, 15000);
@@ -162,10 +188,7 @@ export function renderPlayerShell(): string {
         <p>جارٍ تشغيل المشغل…</p>
         <div class="sp-list">
           <div class="sp-row sp-note">التلفاز يشغّل واجهة متوافقة مع webOS 3.5 ومتصفحات التلفاز القديمة.</div>
-          <div class="sp-row sp-note">إذا لم تتغير هذه الشاشة تلقائياً، استخدم زر إعادة المحاولة.</div>
-        </div>
-        <div class="sp-actions">
-          <a class="sp-button sp-primary" href="/player?diag=1">إعادة المحاولة والتحقق</a>
+          <div class="sp-row sp-note">يحاول المشغل استعادة ملفات التشغيل تلقائياً، ولا يتطلب ذلك ضغط أي زر.</div>
         </div>
       </div>
     </div>
@@ -177,7 +200,7 @@ export function renderPlayerShell(): string {
   <div class="sp-ui">
     <div class="sp-panel sp-panel-wide">
       <div class="sp-logo">ش</div>
-      <h1>مشغل الشاشة غير متوافق مع إصدار المتصفح الحالي</h1>
+      <h1>المشغل يحاول استعادة التشغيل تلقائياً</h1>
       <div class="sp-alert sp-alert-error" id="signage-fatal-reason"></div>
       <p>تعذر تشغيل المشغل أو استكمال التحميل في هذا المتصفح. البيانات التالية تساعد على تحديد السبب على هذا الطراز.</p>
       <h2>معلومات المتصفح وإصدار webOS</h2>
@@ -186,16 +209,10 @@ export function renderPlayerShell(): string {
         <div class="sp-row sp-mono" id="signage-fatal-href"></div>
         <div class="sp-row sp-note">ملاحظة: طرازات LG 2016 (webOS 3.x) تعمل بمحرك Chromium 38، وهو لا يدعم وحدات ES الحديثة أو الوعود المتقدمة. هذا المشغل مصمم للعمل عليه، وإذا ظهرت هذه الرسالة فغالباً أحد ملفات المشغل لم يُحمّل أو لم يُنفّذ.</div>
       </div>
-      <h2>ما يمكن فعله الآن</h2>
+      <h2>حالة الاستعادة التلقائية</h2>
       <div class="sp-list">
-        <div class="sp-row">1. اضغط «إعادة المحاولة» أدناه لتحميل المشغل من جديد.</div>
-        <div class="sp-row">2. تأكد من وصول التلفاز إلى الإنترنت عبر HTTPS ثم أعد التشغيل.</div>
-        <div class="sp-row">3. من متصفح الحاسوب افتح نفس الرابط للتأكد من أن الشاشة مربوطة وأن المحتوى منشور.</div>
-        <div class="sp-row">4. إذا تكررت الرسالة، فقد يحتاج هذا الطراز إلى تطبيق webOS أصلي بدلاً من متصفح الويب.</div>
-      </div>
-      <div class="sp-actions">
-        <a class="sp-button sp-primary" href="/player?diag=1">إعادة المحاولة</a>
-        <a class="sp-button sp-secondary" href="/player">تحميل المشغل فقط</a>
+        <div class="sp-row">يعيد المشغل طلب ملفاته تلقائياً بفواصل متزايدة، من دون إعادة تحميل الصفحة أو الحاجة إلى جهاز التحكم.</div>
+        <div class="sp-row">تظهر هذه الحالة فقط قبل بدء محرك التشغيل؛ تبقى الوسائط المخزنة محلياً مستقلة عن مزامنة الشبكة.</div>
       </div>
     </div>
   </div>

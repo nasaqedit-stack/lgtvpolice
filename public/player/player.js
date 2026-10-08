@@ -7,12 +7,12 @@
  * Guarantees:
  *   - The first paint happens synchronously and needs no modern API, so a TV without IndexedDB,
  *     fetch, AbortController, ReadableStream, native Promise or Blob URLs still shows a usable
- *     screen with a pairing form, a retry action and a diagnostics screen.
+ *     pairing or automatic-recovery screen.
  *   - Every asynchronous step is individually guarded; a failure switches to a visible state
  *     instead of leaving a blank or frozen page, and cached media keeps playing when the network
  *     or the credential fails.
- *   - The diagnostics screen is reachable at all times (?diag=1, a click on the status line, the
- *     remote's INFO key, or automatically after a fatal error).
+ *   - Diagnostics never cover a playable local playlist; when there is no cached playlist they
+ *     remain reachable from ?diag=1, the status line, INFO, or an error.
  */
 (function (root, factory) {
   var api = factory(root);
@@ -37,7 +37,7 @@
     backToPlayback: 'العودة إلى العرض',
     syncTitle: 'مزامنة المحتوى',
     syncHelp: 'يتم تنزيل الوسائط المطلوبة إلى التخزين المحلي.',
-    syncFoot: 'أبقِ التلفاز متصلاً حتى يكتمل التنزيل والتحقق. لن يُفعّل المحتوى الجديد قبل اكتمال جميع الملفات.',
+    syncFoot: 'سيعيد المشغل محاولة المزامنة تلقائياً. يستمر المحتوى المحلي أثناء أي انقطاع ولا يتطلب الأمر تدخلاً.',
     noContentTitle: 'لا يوجد محتوى منشور',
     noContentHelp: 'عيّن قائمة تشغيل منشورة لهذه الشاشة أو أضف جدولاً زمنياً من لوحة الإدارة.',
     retry: 'إعادة المحاولة',
@@ -66,8 +66,6 @@
     syncFailed: 'تعذرت المزامنة.',
     unexpected: 'خطأ غير متوقع.',
     fatalReason: 'أوقف خطأ غير متوقع التشغيل الطبيعي للمشغل.',
-    enableAudio: 'تشغيل الصوت',
-    audioHint: 'اضغط لتفعيل صوت الفيديو.',
     rePairScreen: 'إعادة ربط الشاشة',
     unpairedNotice: 'الشاشة غير مربوطة من لوحة الإدارة؛ يستمر العرض المحلي للوسائط المحفوظة.',
     playbackLabel: 'العرض',
@@ -151,7 +149,6 @@
       online: true,
       playing: false,
       audioEnabled: false,
-      audioUnlockRequired: false,
       diagnosticsOpen: false,
       pairFormExplicit: false,
       resume: null,
@@ -210,23 +207,13 @@
       var status = createElement(doc, 'div', 'sp-status');
       status.onclick = function () { openDiagnostics('manual'); };
       status.setAttribute('role', 'button');
-      var audioControl = createElement(doc, 'button', 'sp-audio-control', TEXTS.enableAudio);
-      audioControl.setAttribute('type', 'button');
-      audioControl.setAttribute('aria-label', TEXTS.enableAudio);
-      audioControl.style.display = 'none';
-      audioControl.onclick = function (event) {
-        if (event && event.preventDefault) event.preventDefault();
-        activateAudioFromGesture();
-      };
       host.appendChild(stage);
       host.appendChild(overlay);
       host.appendChild(status);
-      host.appendChild(audioControl);
       nodes.host = host;
       nodes.stage = stage;
       nodes.overlay = overlay;
       nodes.status = status;
-      nodes.audioControl = audioControl;
     }
 
     function panel(children) {
@@ -316,7 +303,6 @@
         children.push(createElement(doc, 'div', 'sp-note', TEXTS.cachedLabel + ': ' + state.cachedCount));
       }
       children.push(createElement(doc, 'p', 'sp-note', TEXTS.syncFoot));
-      children.push(button(TEXTS.retry, 'sp-secondary', function () { retryEverything(); }));
       children.push(button(TEXTS.reopenDiagnostics, 'sp-secondary', function () { openDiagnostics('manual'); }));
       return panel(children);
     }
@@ -325,7 +311,6 @@
       var children = [];
       children.push(createElement(doc, 'h1', null, TEXTS.noContentTitle));
       children.push(createElement(doc, 'p', null, TEXTS.noContentHelp));
-      children.push(button(TEXTS.retry, 'sp-primary', function () { retryEverything(); }));
       children.push(button(TEXTS.reopenDiagnostics, 'sp-secondary', function () { openDiagnostics('manual'); }));
       return panel(children);
     }
@@ -386,10 +371,6 @@
         state.diagnosticsOpen = false;
         paint();
       }));
-      var reload = button(TEXTS.reload, 'sp-secondary', function () {
-        reloadNow('manual');
-      });
-      actions.appendChild(reload);
       actions.appendChild(button(TEXTS.close, 'sp-secondary', function () {
         state.diagnosticsOpen = false;
         paint();
@@ -397,35 +378,6 @@
       box.appendChild(actions);
       wrap.appendChild(box);
       return wrap;
-    }
-
-    function renderAudioControl() {
-      if (!nodes.audioControl) return;
-      nodes.audioControl.style.display = state.audioUnlockRequired && state.playing && !state.showPairForm && !state.diagnosticsOpen ? 'block' : 'none';
-      nodes.audioControl.textContent = TEXTS.enableAudio;
-      nodes.audioControl.setAttribute('aria-label', TEXTS.enableAudio);
-      nodes.audioControl.title = TEXTS.audioHint;
-    }
-
-    function activateAudioFromGesture() {
-      if (!engine || typeof engine.enableAudio !== 'function') return;
-      var activation;
-      try { activation = engine.enableAudio(); }
-      catch (error) { state.audioUnlockRequired = true; renderAudioControl(); return; }
-      P.resolve(activation).then(function (enabled) {
-        if (enabled) {
-          state.audioEnabled = true;
-          state.audioUnlockRequired = false;
-          record('audio_enabled', { persisted: true });
-        } else {
-          state.audioUnlockRequired = true;
-          record('audio_enable_failed', null);
-        }
-        renderAudioControl();
-      }, function () {
-        state.audioUnlockRequired = true;
-        renderAudioControl();
-      });
     }
 
     function renderStatusBar() {
@@ -467,6 +419,13 @@
       try { return runtime.hasPlayableContent(state.manifest); } catch (error) { return Boolean(state.manifest); }
     }
 
+    function hasLocalPlaybackState() {
+      if (!hasPlayableContent()) return false;
+      if (engineStageVisible()) return true;
+      try { if (engine && isFn(engine.hasLocalMedia) && engine.hasLocalMedia()) return true; } catch (error) { /* use the stored count below */ }
+      return Number(state.cachedCount) > 0;
+    }
+
     /**
      * The overlay is never allowed to cover media that is on screen. It appears only when there is
      * genuinely nothing to show, or when the operator explicitly asks for the diagnostics / pairing
@@ -476,33 +435,36 @@
       if (!nodes.overlay) return;
       clearNode(nodes.overlay);
       var hasContent = hasPlayableContent();
+      var protectPlayback = hasLocalPlaybackState();
       var stageVisible = engineStageVisible();
-      var pairVisible = state.showPairForm && (state.pairFormExplicit || !hasContent || !stageVisible);
-      // `emptyTicks` is raised by the playback watchdog only after the stage has been genuinely
-      // empty for half a minute: an operator then gets an explanation instead of a silent black
-      // screen. It never appears while media is loading normally (images report pending, videos
-      // start within the same watchdog window).
-      var stalled = !stageVisible && state.emptyTicks >= 2;
-      var showOverlay = state.diagnosticsOpen || pairVisible || !hasContent || (!state.playing && !stageVisible) || stalled;
+      // Local content always has priority over operator screens, sync progress and error prompts.
+      // Pairing/diagnostics remain available only when there is no playable playlist to protect.
+      if (protectPlayback) state.diagnosticsOpen = false;
+      var pairVisible = state.showPairForm && !protectPlayback;
+      var diagnosticVisible = state.diagnosticsOpen && !protectPlayback;
+      var stalled = !protectPlayback && !stageVisible && state.emptyTicks >= 2;
+      var showOverlay = diagnosticVisible || pairVisible || !protectPlayback || (!state.playing && !stageVisible && !protectPlayback) || stalled;
       nodes.overlay.className = 'sp-overlay';
       nodes.overlay.style.display = showOverlay ? 'block' : 'none';
-      if (state.diagnosticsOpen) {
+      if (diagnosticVisible) {
         nodes.overlay.appendChild(renderDiagnostics());
       } else if (pairVisible) {
         nodes.overlay.appendChild(renderPairing(hasContent));
-      } else if (!hasContent) {
+      } else if (!protectPlayback) {
         nodes.overlay.appendChild(state.phase === 'no_content' ? renderNoContent() : renderSync());
-      } else if (!state.playing && !stageVisible) {
-        nodes.overlay.appendChild(renderSync());
-      } else if (stalled) {
+      } else if (!protectPlayback && !state.playing && !stageVisible) {
         nodes.overlay.appendChild(renderSync());
       }
       renderStatusBar();
-      renderAudioControl();
     }
 
     function openDiagnostics(reason) {
       if (!nodes.overlay) return;
+      if (hasLocalPlaybackState()) {
+        record('diagnostics_suppressed_for_playback', { reason: reason || 'manual' });
+        state.diagnosticsOpen = false;
+        return;
+      }
       state.diagnosticsReason = reason === 'fatal' ? TEXTS.fatalReason : '';
       state.diagnosticsOpen = true;
       paint();
@@ -583,7 +545,7 @@
       if (engine) {
         try { engine.stop(); } catch (error) { /* a stop failure must not block re-attachment */ }
       }
-      sync = token ? syncFactory(syncOptions(token)) : null;
+      sync = token && http ? syncFactory(syncOptions(token)) : null;
       engine = engineFactory({
         win: win,
         doc: doc,
@@ -596,14 +558,6 @@
         audioEnabled: state.audioEnabled,
         resume: state.resume || null,
         log: record,
-        onAudioBlocked: function () {
-          state.audioUnlockRequired = true;
-          renderAudioControl();
-        },
-        onAudioReady: function () {
-          state.audioUnlockRequired = false;
-          renderAudioControl();
-        },
         onNotice: function (text) {
           state.notice = text;
           if (state.playing) renderStatusBar(); else paint();
@@ -611,11 +565,12 @@
         onItem: function () {
           state.playing = true;
           if (state.phase !== 'syncing') state.phase = 'playing';
+          paint();
         },
         onProgress: persistPlaybackState,
         onRecoveryExhausted: function (info) {
           record('recovery_exhausted', info || null);
-          recoveryReload('watchdog');
+          if (engine && isFn(engine.advance)) engine.advance();
         }
       });
       if (state.manifest && hasPlayableContent()) {
@@ -658,9 +613,14 @@
       if (requested && requested > reloadVersion) {
         reloadVersion = requested;
         return storage.setSeenReloadVersion(requested).then(function () {
-          // An explicit reload command from the admin app: persist the position first so the
-          // television resumes the same cached item after it comes back.
-          reloadNow('command');
+          // A remote refresh may update/repaint local state, but it must never unload cached
+          // playback. This also consumes the version so an older television does not loop it.
+          record('reload_command_softened', { version: requested });
+          if (engine && hasPlayableContent()) {
+            if (isFn(engine.ensurePlaying)) engine.ensurePlaying();
+            return null;
+          }
+          reloadNow('command_without_cached_content');
           return null;
         }, function () { return null; });
       }
@@ -676,6 +636,15 @@
       var token = requestedToken || state.token;
       if (!token || !storage) return P.resolve(false);
       if (syncLock) return P.resolve(false);
+      if (!http) {
+        state.online = false;
+        if (!state.manifest) state.error = state.lastSyncError || TEXTS.syncFailed;
+        lastSyncAttemptAt = Date.now();
+        syncBackoffMs = Math.min(600000, Math.max(60000, syncBackoffMs * 2));
+        record('sync_deferred_no_http', { backoffMs: syncBackoffMs });
+        if (!state.playing) paint();
+        return P.resolve(false);
+      }
       syncLock = true;
       lastSyncAttemptAt = Date.now();
       state.phase = state.manifest ? 'playing' : 'syncing';
@@ -754,7 +723,7 @@
         storage.getStats().then(function (stats) { state.stats = stats; }, function () { return null; }),
         storage.getLastSyncAt().then(function (at) { if (at) state.lastSyncAt = at; }, function () { return null; })
       ]).then(function () {
-        if (state.playing) renderStatusBar(); else paint();
+        if (state.playing) { renderStatusBar(); paint(); } else paint();
         return true;
       }, function () { return false; });
     }
@@ -794,15 +763,12 @@
       return true;
     }
 
-    function recoveryReload(reason) {
-      return reloadNow(reason);
-    }
-
     /** Lightweight watchdog: reinitializes playback locally before any page-level recovery. */
     function checkPlayback() {
       try {
         if (!engine || !state.manifest) return;
         if (!hasPlayableContent()) { state.emptyTicks = 0; return; }
+        if (isFn(engine.ensurePlaying)) engine.ensurePlaying();
         if (engineStageVisible()) { state.emptyTicks = 0; return; }
         state.emptyTicks += 1;
         record('watchdog_empty_stage', { ticks: state.emptyTicks, offline: !state.online });
@@ -812,10 +778,11 @@
           paint();
           try { engine.render(); } catch (error) { record('watchdog_render_failed', { message: runtime.message(error, 'unknown') }); }
         } else if (state.emptyTicks >= 4 && isFn(engine.hasLocalMedia) && engine.hasLocalMedia()) {
-          // Media is cached but nothing reached the screen for a full minute: reinitialize the
-          // player. Guarded, so an offline television with an empty cache is never reloaded.
+          // Local media is available: ask the engine to reinitialize/advance locally, never reload
+          // the document underneath a cached playlist.
           state.emptyTicks = 0;
-          recoveryReload('watchdog_empty_stage');
+          if (isFn(engine.recover)) engine.recover('watchdog_empty_stage');
+          else engine.render();
         }
       } catch (error) {
         record('watchdog_failed', { message: runtime.message(error, 'unknown') });
@@ -872,8 +839,22 @@
       try { return win.navigator.onLine !== false; } catch (error) { return true; }
     }
 
+    function restorePlayback(reason) {
+      if (!engine || !hasPlayableContent()) return;
+      record('playback_focus_restore', { reason: reason });
+      try {
+        if (isFn(engine.ensurePlaying)) engine.ensurePlaying();
+        else engine.render();
+        state.playing = true;
+        state.phase = 'playing';
+        renderStatusBar();
+      } catch (error) {
+        record('playback_focus_restore_failed', { message: runtime.message(error, 'unknown') });
+      }
+    }
+
     function heartbeat() {
-      if (!state.token || heartbeatLock) return;
+      if (!state.token || heartbeatLock || !http) return;
       heartbeatLock = true;
       var item = engine ? engine.currentItem() : null;
       var playlistId = engine ? engine.playlistId() : null;
@@ -956,6 +937,16 @@
         renderStatusBar();
         // Nothing else happens here on purpose: the cache keeps the playlist running.
       });
+      win.addEventListener('focus', function () { restorePlayback('focus'); }, false);
+      win.addEventListener('pageshow', function () { restorePlayback('pageshow'); }, false);
+      if (doc.addEventListener) {
+        doc.addEventListener('visibilitychange', function () {
+          var visible = true;
+          try { visible = doc.visibilityState ? doc.visibilityState === 'visible' : !doc.hidden; } catch (error) { visible = true; }
+          if (visible) restorePlayback('visible');
+          else record('playback_visibility_hidden', null);
+        }, false);
+      }
       win.addEventListener('error', function (event) {
         record('window_error', { message: event && event.message ? String(event.message).slice(0, 200) : 'unknown' });
       });
@@ -988,8 +979,10 @@
       try {
         http = httpFactory(win, { Promise: P, log: record, transport: win.__SIGNAGE_TRANSPORT__ || null });
       } catch (error) {
-        fatal(error, 'http_init_failed');
-        return P.resolve(false);
+        http = null;
+        state.online = false;
+        state.error = runtime.message(error, TEXTS.unexpected);
+        record('http_init_failed_nonblocking', { message: String(state.error).slice(0, 200) });
       }
       if (wantsDiagnostics(win)) win.setTimeout(function () { openDiagnostics('manual'); }, 0);
       var storagePromise;
@@ -1011,13 +1004,17 @@
           adapter.getCredential(),
           adapter.getActiveManifest(),
           typeof adapter.getPlaybackState === 'function' ? adapter.getPlaybackState() : P.resolve(null),
-          typeof adapter.getRecoveryState === 'function' ? adapter.getRecoveryState() : P.resolve(null)
+          typeof adapter.getRecoveryState === 'function' ? adapter.getRecoveryState() : P.resolve(null),
+          typeof adapter.countCachedAssets === 'function'
+            ? adapter.countCachedAssets().then(function (count) { return count; }, function () { return 0; })
+            : P.resolve(0)
         ]);
       }).then(function (values) {
         var token = values[0];
         var manifest = values[1];
         var playback = values[2];
         var recovery = values[3];
+        state.cachedCount = Number(values[4]) || 0;
         state.token = token || null;
         state.manifest = manifest || null;
         state.resume = playback || null;

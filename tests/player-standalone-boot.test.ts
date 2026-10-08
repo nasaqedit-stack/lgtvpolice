@@ -127,7 +127,7 @@ describe('booting on a TV browser without modern APIs', () => {
 });
 
 describe('blank-screen protection', () => {
-  it('shows the Arabic incompatibility report when the player scripts never run', () => {
+  it('shows diagnostics and automatically retries missing player scripts without a button', () => {
     const target = page({ skipScripts: true });
     const fatal = target.win.document.getElementById('signage-fatal') as any;
     expect(fatal).toBeTruthy();
@@ -136,14 +136,15 @@ describe('blank-screen protection', () => {
     target.win.__signageGuard('تعذر تحميل ملف المشغل: runtime.js');
 
     expect(fatal.style.display).toBe('block');
-    expect(fatal.textContent).toContain('مشغل الشاشة غير متوافق مع إصدار المتصفح الحالي');
+    expect(fatal.textContent).toContain('المشغل يحاول استعادة التشغيل تلقائياً');
     expect(fatal.textContent).toContain('تعذر تحميل ملف المشغل: runtime.js');
+    expect(fatal.textContent).toContain('تتم إعادة المحاولة تلقائياً');
     const details = target.win.document.getElementById('signage-fatal-ua') as any;
     expect(details.textContent).toContain('Chromium: 38');
     expect(details.textContent).toContain('runtime.js: missing');
     expect(details.textContent).toContain('player.js: missing');
-    const retry = fatal.querySelector('a') as any;
-    expect(retry.getAttribute('href')).toContain('/player?diag=1');
+    expect(fatal.querySelector('a')).toBeNull();
+    expect(target.clock.pending()).toBeGreaterThan(0);
     expect(target.win.document.getElementById('signage-fatal-href').textContent).toContain('/player');
   });
 
@@ -167,7 +168,7 @@ describe('blank-screen protection', () => {
     expect(panel.textContent).toContain('آخر خطأ');
     const buttons = Array.from(panel.querySelectorAll('button')).map((node: any) => node.textContent);
     expect(buttons).toContain('إعادة المحاولة');
-    expect(buttons).toContain('إعادة التحميل');
+    expect(buttons).not.toContain('إعادة التحميل');
   });
 });
 
@@ -189,7 +190,7 @@ describe('diagnostics screen', () => {
     expect(text).toContain('آخر الأحداث');
     const buttons = Array.from(panel.querySelectorAll('button')).map((node: any) => node.textContent);
     expect(buttons).toContain('إعادة المحاولة');
-    expect(buttons).toContain('إعادة التحميل');
+    expect(buttons).not.toContain('إعادة التحميل');
     expect(buttons).toContain('إغلاق');
   });
 
@@ -256,17 +257,20 @@ describe('pairing, downloading and playing through the UI', () => {
     expect(plan.calls.some((call) => call.isRange)).toBe(true);
   });
 
-  it('hides playback UI and offers a persistent one-time audio-unlock button when autoplay is blocked', async () => {
+  it('automatically starts cached video muted when LG rejects audible autoplay', async () => {
     const { buildFixture } = await import('./player-harness');
     const fixture = buildFixture();
     const plan = createTransport(fixture);
     const target = page({ transport: plan.transport, indexedDb: new IDBFactory() });
-    let blockAutoplay = true;
-    target.win.HTMLMediaElement.prototype.play = function () {
-      if (!blockAutoplay) return target.win.Promise.resolve();
-      const error: any = new Error('play requires a user gesture');
-      error.name = 'NotAllowedError';
-      return target.win.Promise.reject(error);
+    const playAttempts: boolean[] = [];
+    target.win.HTMLMediaElement.prototype.play = function (this: any) {
+      playAttempts.push(Boolean(this.muted));
+      if (!this.muted) {
+        const error: any = new Error('play requires a user gesture');
+        error.name = 'NotAllowedError';
+        return target.win.Promise.reject(error);
+      }
+      return target.win.Promise.resolve();
     };
     const player = await boot(target);
     setPairCode(target, 'ABCD-1234');
@@ -281,21 +285,15 @@ describe('pairing, downloading and playing through the UI', () => {
     const video: any = target.win.document.querySelector('video.sp-video');
     const overlay: any = target.win.document.querySelector('.sp-overlay');
     const status: any = target.win.document.querySelector('.sp-status');
-    const audioButton: any = target.win.document.querySelector('.sp-audio-control');
     expect(video).toBeTruthy();
-    expect(video.getAttribute('muted')).toBeNull();
-    expect(video.muted).toBe(false);
+    expect(video.getAttribute('muted')).toBe('muted');
+    expect(video.muted).toBe(true);
     expect(overlay.style.display).toBe('none');
     expect(status.style.display).toBe('none');
-    expect(audioButton.textContent).toBe('تشغيل الصوت');
-    expect(audioButton.style.display).toBe('block');
-
-    blockAutoplay = false;
-    audioButton.onclick({ preventDefault() { /* direct user-gesture path */ } });
-    await settle(target.win, target.clock, 40);
-    expect(await player.storage().getAudioEnabled()).toBe(true);
-    expect(audioButton.style.display).toBe('none');
-    expect(video.muted).toBe(false);
+    expect(target.win.document.querySelector('.sp-audio-control')).toBeNull();
+    expect(playAttempts).toContain(false);
+    expect(playAttempts).toContain(true);
+    expect(await player.storage().getAudioEnabled()).toBe(false);
   });
 
   it('keeps playing cached media when the network dies and recovers on retry', async () => {

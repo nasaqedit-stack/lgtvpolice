@@ -160,6 +160,37 @@ describe('cached playback never depends on the network', () => {
     expect(target.win.document.querySelector('video.sp-video')).toBe(video);
   });
 
+  it('keeps cached video running when LG rejects audible autoplay, without an on-screen action', async () => {
+    const fixture = buildFixture();
+    const target = page({ indexedDb: new IDBFactory() });
+    await seedCache(target, fixture);
+    const playAttempts: boolean[] = [];
+    target.win.HTMLMediaElement.prototype.play = function (this: any) {
+      playAttempts.push(Boolean(this.muted));
+      if (!this.muted) {
+        const error: any = new Error('play requires a user gesture');
+        error.name = 'NotAllowedError';
+        return target.win.Promise.reject(error);
+      }
+      return target.win.Promise.resolve();
+    };
+    const player = await boot(target);
+    player.engine().jump(1);
+    await settle(target.win, target.clock, 30);
+    const video: any = target.win.document.querySelector('video.sp-video');
+    expect(video).toBeTruthy();
+    video.oncanplay();
+    await settle(target.win, target.clock, 20);
+
+    // Audible autoplay is attempted first; after the browser rejects it, muted playback starts itself.
+    expect(playAttempts).toContain(false);
+    expect(playAttempts).toContain(true);
+    expect(target.win.document.querySelector('.sp-audio-control')).toBeNull();
+    expect(video.muted).toBe(true);
+    expect(overlay(target).style.display).toBe('none');
+    expect(player.log().some((entry: any) => entry.event === 'muted_autoplay_started')).toBe(true);
+  });
+
   it('never lets a failing manifest interrupt or cover the media on screen', async () => {
     const fixture = buildFixture();
     const planOptions: Parameters<typeof createTransport>[1] = {};
@@ -237,6 +268,24 @@ describe('navigator.onLine and background failures', () => {
     expect(player.state.online).toBe(false);
     expect(target.media.pause.length).toBe(pausesBefore);
     expect(player.log().some((entry: any) => entry.event === 'reload')).toBe(false);
+  });
+
+  it('softens a remote reload command while a locally cached playlist is active', async () => {
+    const fixture = buildFixture();
+    fixture.manifest.commands.reloadVersion = 1;
+    const plan = createTransport(fixture);
+    const target = page({ indexedDb: new IDBFactory(), transport: plan.transport });
+    await seedCache(target, fixture);
+    const player = await boot(target);
+    const image: any = await mediaElement(target);
+    image.onload();
+    await settle(target.win, target.clock, 120);
+
+    expect(player.log().some((entry: any) => entry.event === 'reload_command_softened')).toBe(true);
+    expect(player.log().some((entry: any) => entry.event === 'reload')).toBe(false);
+    expect(target.win.document.querySelector('img.sp-media')).toBe(image);
+    expect(image.style.display).toBe('block');
+    expect(overlay(target).style.display).toBe('none');
   });
 });
 
@@ -357,6 +406,105 @@ describe('missing content never blanks the screen', () => {
 });
 
 describe('watchdog and crash recovery', () => {
+  it('resumes automatically after pause, blur/focus, visibility and pageshow events', async () => {
+    const fixture = buildFixture();
+    const target = page({ indexedDb: new IDBFactory(), transport: deadNetwork });
+    await seedCache(target, fixture);
+    const player = await boot(target);
+    const engine = player.engine();
+    engine.jump(1);
+    await settle(target.win, target.clock, 30);
+    const video: any = target.win.document.querySelector('video.sp-video');
+    expect(video).toBeTruthy();
+    video.oncanplay();
+    await settle(target.win, target.clock, 20);
+    target.clock.advance(1100);
+    await settle(target.win, target.clock, 5);
+    const playsBefore = target.media.play.length;
+
+    video.onpause();
+    target.win.dispatchEvent(new target.win.Event('blur'));
+    target.win.document.dispatchEvent(new target.win.Event('visibilitychange'));
+    target.win.dispatchEvent(new target.win.Event('focus'));
+    target.win.dispatchEvent(new target.win.Event('pageshow'));
+    await settle(target.win, target.clock, 30);
+
+    expect(target.media.play.length).toBeGreaterThan(playsBefore);
+    expect(target.win.document.querySelector('video.sp-video')).toBe(video);
+    expect(overlay(target).style.display).toBe('none');
+    expect(target.win.document.querySelector('.sp-audio-control')).toBeNull();
+    expect(player.log().some((entry: any) => entry.event === 'playback_focus_restore')).toBe(true);
+  });
+
+  it('automatically advances from a failed cached video to another local item without a media request', async () => {
+    const fixture = buildFixture();
+    const calls: string[] = [];
+    const failEveryRequest: Transport = (spec) => {
+      calls.push(spec.url);
+      return Promise.reject(networkError());
+    };
+    const target = page({ indexedDb: new IDBFactory(), transport: failEveryRequest });
+    await seedCache(target, fixture);
+    const player = await boot(target);
+    player.engine().jump(1);
+    await settle(target.win, target.clock, 30);
+    const video: any = target.win.document.querySelector('video.sp-video');
+    video.oncanplay();
+    await settle(target.win, target.clock, 20);
+    const callsBefore = calls.length;
+
+    video.onerror();
+    await settle(target.win, target.clock, 30);
+    const image: any = target.win.document.querySelector('img.sp-media');
+    expect(image).toBeTruthy();
+    image.onload();
+    await settle(target.win, target.clock, 10);
+
+    expect(calls.length).toBe(callsBefore);
+    expect(image.style.display).toBe('block');
+    expect(overlay(target).style.display).toBe('none');
+    expect(player.log().some((entry: any) => entry.event === 'media_error')).toBe(true);
+  });
+
+  it('keeps an offline playlist transitioning for a 14-day virtual run with no user actions', async () => {
+    const fixture = buildFixture({ imageDurationMs: 3600000 });
+    const requests: string[] = [];
+    const offline: Transport = (spec) => {
+      requests.push(spec.url);
+      return Promise.reject(networkError());
+    };
+    const target = page({ indexedDb: new IDBFactory(), transport: offline });
+    await seedCache(target, fixture);
+    const player = await boot(target);
+    const wallStart = target.win.Date.now();
+    target.win.Date.now = function () { return wallStart + target.clock.now(); };
+    let image: any = await mediaElement(target);
+    image.onload();
+    await settle(target.win, target.clock, 5);
+
+    // 14 virtual days of hourly image/video transitions while every network request fails.
+    for (let hour = 0; hour < 14 * 24; hour += 1) {
+      target.clock.advance(3600000);
+      await settle(target.win, target.clock, 3);
+      const video: any = target.win.document.querySelector('video.sp-video');
+      expect(video).toBeTruthy();
+      video.oncanplay();
+      video.onended();
+      await settle(target.win, target.clock, 3);
+      image = target.win.document.querySelector('img.sp-media');
+      expect(image).toBeTruthy();
+      image.onload();
+      await settle(target.win, target.clock, 3);
+      expect(image.style.display).toBe('block');
+      expect(overlay(target).style.display).toBe('none');
+    }
+
+    expect(requests.filter((url) => /api\/player\/manifest/.test(url)).length).toBeGreaterThan(1);
+    expect(requests.filter((url) => /api\/player\/media\//.test(url))).toHaveLength(0);
+    expect(player.log().some((entry: any) => entry.event === 'reload')).toBe(false);
+    expect(player.state.playing).toBe(true);
+  });
+
   it('reinitializes a stopped video from the cached copy before moving on', async () => {
     const fixture = buildFixture();
     const plan = createTransport(fixture);
