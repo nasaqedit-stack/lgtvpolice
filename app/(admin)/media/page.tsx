@@ -3,23 +3,27 @@
 import { ChangeEvent, DragEvent, useCallback, useEffect, useRef, useState } from 'react';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
-import { api, jsonBody } from '@/lib/client/api';
+import { api, ApiError, jsonBody, RequestTimeoutError, withRequestTimeout } from '@/lib/client/api';
+import { runUploadTask, type UploadProgress, type UploadUiState } from '@/lib/client/upload-state';
 import { formatBytes } from '@/lib/shared';
 import { EmptyState, ErrorState, LoadingState, PageHeader } from '@/components/admin-common';
 
 const PART_SIZE = 8 * 1024 * 1024;
+const PART_UPLOAD_TIMEOUT_MS = 120_000;
+const COMPLETE_TIMEOUT_MS = 55_000;
 type FileInfo = { mimeType: string; kind: 'image' | 'video'; width: number | null; height: number | null; durationMs: number | null; thumbnailData: string | null; compatibility: 'candidate' | 'warning' | 'unknown' };
-type UploadState = { name: string; phase: string; percent: number; uploaded: number; total: number } | null;
 
 export default function MediaPage() {
   const [media, setMedia] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [uploadError, setUploadError] = useState('');
   const [query, setQuery] = useState('');
   const [kind, setKind] = useState('all');
   const [sort, setSort] = useState('newest');
-  const [upload, setUpload] = useState<UploadState>(null);
+  const [upload, setUpload] = useState<UploadUiState | null>(null);
   const [dragging, setDragging] = useState(false);
+  const uploadRunning = useRef(false);
   const [preview, setPreview] = useState<any>(null);
   const [busyId, setBusyId] = useState('');
   const inputRef = useRef<HTMLInputElement>(null);
@@ -32,59 +36,67 @@ export default function MediaPage() {
       if (kind !== 'all') params.set('kind', kind);
       params.set('sort', sort === 'name' ? 'name' : sort === 'size' ? 'size' : 'newest');
       const result = await api(`/api/admin/media?${params.toString()}`);
+      if (!Array.isArray(result.media)) throw new Error('أعاد الخادم قائمة وسائط غير صالحة.');
       setMedia(result.media);
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'تعذر تحميل المكتبة.'); }
     finally { setLoading(false); }
   }, [query, kind, sort]);
   useEffect(() => { const timer = window.setTimeout(() => void load(), 180); return () => window.clearTimeout(timer); }, [load]);
-  const setFileProgress = (file: File, phase: string, uploaded = 0) => setUpload({ name: file.name, phase, percent: file.size ? Math.min(100, Math.round(uploaded / file.size * 100)) : 0, uploaded, total: file.size });
-
-  const processFile = async (file: File) => {
+  const processFile = async (file: File, report: UploadProgress) => {
     const info = detectType(file);
     if (!info) throw new Error(`${file.name}: الصيغ المدعومة JPG وPNG وWebP وMP4 فقط. لا يتم قبول SVG غير المنقّح أو HEIC.`);
     if (file.size <= 0 || file.size > 2 * 1024 * 1024 * 1024) throw new Error(`${file.name}: الحجم يجب أن يكون بين بايت واحد و2 جيجابايت.`);
+    report('قراءة بيانات الملف…');
     let details: FileInfo;
     if (info.kind === 'image') details = await inspectImage(file, info.mimeType);
     else details = await inspectVideo(file, info.mimeType);
-    if (details.compatibility === 'warning' && !window.confirm(`${file.name}: لم يستطع متصفح الإدارة تأكيد توافق الفيديو مع H.264/AAC. قد لا يعمل على طراز التلفاز. هل تريد رفعه مع تسجيل التحذير؟`)) return;
+    if (details.compatibility === 'warning' && !window.confirm(`${file.name}: لم يستطع متصفح الإدارة تأكيد توافق الفيديو مع H.264/AAC. قد لا يعمل على طراز التلفاز. هل تريد رفعه مع تسجيل التحذير؟`)) return null;
 
-    setFileProgress(file, 'حساب بصمة SHA-256…');
-    const hash = await hashFile(file, amount => setFileProgress(file, 'حساب بصمة SHA-256…', amount));
+    report('حساب بصمة SHA-256…');
+    const hash = await hashFile(file, amount => report('حساب بصمة SHA-256…', amount));
     const duplicate = await api(`/api/admin/media?hash=${hash}`);
     if (duplicate.media?.length) throw new Error(`${file.name}: نسخة مطابقة موجودة باسم «${duplicate.media[0].display_name}»، لم يُعَد رفعها.`);
 
-    setFileProgress(file, 'تهيئة رفع متعدد الأجزاء…');
+    report('تهيئة رفع متعدد الأجزاء…');
     const uploadKey = `signage-upload:${hash}`;
-    let uploadId = '';
+    let uploadId = sessionStorage.getItem(uploadKey) ?? '';
     let status: any = null;
-    try {
-      uploadId = sessionStorage.getItem(uploadKey) ?? '';
-      if (uploadId) {
+    if (uploadId) {
+      try {
         status = await api(`/api/admin/media/uploads/${uploadId}/status`);
-        if (status.upload.fileSize !== file.size || status.upload.mimeType !== info.mimeType || status.upload.fileName !== file.name) {
-          throw new Error('ملف مختلف عن جلسة الرفع السابقة.');
-        }
+      } catch (reason) {
+        // Only discard a session the server confirms is gone/inactive. Do not hide an auth,
+        // configuration, network, or timeout failure by silently creating another session.
+        if (!(reason instanceof ApiError) || ![404, 409, 410].includes(reason.status)) throw reason;
+        sessionStorage.removeItem(uploadKey);
+        uploadId = '';
       }
-    } catch {
-      if (uploadId) sessionStorage.removeItem(uploadKey);
-      uploadId = '';
-      status = null;
+      if (uploadId && !status?.upload) throw new Error('أعاد الخادم حالة جلسة رفع غير مكتملة.');
+      if (uploadId && (status.upload.fileSize !== file.size || status.upload.mimeType !== info.mimeType || status.upload.fileName !== file.name)) {
+        sessionStorage.removeItem(uploadKey);
+        uploadId = '';
+        status = null;
+      }
     }
     if (!uploadId) {
       const session = await api('/api/admin/media/uploads', { method: 'POST', body: jsonBody({ fileName: file.name, fileSize: file.size, mimeType: info.mimeType }) });
       uploadId = session.uploadId;
+      if (typeof uploadId !== 'string' || !uploadId) throw new Error('لم يُرجع الخادم معرّف جلسة الرفع.');
       sessionStorage.setItem(uploadKey, uploadId);
       status = await api(`/api/admin/media/uploads/${uploadId}/status`);
     }
+    if (!status?.upload || !Array.isArray(status.parts) || !Number.isInteger(status.totalParts)) {
+      throw new Error('أعاد الخادم حالة جلسة رفع غير مكتملة.');
+    }
     const existingParts = new Map<number, number>((status.parts ?? []).map((part: any) => [Number(part.partNumber), Number(part.size)]));
     let completedBytes = [...existingParts.values()].reduce((sum, size) => sum + size, 0);
-    setFileProgress(file, 'رفع أجزاء الملف إلى تخزين الكائنات…', completedBytes);
+    report('رفع أجزاء الملف إلى تخزين الكائنات…', completedBytes);
     const partNumbers = Array.from({ length: status.totalParts }, (_, index) => index + 1).filter(partNumber => !existingParts.has(partNumber));
     await uploadParts(file, uploadId, partNumbers, completed => {
       completedBytes += completed;
-      setFileProgress(file, 'رفع أجزاء الملف إلى تخزين الكائنات…', completedBytes);
+      report('رفع أجزاء الملف إلى تخزين الكائنات…', completedBytes);
     });
-    setFileProgress(file, 'فحص الملف وإضافته إلى المكتبة…', file.size);
+    report('فحص الملف وإنشاء سجل الوسيط…', file.size);
     const result = await api(`/api/admin/media/uploads/${uploadId}/complete`, {
       method: 'POST',
       body: jsonBody({
@@ -95,25 +107,45 @@ export default function MediaPage() {
         thumbnailData: details.thumbnailData,
         compatibility: details.compatibility,
       }),
-    });
+    }, COMPLETE_TIMEOUT_MS);
+    if (!result?.media || typeof result.media.id !== 'string') {
+      throw new Error('لم يُرجع الخادم سجل الوسيط بعد الإكمال؛ لم يتم تأكيد إضافته إلى المكتبة.');
+    }
     sessionStorage.removeItem(uploadKey);
     if (result.duplicate) throw new Error(`${file.name}: الملف موجود مسبقاً ولم تتم إضافة نسخة ثانية.`);
+    return result.media;
   };
 
   const handleFiles = async (files: FileList | File[]) => {
+    if (uploadRunning.current) return;
     const list = Array.from(files);
     if (!list.length) return;
+    uploadRunning.current = true;
     setError('');
-    for (const file of list) {
-      try { await processFile(file); }
-      catch (reason) {
-        setError(reason instanceof Error ? reason.message : `تعذر رفع ${file.name}.`);
-        // Continue through a multi-file selection; one failed file never cancels the others.
+    setUploadError('');
+    try {
+      for (const file of list) {
+        try {
+          await runUploadTask(file, setUpload, async report => {
+            const created = await processFile(file, report);
+            if (created) {
+              // The complete endpoint returns the row only after its database INSERT has finished.
+              // Reconcile that authoritative result immediately, then refresh usage counts/sort.
+              setMedia(current => [{ ...created, usageCount: 0 }, ...current.filter(item => item.id !== created.id)]);
+              await load();
+            }
+            return created;
+          });
+        } catch (reason) {
+          setUploadError(reason instanceof Error ? reason.message : `تعذر رفع ${file.name}.`);
+          // Continue through a multi-file selection; one failed file never cancels the others.
+        }
       }
+      await load();
+    } finally {
+      uploadRunning.current = false;
+      if (inputRef.current) inputRef.current.value = '';
     }
-    setUpload(null);
-    if (inputRef.current) inputRef.current.value = '';
-    await load();
   };
 
   const fileChange = (event: ChangeEvent<HTMLInputElement>) => { if (event.target.files) void handleFiles(event.target.files); };
@@ -143,14 +175,23 @@ export default function MediaPage() {
     finally { setBusyId(''); }
   };
 
+  const isUploading = upload?.status === 'uploading';
+  const chooseFiles = () => { if (!isUploading) inputRef.current?.click(); };
+
   return <div className="page-content">
-    <PageHeader title="مكتبة الوسائط" description="ارفع الصور ومقاطع MP4 إلى تخزين الكائنات الخاص. يستخدم الرفع أجزاء قابلة للاستئناف، ويمنع تكرار الملف بالبصمة." action={<button className="button teal" onClick={() => inputRef.current?.click()} disabled={Boolean(upload)}>＋ رفع ملفات</button>} />
+    <PageHeader title="مكتبة الوسائط" description="ارفع الصور ومقاطع MP4 إلى تخزين الكائنات الخاص. يستخدم الرفع أجزاء قابلة للاستئناف، ويمنع تكرار الملف بالبصمة." action={<button className="button teal" onClick={chooseFiles} disabled={isUploading}>＋ رفع ملفات</button>} />
     {error && <ErrorState message={error} retry={() => void load()} />}
-    <input ref={inputRef} type="file" multiple accept=".jpg,.jpeg,.png,.webp,.mp4,image/jpeg,image/png,image/webp,video/mp4" style={{ display: 'none' }} onChange={fileChange} />
-    <div className={`upload-drop ${dragging ? 'dragging' : ''}`} role="button" tabIndex={0} onClick={() => inputRef.current?.click()} onDragOver={event => { event.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={onDrop} onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') inputRef.current?.click(); }}>
+    {uploadError && <ErrorState message={uploadError} />}
+    <input ref={inputRef} type="file" multiple disabled={isUploading} accept=".jpg,.jpeg,.png,.webp,.mp4,image/jpeg,image/png,image/webp,video/mp4" style={{ display: 'none' }} onChange={fileChange} />
+    <div className={`upload-drop ${dragging ? 'dragging' : ''}`} role="button" aria-disabled={isUploading} tabIndex={isUploading ? -1 : 0} onClick={chooseFiles} onDragOver={event => { event.preventDefault(); if (!isUploading) setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={onDrop} onKeyDown={event => { if (!isUploading && (event.key === 'Enter' || event.key === ' ')) chooseFiles(); }}>
       <div style={{ fontSize: 27, color: '#26998d' }}>⇧</div><strong>اسحب الملفات هنا أو اختر من جهازك</strong><small>JPG · PNG · WebP · MP4 · الحد الأقصى 2 جيجابايت للملف · SVG غير مدعوم حالياً لأنه يتطلب تنقية آمنة.</small>
     </div>
-    {upload && <section className="card card-pad" style={{ marginTop: 14 }}><div style={{ display: 'flex', justifyContent: 'space-between', gap: 10 }}><strong>{upload.name}</strong><span>{upload.phase}</span></div><div className="progress-track" style={{ background: '#e9eef4' }}><div className="progress-fill" style={{ width: `${upload.percent}%` }} /></div><small style={{ color: 'var(--muted)' }}>{upload.percent}% · {formatBytes(upload.uploaded)} / {formatBytes(upload.total)}</small></section>}
+    {upload && <section className={`card card-pad upload-status ${upload.status}`} style={{ marginTop: 14 }} role={upload.status === 'error' ? 'alert' : 'status'} aria-live="polite">
+      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10 }}><strong>{upload.name}</strong><span>{upload.phase}</span></div>
+      <div className="progress-track" style={{ background: '#e9eef4' }}><div className="progress-fill" style={{ width: `${upload.percent}%` }} /></div>
+      <small style={{ color: 'var(--muted)' }}>{upload.percent}% · {formatBytes(upload.uploaded)} / {formatBytes(upload.total)}</small>
+      {upload.error && <p style={{ marginBottom: 0 }}><strong>تفاصيل الخطأ:</strong> {upload.error}</p>}
+    </section>}
     <div className="toolbar" style={{ marginTop: 20 }}><div className="toolbar-start"><input className="search-input" placeholder="ابحث باسم الوسيط…" value={query} onChange={event => setQuery(event.target.value)} aria-label="البحث في الوسائط" /><select className="search-input" value={kind} onChange={event => setKind(event.target.value)} aria-label="تصفية النوع" style={{ width: 145 }}><option value="all">كل الأنواع</option><option value="image">صور</option><option value="video">فيديو</option></select></div><div className="toolbar-end"><select className="search-input" value={sort} onChange={event => setSort(event.target.value)} aria-label="ترتيب الوسائط" style={{ width: 150 }}><option value="newest">الأحدث أولاً</option><option value="name">الاسم</option><option value="size">الأكبر حجماً</option></select><span style={{ color: 'var(--muted)', fontSize: 12 }}>{media.length} عنصر</span></div></div>
     {loading && media.length === 0 ? <LoadingState /> : media.length === 0 ? <section className="card"><EmptyState title="مكتبتك فارغة" description="ارفع صوراً أو فيديو MP4؛ ستُخزن في Supabase Storage وليس داخل مستودع الكود." action={<button className="button teal" onClick={() => inputRef.current?.click()}>اختيار ملفات</button>} /></section> : <div className="media-grid">
       {media.map(item => <article className="card media-card" key={item.id}>
@@ -182,7 +223,8 @@ async function hashFile(file: File, progress: (value: number) => void) {
   const digest = sha256.create();
   const chunk = 8 * 1024 * 1024;
   for (let offset = 0; offset < file.size; offset += chunk) {
-    digest.update(new Uint8Array(await file.slice(offset, Math.min(offset + chunk, file.size)).arrayBuffer()));
+    const bytes = await withRequestTimeout('قراءة جزء من الملف', 30_000, () => file.slice(offset, Math.min(offset + chunk, file.size)).arrayBuffer());
+    digest.update(new Uint8Array(bytes));
     progress(Math.min(offset + chunk, file.size));
   }
   return bytesToHex(digest.digest());
@@ -192,7 +234,7 @@ async function inspectImage(file: File, mimeType: string): Promise<FileInfo> {
   try {
     const image = new Image();
     image.src = url;
-    await image.decode();
+    await withRequestTimeout('فك ترميز الصورة', 30_000, () => image.decode());
     const canvas = document.createElement('canvas');
     const scale = Math.min(1, 480 / Math.max(image.naturalWidth, image.naturalHeight));
     canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
@@ -259,14 +301,34 @@ async function uploadParts(file: File, uploadId: string, partNumbers: number[], 
       const blob = file.slice(start, Math.min(start + PART_SIZE, file.size));
       let done = false;
       for (let attempt = 0; attempt < 3 && !done; attempt += 1) {
+        const startedAt = Date.now();
+        if (process.env.NODE_ENV !== 'production') console.debug(`[media-upload] Storage PUT part ${partNumber} started`);
         try {
           const ticket = await api(`/api/admin/media/uploads/${uploadId}/parts`, { method: 'POST', body: jsonBody({ partNumbers: [partNumber] }) });
-          const response = await fetch(ticket.urls[partNumber], { method: 'PUT', body: blob });
-          if (!response.ok) throw new Error(`رفض التخزين الجزء ${partNumber} (${response.status}).`);
+          const partUrl = ticket.urls?.[partNumber];
+          if (typeof partUrl !== 'string' || !partUrl) throw new Error(`لم يُرجع الخادم رابط رفع للجزء ${partNumber}.`);
+          const response = await withRequestTimeout(`رفع جزء التخزين ${partNumber}`, PART_UPLOAD_TIMEOUT_MS, async signal => {
+            // File bytes go directly to the signed Supabase S3 URL; they are not sent through the
+            // Next/Vercel API (and this is a Blob PUT, not a FormData request).
+            const storageResponse = await fetch(partUrl, { method: 'PUT', body: blob, signal });
+            if (!storageResponse.ok) {
+              const detail = process.env.NODE_ENV !== 'production'
+                ? (await storageResponse.text().catch(() => ''))
+                    .replace(/https?:\/\/[^\s"'<>]+/gi, '[URL redacted]')
+                    .replace(/(authorization|access[_ -]?key|secret|token|signature|password)(\s*[:=]\s*|\s+)[^\s,;<>"']+/gi, '$1$2[redacted]')
+                    .slice(0, 500)
+                : '';
+              throw new Error(`رفض تخزين الجزء ${partNumber} (HTTP ${storageResponse.status})${detail ? `: ${detail}` : ''}`);
+            }
+            return storageResponse;
+          });
           done = true;
           onPartComplete(blob.size);
+          if (process.env.NODE_ENV !== 'production') console.debug(`[media-upload] Storage PUT part ${partNumber} finished`, { status: response.status, elapsedMs: Date.now() - startedAt });
         } catch (error) {
-          if (attempt === 2) throw error;
+          // A timed-out PUT has an unknown outcome; don't retry blindly. The upload session is
+          // retained and the next attempt first asks Storage which part numbers actually landed.
+          if (error instanceof RequestTimeoutError || attempt === 2) throw error;
           await new Promise(resolve => setTimeout(resolve, 700 * (attempt + 1)));
         }
       }

@@ -9,6 +9,16 @@ function required(name: string): string {
   return value;
 }
 
+const SUPABASE_REQUEST_TIMEOUT_MS = 15_000;
+
+function supabaseFetch(input: RequestInfo | URL, init: RequestInit = {}) {
+  const timeout = AbortSignal.timeout(SUPABASE_REQUEST_TIMEOUT_MS);
+  const signal = init.signal ? AbortSignal.any([init.signal, timeout]) : timeout;
+  // Supabase JS/PostgREST uses this for Auth and database HTTP calls. Keep the timeout signal
+  // attached after headers arrive as well, so a stalled response body is bounded too.
+  return fetch(input, { ...init, signal });
+}
+
 export function getSupabasePublicConfig() {
   return {
     url: required('NEXT_PUBLIC_SUPABASE_URL'),
@@ -32,6 +42,7 @@ export async function createSupabaseServer() {
         }
       },
     },
+    global: { fetch: supabaseFetch },
   });
 }
 
@@ -39,6 +50,9 @@ export function createSupabaseAdmin() {
   return createClient(
     required('NEXT_PUBLIC_SUPABASE_URL'),
     required('SUPABASE_SERVICE_ROLE_KEY'),
-    { auth: { autoRefreshToken: false, persistSession: false, detectSessionInUrl: false } },
+    {
+      auth: { autoRefreshToken: false, persistSession: false, detectSessionInUrl: false },
+      global: { fetch: supabaseFetch },
+    },
   );
 }

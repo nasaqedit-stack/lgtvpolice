@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { errorResponse, HttpError, requireAdmin } from '@/lib/server/http';
 
 export const runtime = 'nodejs';
+export const maxDuration = 60;
 export async function GET(request: NextRequest) {
   try {
     const { db } = await requireAdmin(request);

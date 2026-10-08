@@ -9,24 +9,46 @@ export class HttpError extends Error {
   }
 }
 
-export function errorResponse(error: unknown) {
+function safeErrorFields(error: unknown) {
+  const value = error as { name?: unknown; message?: unknown; code?: unknown; status?: unknown } | null;
+  const name = typeof value?.name === 'string' ? value.name.slice(0, 100) : 'UnknownError';
+  const code = typeof value?.code === 'string' ? value.code.slice(0, 100) : undefined;
+  const status = typeof value?.status === 'number' ? value.status : undefined;
+  let message = error instanceof Error
+    ? error.message
+    : typeof value?.message === 'string' ? value.message : String(error);
+  // Diagnostics must not echo signed URLs, auth headers, or credential-like values.
+  message = message
+    .replace(/https?:\/\/[^\s"'<>]+/gi, '[URL redacted]')
+    .replace(/(authorization|access[_ -]?key|secret|token|signature|password)(\s*[:=]\s*|\s+)[^\s,;]+/gi, '$1$2[redacted]')
+    .slice(0, 1000);
+  return { name, code, status, message };
+}
+
+export function errorResponse(error: unknown, context: { route?: string; stage?: string } = {}) {
   if (error instanceof HttpError) {
     return NextResponse.json({ error: error.message, code: error.code }, { status: error.status });
   }
   if (error instanceof ConfigError) {
-    // A required environment variable is missing/empty on this deployment. This is an operator
-    // configuration problem, not a transient failure, so it must never be masked as a generic
-    // "internal_error" 500 that just tells an admin to "try again" forever. The variable name is
-    // not sensitive (it is already public in this repository's source and .env.example); only its
-    // value would be, and that is never included here.
-    console.error('Server configuration error:', error.message);
+    // Environment variable names are not secret; values are never included in the response.
+    console.error('Server configuration error:', { variable: error.variable, ...context });
     return NextResponse.json({
       error: `الخادم غير مهيأ: المتغيّر البيئي "${error.variable}" غير مضبوط في بيئة الإنتاج. راجع إعدادات متغيرات البيئة في Vercel.`,
       code: 'server_misconfigured',
       missingVariable: error.variable,
     }, { status: 503 });
   }
-  console.error('Unhandled API error:', error);
+  const details = safeErrorFields(error);
+  if (process.env.NODE_ENV !== 'production') {
+    console.error('Unhandled API error:', { ...context, ...details });
+    return NextResponse.json({
+      error: `خطأ من الخادم: ${details.message}`,
+      code: details.code || 'internal_error',
+    }, { status: 500 });
+  }
+  // Production logs contain operation-safe metadata only; do not serialize SDK errors, headers,
+  // request bodies, signed URLs, or tokens into Vercel logs.
+  console.error('Unhandled API error:', { ...context, name: details.name, code: details.code, status: details.status });
   return NextResponse.json({ error: 'تعذر إكمال الطلب. حاول مرة أخرى.', code: 'internal_error' }, { status: 500 });
 }
 
