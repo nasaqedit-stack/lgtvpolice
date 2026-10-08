@@ -30,6 +30,10 @@ export async function DELETE(request: NextRequest, context: Context) {
     if (usageError) throw usageError;
     const count = Number(usageRows?.[0]?.usage_count ?? 0);
     if (count > 0) throw new HttpError(409, 'لا يمكن حذف وسيط مستخدم في مسودة أو نسخة منشورة. أزله من القائمة وانشر التغيير أولاً.', 'media_in_use');
+    // A published public submission serves this object directly; deleting it would break public delivery.
+    const { data: publishedSubmission, error: submissionError } = await db.from('submissions').select('id').eq('published_media_id', id).limit(1).maybeSingle();
+    if (submissionError) throw submissionError;
+    if (publishedSubmission) throw new HttpError(409, 'لا يمكن حذف وسيط منشور من مشاركة عامة. ألغِ نشر المشاركة أولاً.', 'media_published_submission');
     const { error: deleteError } = await db.from('media').delete().eq('id', id);
     if (deleteError) throw deleteError;
     const config = storageConfig();

@@ -4,6 +4,11 @@ const nextConfig: NextConfig = {
   allowedDevOrigins: ['*.e2b.app', 'localhost', '127.0.0.1'],
   poweredByHeader: false,
   compress: true,
+  // The video optimization pipeline spawns the ffmpeg-static binary at runtime; the traced
+  // function bundle must include it (sharp is traced automatically by Next.js).
+  outputFileTracingIncludes: {
+    '/api/**': ['./node_modules/ffmpeg-static/ffmpeg'],
+  },
   async headers() {
     return [
       {

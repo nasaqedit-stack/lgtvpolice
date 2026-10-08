@@ -21,10 +21,20 @@ export async function GET(request: NextRequest) {
       if (updateError) throw updateError;
       aborted += 1;
     }
+    // Expired public submission upload sessions (multipart uploads of /submit contributions).
+    const { data: expiredSubmissionUploads, error: submissionUploadsError } = await db.from('submission_uploads').select('id,storage_path,multipart_id').eq('status', 'uploading').lt('expires_at', now).limit(100);
+    if (submissionUploadsError) throw submissionUploadsError;
+    let abortedSubmissionUploads = 0;
+    for (const upload of expiredSubmissionUploads ?? []) {
+      await getS3Client().send(new AbortMultipartUploadCommand({ Bucket: config.bucket, Key: upload.storage_path, UploadId: upload.multipart_id })).catch(() => undefined);
+      const { error: updateError } = await db.from('submission_uploads').update({ status: 'aborted' }).eq('id', upload.id);
+      if (updateError) throw updateError;
+      abortedSubmissionUploads += 1;
+    }
     const { data: pruned, error: pruneError } = await db.rpc('prune_screen_heartbeats');
     if (pruneError) throw pruneError;
     await db.from('pairing_codes').delete().lt('created_at', new Date(Date.now() - 7 * 24 * 60 * 60_000).toISOString());
-    return NextResponse.json({ ok: true, abortedUploads: aborted, prunedHeartbeats: Number(pruned ?? 0) });
+    return NextResponse.json({ ok: true, abortedUploads: aborted, abortedSubmissionUploads, prunedHeartbeats: Number(pruned ?? 0) });
   } catch (error) {
     console.error('Scheduled cleanup failed:', error);
     return NextResponse.json({ error: 'Cleanup failed' }, { status: 500 });

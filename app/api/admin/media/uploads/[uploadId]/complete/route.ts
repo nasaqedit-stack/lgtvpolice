@@ -7,6 +7,7 @@ import { loadUpload, verifyUploadParts } from '@/lib/server/uploads';
 import { inspectQuickTimeObject } from '@/lib/server/quicktime';
 import { isQuickTimeMovCompatible, type QuickTimeCodecInfo } from '@/lib/shared/quicktime';
 import { MAX_UPLOAD_FILE_SIZE } from '@/lib/shared';
+import { sameMediaType, signatureMatches } from '@/lib/server/file-validation';
 
 export const runtime = 'nodejs';
 export const maxDuration = 60;
@@ -28,20 +29,6 @@ const schema = z.object({
     size: z.number().int().nonnegative().max(MAX_UPLOAD_FILE_SIZE),
   }).strict()).max(1024).optional(),
 }).strict();
-
-function signatureMatches(mime: string, bytes: Uint8Array) {
-  if (mime === 'image/jpeg') return bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
-  if (mime === 'image/png') return bytes[0] === 0x89 && String.fromCharCode(...bytes.slice(1, 4)) === 'PNG';
-  if (mime === 'image/webp') return String.fromCharCode(...bytes.slice(0, 4)) === 'RIFF' && String.fromCharCode(...bytes.slice(8, 12)) === 'WEBP';
-  if (mime === 'video/mp4' || mime === 'video/quicktime') return String.fromCharCode(...bytes.slice(4, 8)) === 'ftyp';
-  return false;
-}
-
-/** Compare media types only: a store may echo parameters (`image/png; charset=binary`) it was never given. */
-function sameMediaType(left: string | undefined, right: string | undefined) {
-  const trim = (value: string | undefined) => String(value ?? '').split(';')[0]?.trim().toLowerCase() ?? '';
-  return trim(left) === trim(right) && trim(left) !== '';
-}
 
 export async function POST(request: NextRequest, context: Context) {
   let uploadedKey: string | undefined;
