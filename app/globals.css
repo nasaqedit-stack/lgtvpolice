@@ -122,6 +122,9 @@ tr:last-child td { border-bottom: 0; }
 .upload-drop:hover, .upload-drop.dragging { border-color: var(--teal); background: #f1fbf9; }
 .upload-drop strong { display: block; margin: 8px 0 3px; }
 .upload-drop small { color: var(--muted); }
+.upload-status.success { border-color: #85d8c5; background: #f8fffd; }
+.upload-status.error { border-color: #f0aab2; background: #fffafb; }
+.upload-status.cancelled { border-color: #d9e1ea; }
 .playlist-editor { display: grid; grid-template-columns: minmax(250px,.8fr) minmax(0,1.2fr); gap: 16px; }
 .playlist-item { display: flex; align-items: center; gap: 12px; background: white; border: 1px solid var(--line); border-radius: 12px; padding: 10px; margin-bottom: 8px; cursor: grab; }
 .playlist-item.dragging { opacity: .5; }

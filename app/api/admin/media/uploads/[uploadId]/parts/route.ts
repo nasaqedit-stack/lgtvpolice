@@ -7,14 +7,18 @@ import { getS3Client, storageConfig } from '@/lib/server/storage';
 import { loadUpload } from '@/lib/server/uploads';
 
 export const runtime = 'nodejs';
+export const maxDuration = 60;
 type Context = { params: Promise<{ uploadId: string }> };
 const schema = z.object({ partNumbers: z.array(z.number().int().positive()).min(1).max(20) }).strict();
 
 export async function POST(request: NextRequest, context: Context) {
+  let stage = 'admin_auth';
   try {
     const { db, user } = await requireAdmin(request);
+    stage = 'load_upload_session';
     const { uploadId } = await context.params;
     const upload = await loadUpload(db, user.id, uploadId);
+    stage = 'validate_part_request';
     const parsed = schema.safeParse(await readJson(request));
     if (!parsed.success) throw new HttpError(400, 'أرقام أجزاء الرفع غير صالحة.', 'invalid_parts');
     const partSize = 8 * 1024 * 1024;
@@ -23,6 +27,7 @@ export async function POST(request: NextRequest, context: Context) {
     if (numbers.some(number => number > totalParts)) throw new HttpError(400, 'رقم الجزء يتجاوز حجم الملف.', 'invalid_parts');
     const config = storageConfig();
     const client = getS3Client();
+    stage = 'sign_storage_parts';
     const urls: Record<number, string> = {};
     for (const partNumber of numbers) {
       urls[partNumber] = await getSignedUrl(client, new UploadPartCommand({
@@ -30,5 +35,5 @@ export async function POST(request: NextRequest, context: Context) {
       }), { expiresIn: 15 * 60 });
     }
     return NextResponse.json({ urls, partSize, totalParts, expiresIn: 900 }, { headers: { 'Cache-Control': 'no-store' } });
-  } catch (error) { return errorResponse(error); }
+  } catch (error) { return errorResponse(error, { route: 'POST /api/admin/media/uploads/[uploadId]/parts', stage }); }
 }

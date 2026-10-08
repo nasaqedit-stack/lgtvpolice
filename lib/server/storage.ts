@@ -15,6 +15,12 @@ export function storageConfig() {
   };
 }
 
+export const STORAGE_REQUEST_TIMEOUT_MS = 15_000;
+
+export function storageRequestOptions(timeoutMs = STORAGE_REQUEST_TIMEOUT_MS) {
+  return { abortSignal: AbortSignal.timeout(timeoutMs) };
+}
+
 export function getS3Client() {
   if (!singleton) {
     singleton = new S3Client({
