@@ -61,6 +61,7 @@ export async function uploadParts(
   uploadId: string,
   partNumbers: number[],
   onPartComplete: (bytes: number) => void,
+  partsEndpoint?: string,
 ): Promise<DeclaredUploadPart[]> {
   const queue = [...partNumbers];
   const uploaded: DeclaredUploadPart[] = [];
@@ -76,7 +77,7 @@ export async function uploadParts(
           // The signed URL is requested per attempt: a retry after a slow failure must not
           // reuse a URL that may already be expired, and the offsets are re-derived from the
           // shared partition every time, so a retry can never send a stale byte range.
-          const ticket = await api(`/api/admin/media/uploads/${uploadId}/parts`, { method: 'POST', body: jsonBody({ partNumbers: [partNumber] }) });
+          const ticket = await api(partsEndpoint ?? `/api/admin/media/uploads/${uploadId}/parts`, { method: 'POST', body: jsonBody({ partNumbers: [partNumber] }) });
           const partUrl = ticket.urls?.[partNumber];
           if (typeof partUrl !== 'string' || !partUrl) throw new Error(`لم يُرجع الخادم رابط رفع للجزء ${partNumber}.`);
           const response = await withRequestTimeout(`رفع جزء التخزين ${partNumber}`, PART_UPLOAD_TIMEOUT_MS, async signal => {

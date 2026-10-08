@@ -2,20 +2,25 @@
 
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
-import { useState } from 'react';
+import { createContext, useContext, useState } from 'react';
 import { createSupabaseBrowser } from '@/lib/client/supabase';
+
+/** Lets admin pages distinguish the FINAL APPROVER (admin) from a reviewer (operator). */
+const AdminRoleContext = createContext<string>('viewer');
+export function useAdminRole() { return useContext(AdminRoleContext); }
 
 const items = [
   { href: '/dashboard', label: 'الرئيسية', icon: '◫' },
   { href: '/screens', label: 'الشاشات', icon: '▣' },
   { href: '/media', label: 'الوسائط', icon: '▧' },
+  { href: '/submissions', label: 'المشاركات', icon: '✉' },
   { href: '/playlists', label: 'قوائم التشغيل', icon: '≡' },
   { href: '/schedule', label: 'الجدولة', icon: '◷' },
   { href: '/settings', label: 'الإعدادات', icon: '⚙' },
 ];
 const titles: Record<string, string> = {
   '/dashboard': 'نظرة عامة', '/screens': 'إدارة الشاشات', '/media': 'مكتبة الوسائط',
-  '/playlists': 'قوائم التشغيل', '/schedule': 'جدولة المحتوى', '/settings': 'الإعدادات',
+  '/submissions': 'مشاركات المساهمين', '/playlists': 'قوائم التشغيل', '/schedule': 'جدولة المحتوى', '/settings': 'الإعدادات',
 };
 
 export default function AdminShell({ children, email, role }: { children: React.ReactNode; email: string; role: string }) {
@@ -44,6 +49,7 @@ export default function AdminShell({ children, email, role }: { children: React.
   return <div className="admin-shell">
     <aside className={`sidebar ${menuOpen ? 'open' : ''}`}>{nav}</aside>
     {menuOpen && <button className="mobile-backdrop" aria-label="إغلاق القائمة" onClick={() => setMenuOpen(false)} />}
+    <AdminRoleContext.Provider value={role}>
     <main className="admin-main">
       <header className="topbar">
         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
@@ -54,5 +60,6 @@ export default function AdminShell({ children, email, role }: { children: React.
       </header>
       {children}
     </main>
+    </AdminRoleContext.Provider>
   </div>;
 }
