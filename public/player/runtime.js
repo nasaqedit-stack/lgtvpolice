@@ -729,6 +729,21 @@
   IdbAdapter.prototype.setAudioEnabled = function (value) {
     return this._put('meta', { key: 'audioEnabled', value: Boolean(value) }).then(function () { return true; });
   };
+  // Last known playback position: written after every item change and while a video plays, so a
+  // page reload (watchdog recovery or a remote reload command) can resume the cached playlist
+  // exactly where it stopped, without any network request.
+  IdbAdapter.prototype.getPlaybackState = function () {
+    return this._get('meta', 'playbackState').then(function (row) { return (row && row.value) || null; }, function () { return null; });
+  };
+  IdbAdapter.prototype.setPlaybackState = function (value) {
+    return this._put('meta', { key: 'playbackState', value: value }).then(function () { return true; }, function () { return false; });
+  };
+  IdbAdapter.prototype.getRecoveryState = function () {
+    return this._get('meta', 'recoveryReload').then(function (row) { return (row && row.value) || null; }, function () { return null; });
+  };
+  IdbAdapter.prototype.setRecoveryState = function (value) {
+    return this._put('meta', { key: 'recoveryReload', value: value }).then(function () { return true; }, function () { return false; });
+  };
   IdbAdapter.prototype.countCachedAssets = function () {
     return this._getAll('assets').then(function (rows) {
       var count = 0;
@@ -1034,6 +1049,18 @@
   CacheAdapter.prototype.setAudioEnabled = function (value) {
     return this._putJson(this._metaUrl('audioEnabled'), { enabled: Boolean(value) });
   };
+  CacheAdapter.prototype.getPlaybackState = function () {
+    return this._getJson(this._metaUrl('playbackState')).then(function (value) { return (value && value.value) || null; });
+  };
+  CacheAdapter.prototype.setPlaybackState = function (value) {
+    return this._putJson(this._metaUrl('playbackState'), { value: value });
+  };
+  CacheAdapter.prototype.getRecoveryState = function () {
+    return this._getJson(this._metaUrl('recoveryReload')).then(function (value) { return (value && value.value) || null; });
+  };
+  CacheAdapter.prototype.setRecoveryState = function (value) {
+    return this._putJson(this._metaUrl('recoveryReload'), { value: value });
+  };
   CacheAdapter.prototype.countCachedAssets = function () {
     var self = this;
     return new this.P(function (resolve) {
@@ -1210,6 +1237,10 @@
   MemoryAdapter.prototype.setSeenReloadVersion = function (value) { this.meta.seenReloadVersion = Number(value) || 0; return this.P.resolve(true); };
   MemoryAdapter.prototype.getAudioEnabled = function () { return this.P.resolve(Boolean(this.meta.audioEnabled)); };
   MemoryAdapter.prototype.setAudioEnabled = function (value) { this.meta.audioEnabled = Boolean(value); return this.P.resolve(true); };
+  MemoryAdapter.prototype.getPlaybackState = function () { return this.P.resolve(this.meta.playbackState || null); };
+  MemoryAdapter.prototype.setPlaybackState = function (value) { this.meta.playbackState = value; return this.P.resolve(true); };
+  MemoryAdapter.prototype.getRecoveryState = function () { return this.P.resolve(this.meta.recoveryReload || null); };
+  MemoryAdapter.prototype.setRecoveryState = function (value) { this.meta.recoveryReload = value; return this.P.resolve(true); };
   MemoryAdapter.prototype.countCachedAssets = function () {
     var count = 0;
     for (var hash in this.assets) if (hasOwn(this.assets, hash) && this.assets[hash].complete) count += 1;
@@ -1579,6 +1610,7 @@
   }
 
   function hasPlayableContent(manifest) {
+    if (!manifest) return false;
     var playlists = manifest.playlists || [];
     var playable = false;
     for (var i = 0; i < playlists.length; i += 1) {
@@ -1622,6 +1654,25 @@
     var shaModule = resolveSha(win, options.sha);
     var preferSameOrigin = Boolean(options.preferSameOrigin);
     var signedUrlCache = {};
+    // Hashes the player itself protects: whatever is on the screen right now, plus every asset of
+    // the manifest being played. Garbage collection must never delete active media, even when the
+    // incoming manifest no longer references it.
+    var extraProtect = isFn(options.protectHashes) ? options.protectHashes : function () { return []; };
+
+    function activeHashes() {
+      var hashes = [];
+      try {
+        var extra = extraProtect() || [];
+        for (var i = 0; i < extra.length; i += 1) if (extra[i] && hashes.indexOf(extra[i]) === -1) hashes.push(extra[i]);
+      } catch (error) { noop(); }
+      return hashes;
+    }
+
+    function protection(manifest, targets) {
+      var hashes = protectList(manifest);
+      if (targets && targets.length) hashes = hashes.concat(targets);
+      return hashes.concat(activeHashes());
+    }
 
     function progress(phase, text, values) {
       var payload = { phase: phase, message: text, totalBytes: 0, downloadedBytes: 0 };
@@ -1642,6 +1693,7 @@
     function authorizedRequest(spec) {
       var finalSpec = extend({}, spec);
       finalSpec.headers = authHeaders(spec.headers);
+      if (!finalSpec.timeoutMs) finalSpec.timeoutMs = 20000;
       return http.request(finalSpec).then(function (response) {
         if (response.status === 401) throw PlayerError('تم إلغاء ربط هذه الشاشة. أعد ربطها من لوحة الإدارة.', 'screen_unauthorized');
         if (response.status === 403) throw PlayerError('الشاشة معطّلة على الخادم. يستمر المحتوى المحلي حتى يتوفر اتصال.', 'screen_disabled');
@@ -1654,7 +1706,7 @@
     function mediaUrls(mediaIds) {
       if (!mediaIds.length) return P.resolve({});
       return authorizedRequest({
-        method: 'POST', url: '/api/player/media-urls', responseType: 'text',
+        method: 'POST', url: '/api/player/media-urls', responseType: 'text', timeoutMs: 15000,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ mediaIds: mediaIds })
       }).then(function (result) {
@@ -1669,7 +1721,7 @@
         for (var i = 0; i < mediaIds.length; i += 1) {
           (function (mediaId) {
             singles.push(authorizedRequest({
-              method: 'POST', url: '/api/player/media-urls', responseType: 'text',
+              method: 'POST', url: '/api/player/media-urls', responseType: 'text', timeoutMs: 15000,
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ mediaIds: [mediaId] })
             }).then(function (result) {
@@ -1897,17 +1949,25 @@
         previous = saved;
         var headers = {};
         if (previous && previous.manifestHash) headers['If-None-Match'] = '"' + previous.manifestHash + '"';
-        return authorizedRequest({ method: 'GET', url: '/api/player/manifest', responseType: 'text', headers: headers });
+        return authorizedRequest({ method: 'GET', url: '/api/player/manifest', responseType: 'text', timeoutMs: 20000, headers: headers });
       }).then(function (response) {
         if (response.status === 304 && previous) {
           return storage.completeHashes(previous).then(function (missingHashes) {
             if (!missingHashes.length) {
               progress('ready', 'المحتوى المحلي محدث.');
-              return storage.getLastSyncAt().then(function (at) {
-                return { manifest: previous, changed: false, lastSyncAt: at || previous.generatedAt || nowIso() };
+              // Nothing changed: this is the right moment to drop media that neither the active
+              // manifest nor the player itself references any more (never the active media).
+              return storage.deleteUnreferenced(protection(previous)).then(function () {
+                return storage.getLastSyncAt().then(function (at) {
+                  return { manifest: previous, changed: false, lastSyncAt: at || previous.generatedAt || nowIso() };
+                });
+              }, function () {
+                return storage.getLastSyncAt().then(function (at) {
+                  return { manifest: previous, changed: false, lastSyncAt: at || previous.generatedAt || nowIso() };
+                });
               });
             }
-            return authorizedRequest({ method: 'GET', url: '/api/player/manifest', responseType: 'text' });
+            return authorizedRequest({ method: 'GET', url: '/api/player/manifest', responseType: 'text', timeoutMs: 20000 });
           });
         }
         return response;
@@ -1931,7 +1991,7 @@
         var assets = uniqueAssets(incoming);
         var targets = [];
         for (var i = 0; i < assets.length; i += 1) targets.push(assets[i].hash);
-        return storage.deleteUnreferenced(protectList(previous).concat(targets)).then(function () {
+        return storage.deleteUnreferenced(protection(previous, targets)).then(function () {
           progress('checking', 'فحص التخزين المحلي والوسائط المطلوبة…');
           var pending = [];
           function checkNext(index) {
@@ -2004,7 +2064,9 @@
                     return storage.activateManifest(incoming).then(function () {
                       var at = nowIso();
                       return storage.setLastSyncAt(at).then(function () {
-                        return storage.deleteUnreferenced(targets).then(function () {
+                        // `activeHashes()` still reports the manifest the engine is showing: media
+                        // that is on screen survives this pass and is collected on the next sync.
+                        return storage.deleteUnreferenced(targets.concat(activeHashes())).then(function () {
                           progress('ready', 'اكتملت المزامنة. يمكن الآن التشغيل دون إنترنت.', { totalBytes: totalBytes, downloadedBytes: totalBytes });
                           return { manifest: incoming, changed: !previous || previous.manifestHash !== incoming.manifestHash, lastSyncAt: at };
                         });
@@ -2047,17 +2109,31 @@
     var onState = isFn(options.onState) ? options.onState : noop;
     var onAudioBlocked = isFn(options.onAudioBlocked) ? options.onAudioBlocked : noop;
     var onAudioReady = isFn(options.onAudioReady) ? options.onAudioReady : noop;
+    var onProgress = isFn(options.onProgress) ? options.onProgress : noop;
+    var onRecoveryExhausted = isFn(options.onRecoveryExhausted) ? options.onRecoveryExhausted : noop;
     var state = {
       manifest: null, playlistId: null, index: 0, item: null, element: null, objectUrl: null,
       source: null, mounted: false, mountedHash: null, mountedKind: null, videoElement: null, videoSourceUrl: null,
       pendingImage: null, pendingImageUrl: null, playbackGeneration: 0, renderRequest: 0,
-      audioEnabled: Boolean(options.audioEnabled), audioBlocked: false
+      audioEnabled: Boolean(options.audioEnabled), audioBlocked: false,
+      pendingSeek: null, stallAttempts: 0, emptyStreak: 0, hasLocalMedia: false
     };
     var imageTimer = null;
     var stallTimer = null;
     var watchdogMs = options.watchdogMs || 25000;
     var imageDurationDefaultMs = options.imageDurationMs || 10000;
+    var missRetryBaseMs = options.missRetryBaseMs || 5000;
+    var missRetryLimit = options.missRetryLimit || 6;
+    var emptyStreakLimit = options.emptyStreakLimit || 3;
     var networkRetry = {};
+    var missAttempts = {};
+    var resume = options.resume || null;
+    // Object URLs are owned by this cache so a repeated item (or a re-render triggered by a sync)
+    // never re-reads the whole file from IndexedDB and never restarts the video element.
+    var sourceCache = {};
+    var sourceOrder = [];
+    var sourceCacheLimit = options.sourceCacheLimit || 6;
+    var progressAt = 0;
 
     function clearTimers() {
       if (imageTimer) { win.clearTimeout(imageTimer); imageTimer = null; }
@@ -2069,15 +2145,71 @@
         try { urlApi.revokeObjectURL(url); } catch (error) { noop(); }
       }
     }
-    function revokeCurrent() {
-      releaseObjectUrl(state.objectUrl);
-      state.objectUrl = null;
-    }
     function removeImage(image) {
       if (image && image.parentNode) {
         try { image.parentNode.removeChild(image); } catch (error) { noop(); }
       }
     }
+
+    /* ---------------------------------------------------------------- source cache --------------*/
+
+    function cachedSource(hash) {
+      var entry = sourceCache[hash];
+      if (!entry) return null;
+      entry.used += 1;
+      return entry.source;
+    }
+    function isCachedUrl(url) {
+      for (var i = 0; i < sourceOrder.length; i += 1) {
+        var entry = sourceCache[sourceOrder[i]];
+        if (entry && entry.source && entry.source.objectUrl === url) return true;
+      }
+      return false;
+    }
+    function forgetSource(hash) {
+      var entry = sourceCache[hash];
+      if (!entry) return;
+      delete sourceCache[hash];
+      for (var i = 0; i < sourceOrder.length; i += 1) {
+        if (sourceOrder[i] === hash) { sourceOrder.splice(i, 1); break; }
+      }
+      releaseObjectUrl(entry.source && entry.source.objectUrl);
+    }
+    function evictSources() {
+      var guard = 0;
+      while (sourceOrder.length > sourceCacheLimit && guard < 64) {
+        guard += 1;
+        var victim = null;
+        for (var i = 0; i < sourceOrder.length; i += 1) {
+          var hash = sourceOrder[i];
+          if (!sourceCache[hash]) continue;
+          if (hash === state.mountedHash) continue;
+          if (victim === null || sourceCache[hash].used < sourceCache[victim].used) victim = hash;
+        }
+        if (victim === null) return;
+        forgetSource(victim);
+      }
+    }
+    function cacheSource(hash, source) {
+      if (!hash || !source || !source.objectUrl) return source;
+      var entry = sourceCache[hash];
+      if (entry) { entry.used += 1; entry.source = source; return source; }
+      sourceCache[hash] = { source: source, used: 1 };
+      sourceOrder.push(hash);
+      evictSources();
+      return source;
+    }
+    function forgetAllSources() {
+      var hashes = sourceOrder.slice(0);
+      for (var i = 0; i < hashes.length; i += 1) forgetSource(hashes[i]);
+    }
+    /** Revokes a URL only when it is not owned by the cache (never a live, cached media URL). */
+    function discardSource(source) {
+      if (source && source.objectUrl && !isCachedUrl(source.objectUrl)) releaseObjectUrl(source.objectUrl);
+    }
+
+    /* ---------------------------------------------------------------- media elements ------------*/
+
     function createVideoElement() {
       if (state.videoElement) return state.videoElement;
       var video = doc.createElement('video');
@@ -2132,7 +2264,7 @@
     function cancelPendingImage() {
       if (!state.pendingImage) return;
       removeImage(state.pendingImage);
-      if (state.pendingImageUrl && state.pendingImageUrl !== state.objectUrl) releaseObjectUrl(state.pendingImageUrl);
+      if (state.pendingImageUrl && !isCachedUrl(state.pendingImageUrl)) releaseObjectUrl(state.pendingImageUrl);
       state.pendingImage = null;
       state.pendingImageUrl = null;
     }
@@ -2141,21 +2273,103 @@
       if (!urlApi || !isFn(urlApi.createObjectURL)) return null;
       try { return urlApi.createObjectURL(blob); } catch (error) { return null; }
     }
+
+    /* ---------------------------------------------------------------- progress / recovery ------*/
+
+    function reportProgress(positionMs) {
+      var now = Date.now();
+      var position = Math.max(0, Math.round(Number(positionMs) || 0));
+      if (position > 0 && now - progressAt < 5000) return;
+      progressAt = now;
+      try {
+        onProgress({
+          manifestHash: (state.manifest && state.manifest.manifestHash) || null,
+          playlistId: state.playlistId,
+          index: state.index,
+          hash: state.mountedHash || (state.item && state.item.hash) || null,
+          kind: state.mountedKind || (state.item && state.item.kind) || null,
+          positionMs: position,
+          at: now
+        });
+      } catch (error) { noop(); }
+    }
+
+    function noteEmptyStage() {
+      if (state.mounted || state.pendingImage) { state.emptyStreak = 0; return; }
+      state.emptyStreak += 1;
+      if (state.emptyStreak < emptyStreakLimit || !state.hasLocalMedia) return;
+      state.emptyStreak = 0;
+      log('playback_recovery_exhausted', { hash: safeString(state.mountedHash, 12) });
+      // The playlist is cached locally but nothing reached the screen: the page-level watchdog is
+      // allowed to reinitialize the player (bounded, and never while offline without cached media).
+      onRecoveryExhausted({ reason: 'empty_stage' });
+    }
+
     function armStall(reason) {
       if (stallTimer) win.clearTimeout(stallTimer);
       stallTimer = win.setTimeout(function () {
-        log('stall_watchdog', { reason: reason });
-        notice('تأخر تشغيل الوسيط؛ سيتم الانتقال إلى العنصر التالي.');
-        advance();
+        stallTimer = null;
+        handleStall(reason);
       }, watchdogMs);
     }
+    function recoverMedia() {
+      var kind = state.item && state.item.kind ? state.item.kind : (state.mountedKind || 'media');
+      if (kind === 'video' && state.videoElement && state.element === state.videoElement) {
+        var video = state.videoElement;
+        var position = 0;
+        try { position = Number(video.currentTime) || 0; } catch (error) { position = 0; }
+        if (position > 2 && state.mountedHash) state.pendingSeek = { hash: state.mountedHash, position: position };
+        try { if (isFn(video.pause)) video.pause(); } catch (error) { noop(); }
+        try {
+          if (isFn(video.load)) video.load();
+          else if (state.source && state.source.url) { video.src = state.source.url; state.videoSourceUrl = state.source.url; }
+        } catch (error) { noop(); }
+        armStall(kind);
+        tryPlay(video, state.playbackGeneration);
+        return;
+      }
+      if (state.pendingImage && state.source && state.source.url) {
+        try { state.pendingImage.src = state.source.url; } catch (error) { noop(); }
+        armStall(kind);
+        return;
+      }
+      render();
+    }
+    function rebindLocalMedia() {
+      var item = state.item;
+      var generation = state.playbackGeneration;
+      if (!item) { state.stallAttempts = 0; advance(); return; }
+      notice('إعادة قراءة الوسيط من التخزين المحلي…');
+      forgetSource(item.hash);
+      resolveLocalSource(item).then(function (source) {
+        if (generation !== state.playbackGeneration) { discardSource(source); return; }
+        if (!source) { state.stallAttempts = 0; advance(); return; }
+        mount(item, source);
+      }, function () { state.stallAttempts = 0; advance(); });
+    }
+    function handleStall(reason) {
+      var kind = state.item && state.item.kind ? state.item.kind : null;
+      if (kind && state.stallAttempts < 2) {
+        state.stallAttempts += 1;
+        log('stall_recovery', { reason: reason, attempt: state.stallAttempts, kind: kind, hash: safeString(state.mountedHash, 12) });
+        notice('إعادة تهيئة تشغيل الوسيط من النسخة المحلية…');
+        if (state.stallAttempts === 1) recoverMedia();
+        else rebindLocalMedia();
+        return;
+      }
+      log('stall_watchdog', { reason: reason, attempts: state.stallAttempts, hash: safeString(state.mountedHash, 12) });
+      notice('تأخر تشغيل الوسيط؛ سيتم الانتقال إلى العنصر التالي.');
+      state.stallAttempts = 0;
+      advance();
+    }
+
     function advance() {
       state.index += 1;
       render();
     }
     function advanceLater(delayMs) {
       if (imageTimer) win.clearTimeout(imageTimer);
-      imageTimer = win.setTimeout(function () { advance(); }, delayMs || 1200);
+      imageTimer = win.setTimeout(function () { imageTimer = null; advance(); }, delayMs || 1200);
     }
     function isAutoplayBlocked(error) {
       var name = error && error.name ? String(error.name) : '';
@@ -2196,23 +2410,39 @@
         });
       }
     }
+
+    function applyPendingSeek(video, item) {
+      var seek = state.pendingSeek;
+      if (!seek || !item || seek.hash !== item.hash) return;
+      state.pendingSeek = null;
+      var seconds = Number(seek.position) || 0;
+      if (seconds < 5) return;
+      try {
+        var duration = Number(video.duration);
+        if (!isFinite(duration) || duration <= 0 || seconds > duration - 3) return;
+        video.currentTime = seconds;
+      } catch (error) { noop(); }
+    }
+
     function activateVideo(item, source, video, generation) {
       if (generation !== state.playbackGeneration) return;
       if (state.element && state.element !== video) {
         if (state.element === state.videoElement) clearVideoSource(state.videoElement);
         else removeImage(state.element);
       }
-      var oldUrl = state.objectUrl;
       state.element = video;
       state.source = source;
       state.objectUrl = source.objectUrl || null;
       state.mounted = true;
       state.mountedHash = item.hash;
       state.mountedKind = item.kind;
+      state.stallAttempts = 0;
+      state.emptyStreak = 0;
+      if (source.kind === 'local') state.hasLocalMedia = true;
       setVideoVisible(video, true);
-      if (oldUrl && oldUrl !== state.objectUrl) releaseObjectUrl(oldUrl);
       onItem(item, source);
       onState({ item: item, source: source.kind, index: state.index, playlistId: state.playlistId });
+      reportProgress(0);
     }
 
     function mount(item, source) {
@@ -2238,10 +2468,9 @@
       img.onload = function () {
         if (generation !== state.playbackGeneration || state.pendingImage !== img) {
           removeImage(img);
-          if (source.objectUrl && source.objectUrl !== state.objectUrl) releaseObjectUrl(source.objectUrl);
+          discardSource(source);
           return;
         }
-        var previousUrl = state.objectUrl;
         if (state.element && state.element !== img) {
           if (state.element === state.videoElement) clearVideoSource(state.videoElement);
           else removeImage(state.element);
@@ -2256,15 +2485,18 @@
         state.mounted = true;
         state.mountedHash = item.hash;
         state.mountedKind = item.kind;
-        if (previousUrl && previousUrl !== state.objectUrl) releaseObjectUrl(previousUrl);
+        state.stallAttempts = 0;
+        state.emptyStreak = 0;
+        if (source.kind === 'local') state.hasLocalMedia = true;
         if (stallTimer) { win.clearTimeout(stallTimer); stallTimer = null; }
         var duration = Number(item.durationMs);
         if (!isFinite(duration) || duration < 1000) duration = imageDurationDefaultMs;
         if (duration > 86400000) duration = 86400000;
         if (imageTimer) win.clearTimeout(imageTimer);
-        imageTimer = win.setTimeout(function () { advance(); }, duration);
+        imageTimer = win.setTimeout(function () { imageTimer = null; advance(); }, duration);
         onItem(item, source);
         onState({ item: item, source: source.kind, index: state.index, playlistId: state.playlistId });
+        reportProgress(0);
       };
       img.onerror = function () { handleMediaFailure(item, source, 'image', img, generation); };
       state.pendingImage = img;
@@ -2290,6 +2522,7 @@
       else video.removeAttribute('loop');
       video.oncanplay = function () {
         if (generation !== state.playbackGeneration) return;
+        applyPendingSeek(video, item);
         activateVideo(item, source, video, generation);
         armStall('video');
         tryPlay(video, generation);
@@ -2301,7 +2534,13 @@
         onAudioReady();
         armStall('video');
       };
-      video.ontimeupdate = function () { if (generation === state.playbackGeneration) armStall('video'); };
+      video.ontimeupdate = function () {
+        if (generation !== state.playbackGeneration) return;
+        armStall('video');
+        var position = 0;
+        try { position = (Number(video.currentTime) || 0) * 1000; } catch (error) { position = 0; }
+        reportProgress(position);
+      };
       video.onprogress = function () { if (generation === state.playbackGeneration) armStall('video'); };
       video.onended = function () {
         if (generation !== state.playbackGeneration) return;
@@ -2344,8 +2583,7 @@
       state.source = null;
       if (source && source.kind === 'local' && !networkRetry[item.hash]) {
         networkRetry[item.hash] = true;
-        if (source.objectUrl && source.objectUrl !== state.objectUrl) releaseObjectUrl(source.objectUrl);
-        if (source.objectUrl === state.objectUrl) revokeCurrent();
+        forgetSource(item.hash);
         notice('تعذر قراءة الوسيط المحلي؛ ستتم محاولة التشغيل من الشبكة.');
         return resolveNetworkSource(item).then(function (networkSource) {
           if (networkSource) { mount(item, networkSource); return; }
@@ -2353,17 +2591,18 @@
           advanceLater(1200);
         }, function () { advanceLater(1200); });
       }
-      if (source && source.objectUrl && source.objectUrl !== state.objectUrl) releaseObjectUrl(source.objectUrl);
       notice(kind === 'video' ? 'تعذر تشغيل الفيديو؛ الانتقال إلى العنصر التالي…' : 'تعذر عرض الصورة؛ الانتقال إلى العنصر التالي…');
       advanceLater(1200);
     }
 
     function resolveLocalSource(item) {
+      var cached = cachedSource(item.hash);
+      if (cached) return P.resolve(cached);
       return storage.getAssetBlob(item.hash).then(function (blob) {
         if (!blob) return null;
         var url = objectUrl(blob);
         if (!url) return null;
-        return { kind: 'local', url: url, objectUrl: url, mimeType: item.mimeType };
+        return cacheSource(item.hash, { kind: 'local', url: url, objectUrl: url, mimeType: item.mimeType });
       }, function () { return null; });
     }
 
@@ -2391,64 +2630,104 @@
       }, function () { return bufferedNetworkSource(item); });
     }
 
-    function discardSource(source) {
-      if (source && source.objectUrl && source.objectUrl !== state.objectUrl) releaseObjectUrl(source.objectUrl);
+    /**
+     * The next item is not playable (not cached and the network is down): keep the media that is
+     * already on screen, never blank it, and retry the missing asset in the background with a
+     * bounded backoff. Only after `missRetryLimit` attempts does the playlist move on.
+     */
+    function holdForMissingItem(item, requestId) {
+      var hash = item && item.hash ? item.hash : 'unknown';
+      var attempts = (missAttempts[hash] || 0) + 1;
+      missAttempts[hash] = attempts;
+      log('media_missing', { hash: safeString(hash, 12), attempts: attempts, mounted: state.mounted });
+      if (state.mounted) notice('لا توجد نسخة محلية من الوسيط التالي؛ يستمر العرض الحالي.');
+      else notice('لا توجد نسخة محلية من هذا الوسيط؛ ستتم إعادة المحاولة في الخلفية.');
+      noteEmptyStage();
+      if (attempts > missRetryLimit) {
+        missAttempts[hash] = 0;
+        state.stallAttempts = 0;
+        advance();
+        return;
+      }
+      var delay = Math.min(60000, missRetryBaseMs * Math.pow(2, attempts - 1));
+      if (imageTimer) { win.clearTimeout(imageTimer); imageTimer = null; }
+      imageTimer = win.setTimeout(function () {
+        imageTimer = null;
+        if (requestId !== state.renderRequest) return;
+        render();
+      }, delay);
+    }
+
+    function clearStage() {
+      cancelPendingImage();
+      removeElement();
+      state.objectUrl = null;
+      clearTimers();
+      state.mounted = false;
+      state.mountedHash = null;
+      state.mountedKind = null;
+      state.item = null;
+      state.source = null;
+      state.stallAttempts = 0;
     }
 
     function render() {
       state.renderRequest += 1;
       var requestId = state.renderRequest;
       if (!state.manifest || !state.playlistId) {
-        cancelPendingImage();
-        removeElement();
-        revokeCurrent();
-        clearTimers();
-        state.mounted = false;
-        state.mountedHash = null;
-        state.mountedKind = null;
-        state.item = null;
-        state.source = null;
+        clearStage();
         onState({ item: null, index: 0, playlistId: state.playlistId });
         return;
       }
       var current = activeItem(state.manifest, state.playlistId, state.index);
       if (!current) {
-        cancelPendingImage();
-        removeElement();
-        revokeCurrent();
-        clearTimers();
-        state.mounted = false;
-        state.mountedHash = null;
-        state.mountedKind = null;
-        state.item = null;
-        state.source = null;
+        clearStage();
         onState({ item: null, index: 0, playlistId: state.playlistId });
         return;
       }
       var item = current.item;
       state.index = current.index;
-      if (state.mounted && state.mountedHash === item.hash && state.mountedKind === item.kind && state.source
-        && state.source.objectUrl && (state.source.kind === 'local' || state.source.kind === 'network-buffered')) {
-        state.item = item;
-        mount(item, state.source);
+      state.item = item;
+      // The item that is already on screen stays untouched: a background sync or a repeated item
+      // must never restart, reload or re-decode the media that is currently playing.
+      if (state.mounted && state.mountedHash === item.hash && state.mountedKind === item.kind) {
+        state.emptyStreak = 0;
+        onState({ item: item, source: state.source ? state.source.kind : null, index: state.index, playlistId: state.playlistId });
         return;
       }
-      state.item = item;
+      var cached = cachedSource(item.hash);
+      if (cached) { mount(item, cached); return; }
       resolveLocalSource(item).then(function (localSource) {
         if (requestId !== state.renderRequest) { discardSource(localSource); return; }
         if (localSource) { mount(item, localSource); return; }
         return resolveNetworkSource(item).then(function (networkSource) {
           if (requestId !== state.renderRequest) { discardSource(networkSource); return; }
           if (networkSource) { mount(item, networkSource); return; }
-          notice('لا توجد نسخة محلية من الوسيط ولا اتصال متاح. سيتم تجاوز العنصر.');
-          advanceLater(1500);
+          holdForMissingItem(item, requestId);
         });
       }, function (error) {
         if (requestId !== state.renderRequest) return;
         log('local_source_failed', { code: errorCode(error) });
-        notice('تعذر فتح الوسيط المحلي؛ الانتقال إلى العنصر التالي…');
-        advanceLater(1200);
+        holdForMissingItem(item, requestId);
       });
+    }
+
+    function applyResume(manifest) {
+      if (!resume || !manifest) return;
+      var restored = resume;
+      resume = null;
+      if (restored.manifestHash && manifest.manifestHash && restored.manifestHash !== manifest.manifestHash) return;
+      var playlists = manifest.playlists || [];
+      var found = null;
+      for (var i = 0; i < playlists.length; i += 1) {
+        if (playlists[i] && playlists[i].id === restored.playlistId && playlists[i].enabled !== false) { found = playlists[i]; break; }
+      }
+      if (!found || !isArray(found.items) || !found.items.length) return;
+      state.playlistId = found.id;
+      state.index = Math.max(0, Number(restored.index) || 0);
+      if (restored.itemHash && Number(restored.positionMs) > 0) {
+        state.pendingSeek = { hash: restored.itemHash, position: Number(restored.positionMs) / 1000 };
+      }
     }
 
     function enableAudio() {
@@ -2486,6 +2765,7 @@
     return {
       setManifest: function (manifest) {
         state.manifest = manifest;
+        applyResume(manifest);
         if (!state.playlistId) state.playlistId = scheduledPlaylistId(win, manifest, new Date());
         return state;
       },
@@ -2494,6 +2774,7 @@
         if (state.playlistId !== playlistId) {
           state.playlistId = playlistId;
           state.index = 0;
+          missAttempts = {};
         }
         return state;
       },
@@ -2501,7 +2782,28 @@
       index: function () { return state.index; },
       currentItem: function () { return state.item; },
       currentSource: function () { return state.source; },
+      currentPositionMs: function () {
+        var element = state.element;
+        if (!element || state.mountedKind !== 'video') return 0;
+        try { return Math.max(0, Math.round((Number(element.currentTime) || 0) * 1000)); } catch (error) { return 0; }
+      },
       isMounted: function () { return state.mounted; },
+      isPending: function () { return Boolean(state.pendingImage); },
+      hasLocalMedia: function () { return state.hasLocalMedia || sourceOrder.length > 0; },
+      /** Hashes that must never be garbage collected while this engine is on screen. */
+      protectedHashes: function () {
+        var out = [];
+        var playlists = (state.manifest && state.manifest.playlists) || [];
+        for (var i = 0; i < playlists.length; i += 1) {
+          var items = (playlists[i] && playlists[i].items) || [];
+          for (var j = 0; j < items.length; j += 1) {
+            if (items[j] && items[j].hash && out.indexOf(items[j].hash) === -1) out.push(items[j].hash);
+          }
+        }
+        if (state.mountedHash && out.indexOf(state.mountedHash) === -1) out.push(state.mountedHash);
+        if (state.item && state.item.hash && out.indexOf(state.item.hash) === -1) out.push(state.item.hash);
+        return out;
+      },
       enableAudio: enableAudio,
       jump: function (index) { state.index = Number(index) || 0; render(); },
       advance: advance,
@@ -2512,7 +2814,8 @@
         clearTimers();
         cancelPendingImage();
         removeElement();
-        revokeCurrent();
+        forgetAllSources();
+        state.objectUrl = null;
         if (state.videoElement && state.videoElement.parentNode) {
           try { state.videoElement.parentNode.removeChild(state.videoElement); } catch (error) { noop(); }
         }
@@ -2616,6 +2919,7 @@
     toUint8: toUint8,
     scheduledPlaylistId: scheduledPlaylistId,
     activeItem: activeItem,
+    hasPlayableContent: hasPlayableContent,
     timezoneOffsetMinutes: timezoneOffsetMinutes,
     deviceInfo: deviceInfo,
     normalizePairCode: normalizePairCode,

@@ -158,3 +158,58 @@ capability instead of failing.
 | Supabase migration, PostgREST RPC grants, RLS and Vercel cron | Not run | No Supabase database or Vercel project credentials were configured |
 
 The automated network tests use mocked HTTP and are not represented as physical network-loss or TV playback tests. Production acceptance requires the device checklist in `TV-SETUP.md` with a complete image → MP4 → image playlist and network physically disconnected.
+
+## Playback-first offline runtime (2026-10-08, player `2.2.0-1`)
+
+Root causes fixed in this change (all verified against the shipped files):
+
+- Startup blocked the first frame on `getStats`, `countCachedAssets`, `getSeenReloadVersion`
+  and `getAudioEnabled` before `attachEngine()` could render from the local manifest.
+- `paint()` kept the opaque `.sp-overlay` (and the pairing form) over media that was already
+  playing, including after a 401 that cleared the credential.
+- `applyManifest()` called `engine.render()` after every synchronization, which re-created the
+  blob object URL and re-assigned `video.src`, so a 60-second sync restarted the current video.
+- `deleteUnreferenced()` protected only the previous manifest, so activating a new playlist while
+  the old one was still on screen could delete the media being played.
+- The stall watchdog advanced immediately with no recovery attempt, and a media failure removed
+  the visible element before the replacement was ready (black screen for a missing asset).
+
+Rules now enforced (PLAYBACK > CACHE > SYNC): local manifest -> cached media -> playback ->
+background synchronization; atomic activation only after every asset is downloaded, size-checked
+and hash-verified; missing next item keeps the current media and retries with bounded backoff;
+Garbage collection always receives the hashes the engine is displaying (`protectHashes`);
+stall recovery reinitializes the media element and re-reads the local copy before skipping;
+the page-level watchdog may reload at most once per ten minutes and only when locally cached
+media had been on screen; `meta.playbackState` resumes the same item after a reload.
+
+Executed in this checkout:
+
+- `npm test` — 14 files, 177 tests passed (includes `tests/player-offline-first.test.ts`, 17 new
+  acceptance tests, and the three `the deployed /player document` checks that run once `.next`
+  exists).
+- `npm run lint` — passed with no warnings.
+- `npm run typecheck` — passed.
+- `npm run build` — passed; `/player` is still served as a static document
+  (`public/player/*.js?v=2.2.0-1`), ES5-parsed at `ecmaVersion: 5` by the syntax suite.
+- Production-parity acceptance run (local, sandbox): `npm run build && npm start`, then the
+  served `/player` document plus the three served scripts were loaded into the webOS-3.5-like
+  jsdom window with a pre-seeded IndexedDB cache while the live API calls failed
+  (no Supabase credentials in this environment). Result: a cached `blob:` element was displayed,
+  `.sp-overlay` stayed `display: none`, and the failure was recorded as a diagnostic only
+  (`screen_unauthorized`) instead of stopping or blanking playback.
+- Not run here: production deployment, `npm audit`, Supabase migration, live media E2E, and the
+  physical LG UJ634V. `https://lgtvpolice.vercel.app` is unreachable from this sandbox and the
+  change is not merged into `main`, so the deployed origin still serves `2.1.0-1`.
+
+Manual acceptance on the television (after the change is merged and deployed):
+
+1. Open `/player` on the TV, let it pair and finish a sync (the diagnostics screen lists the
+   cached media count and the last sync time).
+2. Unplug the Wi-Fi/Ethernet and power-cycle the TV.
+3. Confirm cached content starts immediately and keeps cycling; the status line (hidden while
+   media is on screen) shows «تشغيل محلي دون اتصال» when opened.
+4. Reconnect the network: the next background sync resumes within a minute and the picture is
+   never interrupted.
+5. Publish a new playlist from the admin app: it is downloaded in the background and only becomes
+   active once every asset is cached and verified; the current item keeps playing until its own
+   transition.
