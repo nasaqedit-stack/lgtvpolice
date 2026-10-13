@@ -1537,7 +1537,6 @@
 
   function createHttp(win, options) {
     var opts = options || {};
-    var log = isFn(opts.log) ? opts.log : noop;
     var transport = isFn(opts.transport) ? opts.transport : null;
     var P = resolvePromise(opts.Promise, win);
     var api = {};
