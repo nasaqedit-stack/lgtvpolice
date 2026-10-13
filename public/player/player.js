@@ -174,7 +174,8 @@
       syncFailures: 0,
       lastSyncAttemptAt: 0,
       lastSyncError: '',
-      lastErrorCode: ''
+      lastErrorCode: '',
+      lastErrorStage: ''
     };
     var nodes = {};
     var storage = null;
@@ -1184,6 +1185,7 @@
         state.error = '';
         state.lastSyncError = '';
         state.lastErrorCode = '';
+        state.lastErrorStage = '';
         state.latestManifest = result.manifest || state.latestManifest;
         if (result.lastSyncAt) state.lastSyncAt = result.lastSyncAt;
         record('sync_ok', { changed: Boolean(result.changed), candidate: Boolean(result.candidate) });
@@ -1199,14 +1201,18 @@
         syncLock = false;
         if (disposed) return false;
         var code = runtime.errorCode(error);
+        // The runtime tags each failure with the step that failed (manifest, storage, download,
+        // verify, activate, render). The heartbeat reports "stage:code" so the operator can see WHERE.
+        var stage = error && typeof error.stage === 'string' ? error.stage.slice(0, 24) : 'sync';
         state.progress = null;
         state.error = TEXTS.syncFailed;
         state.lastSyncError = code;
         state.lastErrorCode = code;
+        state.lastErrorStage = stage;
         syncFailures += 1;
         state.syncFailures = syncFailures;
         syncBackoffMs = Math.min(600000, 60000 * Math.pow(2, Math.min(syncFailures - 1, 4)));
-        record('sync_failed', { code: code, backoffMs: syncBackoffMs });
+        record('sync_failed', { code: code, stage: stage, backoffMs: syncBackoffMs });
         wd('noteSyncFailure', [code]);
         if (code === 'screen_unauthorized') {
           state.token = null;
@@ -1424,7 +1430,7 @@
         currentPlaylistVersion: playlistVersion,
         currentItemId: item && item.id ? item.id : null,
         syncStatus: syncLock ? 'syncing' : (state.error ? 'failed' : 'ready'),
-        syncError: state.error ? String(state.lastErrorCode || 'sync_failed').slice(0, 80) : null,
+        syncError: state.error ? String((state.lastErrorStage ? state.lastErrorStage + ':' : '') + (state.lastErrorCode || 'sync_failed')).slice(0, 80) : null,
         cachedMediaCount: state.cachedCount,
         storageUsageBytes: isFiniteNumber(state.stats.usage) ? state.stats.usage : null,
         storageQuotaBytes: isFiniteNumber(state.stats.quota) ? state.stats.quota : null,
