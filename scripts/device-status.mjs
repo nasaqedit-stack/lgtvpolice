@@ -47,10 +47,13 @@ function summarize(status) {
   };
   lines.push(`deployment: player=${status.deployment?.playerVersion} runtime=${status.deployment?.runtimeVersion} env=${status.deployment?.vercelEnv || '?'} sha=${String(status.deployment?.gitSha || '').slice(0, 7)}`);
   lines.push(`counts: screens=${status.counts?.screens} playlists=${status.counts?.playlists} media=${status.counts?.media}`);
-  if (status.schema) {
-    lines.push(`schema: player-health columns ${status.schema.playerHealthColumnsPresent}/${status.schema.playerHealthColumnsExpected} present` +
-      (status.schema.complete ? '' : ` MISSING: ${Object.entries(status.schema.columns).filter(([, ok]) => !ok).map(([name]) => name).join(', ') || 'none'}` +
-        ` | tables: ${Object.entries(status.schema.tables).map(([name, ok]) => `${name}=${ok ? 'yes' : 'NO'}`).join(' ')}`));
+  const schema = status.schema;
+  if (schema) {
+    const missing = Object.keys(schema.columns || {}).filter((name) => !schema.columns[name]);
+    const missingTables = Object.keys(schema.tables || {}).filter((name) => !schema.tables[name]);
+    lines.push(`schema: player-health columns ${schema.playerHealthColumnsPresent}/${schema.playerHealthColumnsExpected} present` +
+      (missing.length ? ` MISSING_COLUMNS: ${missing.join(', ')}` : '') +
+      (missingTables.length ? ` MISSING_TABLES: ${missingTables.join(', ')}` : ''));
   }
   if (status.storage) {
     lines.push(`storage: bucket=${status.storage.bucket} objects=${status.storage.objectCount} bytes=${status.storage.totalBytes}${status.storage.error ? ` error=${status.storage.error}` : ''}`);
@@ -117,7 +120,13 @@ async function main() {
     return;
   }
 
-  const report = summarize(status);
+  let report;
+  try { report = summarize(status); }
+  catch (error) {
+    console.log('could not summarize the response; raw body follows:');
+    console.log(raw.slice(0, 4000));
+    throw error;
+  }
   console.log(report);
   if (status.errors) console.log(`\ncollection errors:\n- ${status.errors.join('\n- ')}`);
   annotate('Device status summary', report);
