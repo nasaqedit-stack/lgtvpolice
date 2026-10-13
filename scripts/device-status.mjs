@@ -47,6 +47,11 @@ function summarize(status) {
   };
   lines.push(`deployment: player=${status.deployment?.playerVersion} runtime=${status.deployment?.runtimeVersion} env=${status.deployment?.vercelEnv || '?'} sha=${String(status.deployment?.gitSha || '').slice(0, 7)}`);
   lines.push(`counts: screens=${status.counts?.screens} playlists=${status.counts?.playlists} media=${status.counts?.media}`);
+  if (status.schema) {
+    lines.push(`schema: player-health columns ${status.schema.playerHealthColumnsPresent}/${status.schema.playerHealthColumnsExpected} present` +
+      (status.schema.complete ? '' : ` MISSING: ${Object.entries(status.schema.columns).filter(([, ok]) => !ok).map(([name]) => name).join(', ') || 'none'}` +
+        ` | tables: ${Object.entries(status.schema.tables).map(([name, ok]) => `${name}=${ok ? 'yes' : 'NO'}`).join(' ')}`));
+  }
   if (status.storage) {
     lines.push(`storage: bucket=${status.storage.bucket} objects=${status.storage.objectCount} bytes=${status.storage.totalBytes}${status.storage.error ? ` error=${status.storage.error}` : ''}`);
   }
@@ -63,6 +68,10 @@ function summarize(status) {
     lines.push(`  manifest v${screen.manifest?.latestVersion ?? '-'} age=${age(screen.manifest?.ageMs)} assets=${screen.manifest?.assetCount ?? '-'}`);
     const device = screen.deviceInfo || {};
     lines.push(`  device: ${device.userAgent || 'unknown UA'} | ${device.screenWidth}x${device.screenHeight} ${device.language || ''}`);
+    if (screen.heartbeatTotals) lines.push(`  heartbeats stored: total=${screen.heartbeatTotals.total} last24h=${screen.heartbeatTotals.last24h}`);
+    for (const code of (screen.pairingCodes || []).slice(0, 5)) {
+      lines.push(`  pairing code: created=${code.createdAt} used=${code.usedAt || 'not used'} attempts=${code.attempts}`);
+    }
     for (const beat of (screen.heartbeats || []).slice(0, 5)) {
       lines.push(`  beat ${age(beat.ageMs)}: ${beat.syncStatus} err=${beat.syncError || '-'} cached=${beat.cachedMediaCount} item=${beat.currentItemId ? String(beat.currentItemId).slice(0, 8) : '-'} player=${beat.deviceInfo?.playerVersion || '?'}/${beat.deviceInfo?.runtimeVersion || '?'}`);
     }
