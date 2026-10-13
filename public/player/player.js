@@ -103,7 +103,7 @@
    * which build a television is really running, and so the player can tell when the deployment has
    * moved on and adopt the new build.
    */
-  var PLAYER_VERSION = '3.0.0-5';
+  var PLAYER_VERSION = '3.0.0-6';
 
   function logLine(entry) {
     var when = '';

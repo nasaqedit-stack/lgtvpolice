@@ -26,7 +26,7 @@
 })(typeof self !== 'undefined' ? self : (typeof window !== 'undefined' ? window : this), function (root) {
   'use strict';
 
-  var VERSION = '2.2.0';
+  var VERSION = '2.2.1';
   var DB_NAME = 'digital-signage-player';  // unchanged: TVs already paired keep their data
   var DB_VERSION = 1;
   var DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024;
