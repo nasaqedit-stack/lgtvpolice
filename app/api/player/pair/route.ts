@@ -28,6 +28,11 @@ export async function POST(request: NextRequest) {
       platform: parsed.data.deviceInfo?.platform ?? 'browser',
       screenWidth: parsed.data.deviceInfo?.screenWidth ?? null,
       screenHeight: parsed.data.deviceInfo?.screenHeight ?? null,
+      language: parsed.data.deviceInfo?.language ?? null,
+      // Which build the device is running at pairing time. The heartbeat keeps it up to date, and
+      // it is the only way to know whether a television ever picked up a deployed player fix.
+      playerVersion: parsed.data.deviceInfo?.playerVersion ?? null,
+      runtimeVersion: parsed.data.deviceInfo?.runtimeVersion ?? null,
     };
     const { data: screenId, error } = await db.rpc('consume_pairing_code', {
       p_code_hash: hashHex(normalized),

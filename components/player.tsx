@@ -9,6 +9,7 @@ import {
   storeCredential,
 } from '@/lib/player/storage';
 import { PlayerSyncError, synchronizePlayer, type SyncProgress } from '@/lib/player/sync';
+import { PLAYER_RUNTIME_VERSION, PLAYER_VERSION } from '@/lib/player/standalone/shell';
 
 type SyncState = 'ready' | 'syncing' | 'failed' | 'never';
 type PlayerMediaUrl = { hash: string; url: string; kind: 'image' | 'video'; loop: boolean; name: string };
@@ -21,6 +22,9 @@ function deviceInfo() {
     screenWidth: window.screen?.width ?? 0,
     screenHeight: window.screen?.height ?? 0,
     language: navigator.language?.slice(0, 30),
+    // Same telemetry the standalone player sends: which build is actually executing on this device.
+    playerVersion: PLAYER_VERSION,
+    runtimeVersion: PLAYER_RUNTIME_VERSION,
   };
 }
 function getActiveItem(manifest: ScreenManifest | null, playlistId: string | null, index: number): { playlistId: string; playlistVersion: number; item: ManifestItem; count: number } | null {

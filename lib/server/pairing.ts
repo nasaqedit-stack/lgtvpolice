@@ -12,6 +12,11 @@ export const deviceInfoSchema = z.object({
   screenWidth: z.number().int().min(0).max(20000).optional(),
   screenHeight: z.number().int().min(0).max(20000).optional(),
   language: z.string().max(30).optional(),
+  // Which build this device is ACTUALLY executing. A television that has not reloaded since a
+  // deploy keeps reporting the previous build, and without these fields nobody can tell whether a
+  // fix ever reached the screen (it can only be seen from the device's own heartbeat).
+  playerVersion: z.string().max(40).optional(),
+  runtimeVersion: z.string().max(40).optional(),
 });
 export const pairRequestSchema = z.object({
   code: z.string().min(6).max(16),

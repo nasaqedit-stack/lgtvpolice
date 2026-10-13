@@ -3712,29 +3712,39 @@
    * 8. Pairing, heartbeat and diagnostics
    * ------------------------------------------------------------------------------------------ */
 
-  function deviceInfo(win) {
+  function deviceInfo(win, extra) {
     var nav = (win && win.navigator) || {};
-    return {
+    var info = {
       userAgent: safeString(nav.userAgent, 500),
       platform: safeString(nav.platform || 'browser', 120),
       screenWidth: (win && win.screen && win.screen.width) || 0,
       screenHeight: (win && win.screen && win.screen.height) || 0,
-      language: safeString(nav.language || '', 30)
+      language: safeString(nav.language || '', 30),
+      // Reported in every pairing and every heartbeat. A television keeps running the build it
+      // loaded, so this is the only honest answer to "which version is the TV on right now?".
+      runtimeVersion: VERSION
     };
+    // `extra` lets the UI layer add its own build (player.js) without the runtime knowing about it.
+    if (extra && typeof extra === 'object') {
+      for (var key in extra) {
+        if (hasOwn(extra, key) && typeof extra[key] === 'string') info[key] = safeString(extra[key], 40);
+      }
+    }
+    return info;
   }
 
   function normalizePairCode(code) {
     return safeString(code, 32).replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
   }
 
-  function pairScreen(win, http, storage, code) {
+  function pairScreen(win, http, storage, code, extraDeviceInfo) {
     var P = resolvePromise(null, win);
     var normalized = normalizePairCode(code);
     if (normalized.length !== 8) return P.reject(PlayerError('أدخل الرمز المكوّن من 8 أحرف.', 'invalid_pairing_code'));
     return http.request({
       method: 'POST', url: '/api/player/pair', responseType: 'text',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ code: normalized, deviceInfo: deviceInfo(win) }),
+      body: JSON.stringify({ code: normalized, deviceInfo: deviceInfo(win, extraDeviceInfo) }),
       timeoutMs: 30000
     }).then(function (response) {
       var payload = null;
