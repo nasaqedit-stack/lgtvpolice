@@ -47,6 +47,14 @@ function summarize(status) {
   };
   lines.push(`deployment: player=${status.deployment?.playerVersion} runtime=${status.deployment?.runtimeVersion} env=${status.deployment?.vercelEnv || '?'} sha=${String(status.deployment?.gitSha || '').slice(0, 7)}`);
   lines.push(`counts: screens=${status.counts?.screens} playlists=${status.counts?.playlists} media=${status.counts?.media}`);
+  const schema = status.schema;
+  if (schema) {
+    const missing = Object.keys(schema.columns || {}).filter((name) => !schema.columns[name]);
+    const missingTables = Object.keys(schema.tables || {}).filter((name) => !schema.tables[name]);
+    lines.push(`schema: player-health columns ${schema.playerHealthColumnsPresent}/${schema.playerHealthColumnsExpected} present` +
+      (missing.length ? ` MISSING_COLUMNS: ${missing.join(', ')}` : '') +
+      (missingTables.length ? ` MISSING_TABLES: ${missingTables.join(', ')}` : ''));
+  }
   if (status.storage) {
     lines.push(`storage: bucket=${status.storage.bucket} objects=${status.storage.objectCount} bytes=${status.storage.totalBytes}${status.storage.error ? ` error=${status.storage.error}` : ''}`);
   }
@@ -63,6 +71,10 @@ function summarize(status) {
     lines.push(`  manifest v${screen.manifest?.latestVersion ?? '-'} age=${age(screen.manifest?.ageMs)} assets=${screen.manifest?.assetCount ?? '-'}`);
     const device = screen.deviceInfo || {};
     lines.push(`  device: ${device.userAgent || 'unknown UA'} | ${device.screenWidth}x${device.screenHeight} ${device.language || ''}`);
+    if (screen.heartbeatTotals) lines.push(`  heartbeats stored: total=${screen.heartbeatTotals.total} last24h=${screen.heartbeatTotals.last24h}`);
+    for (const code of (screen.pairingCodes || []).slice(0, 5)) {
+      lines.push(`  pairing code: created=${code.createdAt} used=${code.usedAt || 'not used'} attempts=${code.attempts}`);
+    }
     for (const beat of (screen.heartbeats || []).slice(0, 5)) {
       lines.push(`  beat ${age(beat.ageMs)}: ${beat.syncStatus} err=${beat.syncError || '-'} cached=${beat.cachedMediaCount} item=${beat.currentItemId ? String(beat.currentItemId).slice(0, 8) : '-'} player=${beat.deviceInfo?.playerVersion || '?'}/${beat.deviceInfo?.runtimeVersion || '?'}`);
     }
@@ -108,7 +120,13 @@ async function main() {
     return;
   }
 
-  const report = summarize(status);
+  let report;
+  try { report = summarize(status); }
+  catch (error) {
+    console.log('could not summarize the response; raw body follows:');
+    console.log(raw.slice(0, 4000));
+    throw error;
+  }
   console.log(report);
   if (status.errors) console.log(`\ncollection errors:\n- ${status.errors.join('\n- ')}`);
   annotate('Device status summary', report);

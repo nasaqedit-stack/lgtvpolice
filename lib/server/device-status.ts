@@ -241,7 +241,7 @@ export function buildDeviceStatus(input: DeviceStatusInput, now: number = Date.n
       playlists: playlists.length,
       media: media.length,
     },
-    playlists: playlists.map(playlistView).filter(Boolean),
+    playlists: playlists.map((row) => playlistView(String(row.id))).filter(Boolean),
     media: media.map((row) => ({
       id: String(row.id),
       name: text(row.display_name, 120),
@@ -254,6 +254,44 @@ export function buildDeviceStatus(input: DeviceStatusInput, now: number = Date.n
     })),
     storage: input.storage || null,
     screens: screenReports,
+  };
+}
+
+/**
+ * Probes for the columns and tables that were added by later migrations.
+ *
+ * The heartbeat route deliberately degrades when the player-health columns are missing, so a
+ * project that skipped a migration keeps working — and silently loses every self-healing field
+ * (`player_state`, `boot_count`, command acknowledgements…). This probe turns that silence into a
+ * fact an operator can see.
+ */
+const OPTIONAL_SCREEN_COLUMNS = [
+  'player_state', 'player_state_since', 'last_applied_sync_version', 'last_applied_reload_version',
+  'recovery_count', 'last_recovery_at', 'last_recovery_reason', 'last_recovery_state',
+  'last_health_status', 'last_health_checked_at', 'last_boot_at', 'boot_count',
+] as const;
+
+const OPTIONAL_TABLES = ['submissions', 'submission_tokens', 'submission_events'] as const;
+
+export async function probeSchema(db: any) {
+  const columns: Record<string, boolean> = {};
+  for (const column of OPTIONAL_SCREEN_COLUMNS) {
+    // A tiny select is enough: PostgREST answers 42703/PGRST204 when the column does not exist.
+    const { error } = await db.from('screens').select(column).limit(1);
+    columns[column] = !error;
+  }
+  const tables: Record<string, boolean> = {};
+  for (const table of OPTIONAL_TABLES) {
+    const { error } = await db.from(table).select('id').limit(1);
+    tables[table] = !error;
+  }
+  const present = Object.values(columns).filter(Boolean).length;
+  return {
+    complete: present === OPTIONAL_SCREEN_COLUMNS.length && Object.values(tables).every(Boolean),
+    playerHealthColumnsPresent: present,
+    playerHealthColumnsExpected: OPTIONAL_SCREEN_COLUMNS.length,
+    columns,
+    tables,
   };
 }
 
@@ -372,8 +410,54 @@ export async function readDeviceStatus(db: any, now: number = Date.now()) {
     };
   }, { bucket: storageConfigSafe(), objectCount: null, totalBytes: null, objects: [], error: 'storage_unavailable' } as StorageReport);
 
+  const pairingCodes = await safe('pairing_codes', async () => {
+    const { data, error } = await db.from('pairing_codes')
+      .select('screen_id, expires_at, used_at, attempts, created_at')
+      .order('created_at', { ascending: false })
+      .limit(20);
+    if (error) throw error;
+    return (data || []) as Record<string, any>[];
+  }, [] as Record<string, any>[]);
+
+  const heartbeatTotals: Record<string, { total: number | null; last24h: number | null }> = {};
+  for (const screen of screens) {
+    const id = String(screen.id);
+    const total = await safe(`heartbeat_count[${id}]`, async () => {
+      const { count, error } = await db.from('screen_heartbeats').select('*', { count: 'exact', head: true }).eq('screen_id', id);
+      if (error) throw error;
+      return count;
+    }, null as number | null);
+    const recent = await safe(`heartbeat_count_24h[${id}]`, async () => {
+      const { count, error } = await db.from('screen_heartbeats')
+        .select('*', { count: 'exact', head: true })
+        .eq('screen_id', id)
+        .gte('received_at', new Date(now - 24 * 60 * 60_000).toISOString());
+      if (error) throw error;
+      return count;
+    }, null as number | null);
+    heartbeatTotals[id] = { total, last24h: recent };
+  }
+
+  const schema = await probeSchema(db);
+
   const status = buildDeviceStatus({ screens, heartbeats, credentials, manifests, playlists, playlistItems, media, storage }, now);
-  return { ...status, errors: errors.length ? errors : null };
+  const withExtras = {
+    ...status,
+    schema,
+    screens: status.screens.map((screen) => ({
+      ...screen,
+      heartbeatTotals: heartbeatTotals[screen.id] || null,
+      pairingCodes: pairingCodes
+        .filter((row) => String(row.screen_id) === screen.id)
+        .map((row) => ({
+          createdAt: iso(row.created_at),
+          expiresAt: iso(row.expires_at),
+          usedAt: iso(row.used_at),
+          attempts: Number(row.attempts) || 0,
+        })),
+    })),
+  };
+  return { ...withExtras, errors: errors.length ? errors : null };
 }
 
 function storageConfigSafe() {

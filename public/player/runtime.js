@@ -26,7 +26,7 @@
 })(typeof self !== 'undefined' ? self : (typeof window !== 'undefined' ? window : this), function (root) {
   'use strict';
 
-  var VERSION = '2.2.0';
+  var VERSION = '2.2.1';
   var DB_NAME = 'digital-signage-player';  // unchanged: TVs already paired keep their data
   var DB_VERSION = 1;
   var DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024;
@@ -1866,6 +1866,11 @@
     var integrityFailures = {};
     var preflightedAssetHashes = {};
     var preflightedAssetOrder = [];
+    // Assets this television could not store or could not prepare for playback. They are retried
+    // after a cooldown instead of on every single synchronization: one file a 2016 television
+    // cannot decode must not keep it re-downloading thirteen megabytes once a minute.
+    var deferredAssets = {};
+    var DEGRADED_RETRY_MS = 30 * 60 * 1000;
     // Hashes the player itself protects: whatever is on the screen right now, plus every asset of
     // the manifest being played. Garbage collection must never delete active media, even when the
     // incoming manifest no longer references it.
@@ -2252,24 +2257,82 @@
       while (preflightedAssetOrder.length > 1000) delete preflightedAssetHashes[preflightedAssetOrder.shift()];
     }
 
+    /**
+     * Loads every asset once into a media element before the playlist is allowed to replace what
+     * is on screen. Returns the hashes that could NOT be prepared rather than aborting the whole
+     * synchronization: the caller decides whether that is fatal (good content is already playing)
+     * or survivable (nothing is on screen and something playable beats nothing at all).
+     */
     function preflightManifestAssets(assets) {
-      if (!preflightAsset) return P.resolve(true);
+      if (!preflightAsset) return P.resolve([]);
       currentStage = 'render';
+      var failed = [];
       function next(index) {
-        if (index >= assets.length) return P.resolve(true);
+        if (index >= assets.length) return P.resolve(failed);
         var asset = assets[index];
         if (preflightedAssetHashes[asset.hash]) return next(index + 1);
         var result;
-        try { result = preflightAsset(asset); } catch (error) { return P.reject(error); }
+        try { result = preflightAsset(asset); }
+        catch (error) { failed.push(asset.hash); return next(index + 1); }
         return P.resolve(result).then(function (prepared) {
-          if (prepared === false) throw PlayerError('تعذر تجهيز الوسيط الجديد للتشغيل؛ بقي المحتوى الحالي نشطاً.', 'render_preflight_failed');
-          rememberPreflightedHash(asset.hash);
+          if (prepared === false) failed.push(asset.hash);
+          else rememberPreflightedHash(asset.hash);
           return next(index + 1);
-        }, function (error) {
-          throw PlayerError('تعذر تجهيز الوسيط الجديد للتشغيل؛ بقي المحتوى الحالي نشطاً.', 'render_preflight_failed');
-        });
+        }, function () { failed.push(asset.hash); return next(index + 1); });
       }
       return next(0);
+    }
+
+    /**
+     * Builds a manifest that contains only the assets this television can actually play.
+     *
+     * A signage screen that is dark because one file in the playlist is unusable is a worse
+     * outcome than a screen playing the rest of it, so a reduced manifest is activated when — and
+     * only when — there is no complete playlist on screen to fall back on. The atomic rule
+     * (never replace good content with a partial list) is untouched.
+     */
+    function reduceManifest(manifest, unavailableHashes) {
+      var dropped = {};
+      for (var i = 0; i < unavailableHashes.length; i += 1) dropped[unavailableHashes[i]] = true;
+      var out = {};
+      for (var key in manifest) { if (hasOwn(manifest, key)) out[key] = manifest[key]; }
+      var lists = Array.isArray(manifest.playlists) ? manifest.playlists : [];
+      var playlists = [];
+      var kept = {};
+      for (var p = 0; p < lists.length; p += 1) {
+        var list = lists[p] || {};
+        var source = Array.isArray(list.items) ? list.items : [];
+        var items = [];
+        for (var q = 0; q < source.length; q += 1) {
+          if (!source[q] || dropped[source[q].hash]) continue;
+          items.push(source[q]);
+          kept[source[q].hash] = true;
+        }
+        if (!items.length) continue;
+        var copy = {};
+        for (var field in list) { if (hasOwn(list, field)) copy[field] = list[field]; }
+        copy.items = items;
+        playlists.push(copy);
+      }
+      if (!playlists.length) return null;
+      out.playlists = playlists;
+      var rules = Array.isArray(manifest.schedules) ? manifest.schedules : [];
+      var schedules = [];
+      for (var r = 0; r < rules.length; r += 1) {
+        var usable = false;
+        for (var t = 0; t < playlists.length; t += 1) if (playlists[t].id === rules[r].playlistId) usable = true;
+        if (usable) schedules.push(rules[r]);
+      }
+      out.schedules = schedules;
+      var all = Array.isArray(manifest.assets) ? manifest.assets : [];
+      var assets = [];
+      for (var a = 0; a < all.length; a += 1) if (all[a] && kept[all[a].hash]) assets.push(all[a]);
+      out.assets = assets;
+      var fallback = playlists[0].id;
+      var stillPresent = false;
+      for (var d = 0; d < playlists.length; d += 1) if (playlists[d].id === manifest.defaultPlaylistId) stillPresent = true;
+      out.defaultPlaylistId = stillPresent ? manifest.defaultPlaylistId : fallback;
+      return out;
     }
 
     function quantity(list) {
@@ -2311,6 +2374,61 @@
             });
           }, function () { throw storageQuotaError(); });
         }); }
+      }
+
+      /**
+       * Commits one manifest (the complete one, or a reduced one) and reports how many assets had
+       * to be left out. `skipped` is what the heartbeat surfaces as a `degraded:` warning.
+       */
+    /**
+     * True when `previous` is the reduced form of this very revision: it carries the same manifest
+     * hash but is missing at least one of its assets. That is the steady state of a screen that is
+     * already showing everything it can show, so re-committing it is not a regression.
+     */
+    function isReducedCopyOf(previous, incoming) {
+      if (!previous || !previous.manifestHash || previous.manifestHash !== incoming.manifestHash) return false;
+      var have = {};
+      var lists = Array.isArray(previous.playlists) ? previous.playlists : [];
+      for (var i = 0; i < lists.length; i += 1) {
+        var items = Array.isArray(lists[i].items) ? lists[i].items : [];
+        for (var j = 0; j < items.length; j += 1) if (items[j]) have[items[j].hash] = true;
+      }
+      var all = uniqueAssets(incoming);
+      for (var k = 0; k < all.length; k += 1) if (!have[all[k].hash]) return true;
+      return false;
+    }
+
+      function commit(manifest, skipped, protect) {
+        return writeWithQuotaRecovery(function () {
+          return deferActivation ? storage.prepareManifest(manifest) : storage.activateManifest(manifest);
+        }).then(function () {
+          var at = nowIso();
+          var result = {
+            manifest: manifest,
+            changed: !previous || previous.manifestHash !== manifest.manifestHash,
+            lastSyncAt: at,
+            candidate: deferActivation,
+            skipped: skipped || 0
+          };
+          if (deferActivation) {
+            progress('ready', 'اكتملت مزامنة القائمة وتجهيزها بأمان.', { totalBytes: quantity(uniqueAssets(manifest)), downloadedBytes: quantity(uniqueAssets(manifest)) });
+            return result;
+          }
+          return P.resolve(storage.setLastSyncAt(at)).then(function () {
+            // Direct consumers retain the original eager-activation behavior. The
+            // shipped TV player opts into deferred activation and commits only after
+            // the first candidate frame has rendered successfully.
+            var protectedHashes = (protect || []).slice(0);
+            var manifestAssets = uniqueAssets(manifest);
+            for (var i = 0; i < manifestAssets.length; i += 1) {
+              if (protectedHashes.indexOf(manifestAssets[i].hash) === -1) protectedHashes.push(manifestAssets[i].hash);
+            }
+            return storage.deleteUnreferenced(protectedHashes.concat(activeHashes())).then(function () {
+              progress('ready', 'اكتملت المزامنة. يمكن الآن التشغيل دون إنترنت.', { totalBytes: quantity(uniqueAssets(manifest)), downloadedBytes: quantity(uniqueAssets(manifest)) });
+              return result;
+            }, function () { return result; });
+          }, function () { return result; });
+        });
       }
 
       function persistChunk(asset, index, bytes, meta) {
@@ -2381,9 +2499,17 @@
         return storage.deleteUnreferenced(protection(previous, targets)).then(function () {
           progress('checking', 'فحص التخزين المحلي والوسائط المطلوبة…');
           var pending = [];
+          var unavailable = {};
           function checkNext(index) {
             if (index >= assets.length) return P.resolve(pending);
             var asset = assets[index];
+            var deferredUntil = Number(deferredAssets[asset.hash]) || 0;
+            if (deferredUntil > Date.now()) {
+              // Inside its cooldown: do not spend the television's bandwidth on a file it could
+              // not use the last time. The activation step still counts it as unavailable.
+              unavailable[asset.hash] = true;
+              return checkNext(index + 1);
+            }
             return storage.hasCompleteAsset(asset.hash, asset.size, asset.mimeType).then(function (ok) {
               if (!ok || integrityFailures[asset.hash]) {
                 pending.push(asset);
@@ -2459,32 +2585,50 @@
                     });
                   }
                   return verifyAll(0).then(function (missing) {
-                    if (missing.length) throw PlayerError('لم تكتمل مزامنة كل الوسائط. تبقى قائمة التشغيل السابقة نشطة.', 'partial_sync');
-                    return preflightManifestAssets(assets).then(function () {
-                      return writeWithQuotaRecovery(function () {
-                        return deferActivation ? storage.prepareManifest(incoming) : storage.activateManifest(incoming);
-                      });
-                    }).then(function () {
-                      var at = nowIso();
-                      var result = {
-                        manifest: incoming,
-                        changed: !previous || previous.manifestHash !== incoming.manifestHash,
-                        lastSyncAt: at,
-                        candidate: deferActivation
-                      };
-                      if (deferActivation) {
-                        progress('ready', 'اكتملت مزامنة القائمة وتجهيزها بأمان.', { totalBytes: totalBytes, downloadedBytes: totalBytes });
-                        return result;
+                    // A file inside its cooldown is not probed again either: preparing 13 MB of
+                    // video for playback is not free on a television, and last time it said no.
+                    var probe = [];
+                    for (var q = 0; q < assets.length; q += 1) {
+                      if (!unavailable[assets[q].hash]) probe.push(assets[q]);
+                    }
+                    return preflightManifestAssets(probe).then(function (unplayable) {
+                      var skipped = missing.slice();
+                      for (var u = 0; u < unplayable.length; u += 1) {
+                        if (skipped.indexOf(unplayable[u]) === -1) skipped.push(unplayable[u]);
                       }
-                      return P.resolve(storage.setLastSyncAt(at)).then(function () {
-                        // Direct consumers retain the original eager-activation behavior. The
-                        // shipped TV player opts into deferred activation and commits only after
-                        // the first candidate frame has rendered successfully.
-                        return storage.deleteUnreferenced(targets.concat(activeHashes())).then(function () {
-                          progress('ready', 'اكتملت المزامنة. يمكن الآن التشغيل دون إنترنت.', { totalBytes: totalBytes, downloadedBytes: totalBytes });
-                          return result;
-                        }, function () { return result; });
-                      }, function () { return result; });
+                      for (var key in unavailable) { if (hasOwn(unavailable, key) && skipped.indexOf(key) === -1) skipped.push(key); }
+                      if (!skipped.length) return commit(incoming, 0, targets);
+                      var stage = missing.length ? 'partial_sync' : 'render_preflight_failed';
+                      var reduced = reduceManifest(incoming, skipped);
+                      if (!reduced) {
+                        currentStage = 'activate';
+                        throw PlayerError(
+                          stage === 'partial_sync'
+                            ? 'لم يكتمل تنزيل أي وسيط بعد. الشاشة تنتظر محتوى قابلاً للتشغيل.'
+                            : 'لا يمكن تشغيل أي من وسائط هذه القائمة على هذا الجهاز.',
+                          stage
+                        );
+                      }
+                      if (previous && !isReducedCopyOf(previous, incoming)) {
+                        // The atomic rule stands: a complete playlist that is already on screen is
+                        // never replaced by a partial one. Only two situations may degrade, and
+                        // they are the two below.
+                        currentStage = 'activate';
+                        throw PlayerError(
+                          stage === 'partial_sync'
+                            ? 'لم تكتمل مزامنة كل الوسائط. تبقى قائمة التشغيل السابقة نشطة.'
+                            : 'تعذر تجهيز الوسيط الجديد للتشغيل؛ بقي المحتوى الحالي نشطاً.',
+                          stage
+                        );
+                      }
+                      // 1. nothing is on screen yet: a screen that plays the files it CAN play
+                      //    beats a screen that stays dark waiting for one file this television may
+                      //    never be able to use.
+                      // 2. what is on screen is already the reduced form of this same revision:
+                      //    that is the steady state, not a regression.
+                      for (var d = 0; d < skipped.length; d += 1) deferredAssets[skipped[d]] = Date.now() + DEGRADED_RETRY_MS;
+                      if (!previous) log('degraded_activation', { skipped: skipped.length, stage: stage });
+                      return commit(reduced, skipped.length, targets);
                     });
                   });
                 });

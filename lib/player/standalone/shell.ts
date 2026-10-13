@@ -15,14 +15,14 @@
  *   2. `window.__signageGuard` shows a diagnostic and retries missing assets automatically without
  *      requiring a remote-control action or reloading the page.
  */
-export const PLAYER_VERSION = '3.0.0-5';
+export const PLAYER_VERSION = '3.0.0-6';
 
 /*
  * The version of public/player/runtime.js, mirrored here so the server knows which runtime build a
  * deployment serves and can compare it with the one a television reports back in its heartbeat.
  * `tests/player-standalone-runtime.test.ts` fails if the two ever drift apart.
  */
-export const PLAYER_RUNTIME_VERSION = '2.2.0';
+export const PLAYER_RUNTIME_VERSION = '2.2.1';
 
 export const PLAYER_ASSETS = ['/player/sha256.js', '/player/runtime.js', '/player/watchdog.js', '/player/player.js'] as const;
 
