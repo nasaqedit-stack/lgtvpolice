@@ -113,10 +113,14 @@ export function normalizePlayerState(value: unknown): PlayerState | null {
  * read goes through a nullable accessor so the route works either way.
  */
 export function deriveScreenHealth(raw: Record<string, any>, now: number = Date.now()): ScreenHealth {
+  const telemetry = raw && raw.device_info && typeof raw.device_info === 'object'
+    && raw.device_info.telemetry && typeof raw.device_info.telemetry === 'object'
+    ? (raw.device_info.telemetry as Record<string, any>)
+    : {};
   const lastHeartbeatAt = isoOrNull(raw.last_seen_at);
   const lastSyncAt = isoOrNull(raw.last_sync_at);
   const heartbeatAgeMs = lastHeartbeatAt ? Math.max(0, now - new Date(lastHeartbeatAt).getTime()) : null;
-  const reported = normalizePlayerState(raw.player_state);
+  const reported = normalizePlayerState(raw.player_state ?? telemetry.playerState);
   const neverConnected = !lastHeartbeatAt;
 
   let status: ScreenHealthStatus;
@@ -141,8 +145,8 @@ export function deriveScreenHealth(raw: Record<string, any>, now: number = Date.
     sync: Math.max(0, numberOr(raw.sync_command_version, 0)),
     reload: Math.max(0, numberOr(raw.reload_command_version, 0)),
   };
-  const appliedSync = nullableNumber(raw.last_applied_sync_version);
-  const appliedReload = nullableNumber(raw.last_applied_reload_version);
+  const appliedSync = nullableNumber(raw.last_applied_sync_version ?? telemetry.appliedSyncVersion);
+  const appliedReload = nullableNumber(raw.last_applied_reload_version ?? telemetry.appliedReloadVersion);
   const applied = { sync: appliedSync, reload: appliedReload };
   // A command is pending only when the player has actually acknowledged an older version. When the
   // migration is not applied yet the applied version is unknown and nothing is claimed as pending.
@@ -158,21 +162,24 @@ export function deriveScreenHealth(raw: Record<string, any>, now: number = Date.
     lastSyncAt,
     neverConnected,
     playerState: reported,
-    playerStateSince: isoOrNull(raw.player_state_since),
+    playerStateSince: isoOrNull(raw.player_state_since ?? telemetry.playerStateSince),
     command,
     applied,
     pendingCommands,
     recovery: {
-      state: nullableString(raw.last_recovery_state, 40),
-      count: Math.max(0, numberOr(raw.recovery_count, 0)),
-      lastAt: isoOrNull(raw.last_recovery_at),
-      reason: nullableString(raw.last_recovery_reason, 120),
+      state: nullableString(raw.last_recovery_state ?? telemetry.lastRecoveryState, 40),
+      count: Math.max(0, numberOr(raw.recovery_count ?? telemetry.recoveryCount, 0)),
+      lastAt: isoOrNull(raw.last_recovery_at ?? telemetry.lastRecoveryAt),
+      reason: nullableString(raw.last_recovery_reason ?? telemetry.lastRecoveryReason, 120),
     },
     health: {
-      status: nullableString(raw.last_health_status, 120),
-      checkedAt: isoOrNull(raw.last_health_checked_at),
+      status: nullableString(raw.last_health_status ?? telemetry.lastHealthStatus, 120),
+      checkedAt: isoOrNull(raw.last_health_checked_at ?? telemetry.lastHealthCheckedAt),
     },
-    boot: { count: Math.max(0, numberOr(raw.boot_count, 0)), lastAt: isoOrNull(raw.last_boot_at) },
+    boot: {
+      count: Math.max(0, numberOr(raw.boot_count, 0)),
+      lastAt: isoOrNull(raw.last_boot_at ?? telemetry.lastBootAt),
+    },
     syncStatus: typeof raw.last_sync_status === 'string' ? raw.last_sync_status : 'never',
     syncError: nullableString(raw.last_sync_error, 300),
   };

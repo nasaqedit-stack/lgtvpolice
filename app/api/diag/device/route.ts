@@ -2,6 +2,7 @@ import { NextResponse, type NextRequest } from 'next/server';
 import { errorResponse, HttpError } from '@/lib/server/http';
 import { requireGitHubOidc } from '@/lib/server/github-oidc';
 import { readDeviceStatus } from '@/lib/server/device-status';
+import { ensurePlayerHealthSchema } from '@/lib/server/schema-migration';
 import { createSupabaseAdmin } from '@/lib/server/supabase';
 
 export const runtime = 'nodejs';
@@ -34,9 +35,12 @@ async function handle(request: NextRequest) {
     }
     const identity = await requireGitHubOidc(request);
     const db = createSupabaseAdmin();
+    const shouldMigrate = request.method === 'POST' || request.nextUrl.searchParams.get('migrate') === '1';
+    const migration = shouldMigrate ? await ensurePlayerHealthSchema(db) : null;
     const status = await readDeviceStatus(db);
     return NextResponse.json({
       ...status,
+      ...(migration ? { migration } : {}),
       caller: {
         repository: identity.repository,
         workflowRef: identity.workflowRef,

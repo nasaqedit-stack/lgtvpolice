@@ -98,8 +98,8 @@ export async function buildManifestBase(db: any, screen: any) {
       // command it has already executed without having to trust its own storage alone, which is the
       // only defence against a reload replaying a reload.
       applied: {
-        syncVersion: Number(screen.last_applied_sync_version || 0),
-        reloadVersion: Number(screen.last_applied_reload_version || 0),
+        syncVersion: Number(screen.last_applied_sync_version ?? screen.device_info?.telemetry?.appliedSyncVersion ?? 0),
+        reloadVersion: Number(screen.last_applied_reload_version ?? screen.device_info?.telemetry?.appliedReloadVersion ?? 0),
       },
     },
   };

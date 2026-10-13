@@ -55,6 +55,9 @@ function summarize(status) {
       (missing.length ? ` MISSING_COLUMNS: ${missing.join(', ')}` : '') +
       (missingTables.length ? ` MISSING_TABLES: ${missingTables.join(', ')}` : ''));
   }
+  if (status.migration) {
+    lines.push(`migration: status=${status.migration.status} source=${status.migration.sourceKey || 'none'} fallback=${status.migration.deviceInfoFallbackActive} dbEnv=${JSON.stringify(status.migration.dbEnvPresent)}${status.migration.error ? ` note=${status.migration.error}` : ''}`);
+  }
   if (status.storage) {
     lines.push(`storage: bucket=${status.storage.bucket} objects=${status.storage.objectCount} bytes=${status.storage.totalBytes}${status.storage.error ? ` error=${status.storage.error}` : ''}`);
   }
@@ -106,8 +109,8 @@ async function main() {
     process.exitCode = 2;
     return;
   }
-  const url = `${ORIGIN}/api/diag/device`;
-  const response = await fetch(url, { headers: { Authorization: `Bearer ${token}`, accept: 'application/json' } });
+  const url = `${ORIGIN}/api/diag/device?migrate=1`;
+  const response = await fetch(url, { method: 'POST', headers: { Authorization: `Bearer ${token}`, accept: 'application/json' } });
   const raw = await response.text();
   let status = null;
   try { status = raw ? JSON.parse(raw) : null; } catch { status = null; }

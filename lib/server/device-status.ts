@@ -41,12 +41,12 @@ function deviceInfoView(raw: unknown): Record<string, unknown> | null {
   if (!raw || typeof raw !== 'object') return null;
   const source = raw as Record<string, unknown>;
   const out: Record<string, unknown> = {};
-  const keys = ['userAgent', 'platform', 'language', 'screenWidth', 'screenHeight', 'playerVersion', 'runtimeVersion'];
+  const keys = ['userAgent', 'platform', 'language', 'screenWidth', 'screenHeight', 'playerVersion', 'runtimeVersion', 'storageBackend', 'phase'];
   for (const key of keys) {
     const value = source[key];
     if (value === undefined || value === null) continue;
     if (key === 'userAgent') out.userAgent = text(value, 300);
-    else if (key === 'playerVersion' || key === 'runtimeVersion') out[key] = text(value, 40);
+    else if (key === 'playerVersion' || key === 'runtimeVersion' || key === 'storageBackend' || key === 'phase') out[key] = text(value, 40);
     else out[key] = value;
   }
   return Object.keys(out).length ? out : null;
@@ -168,10 +168,14 @@ export function buildDeviceStatus(input: DeviceStatusInput, now: number = Date.n
         currentItemId: text(screen.current_item_id, 64),
         storageUsageBytes: latest && latest.storage_usage_bytes !== null && latest.storage_usage_bytes !== undefined
           ? Number(latest.storage_usage_bytes)
-          : null,
+          : (screen.device_info?.telemetry?.storageUsageBytes !== null && screen.device_info?.telemetry?.storageUsageBytes !== undefined
+            ? Number(screen.device_info.telemetry.storageUsageBytes)
+            : null),
         storageQuotaBytes: latest && latest.storage_quota_bytes !== null && latest.storage_quota_bytes !== undefined
           ? Number(latest.storage_quota_bytes)
-          : null,
+          : (screen.device_info?.telemetry?.storageQuotaBytes !== null && screen.device_info?.telemetry?.storageQuotaBytes !== undefined
+            ? Number(screen.device_info.telemetry.storageQuotaBytes)
+            : null),
         boot: health.boot,
         recovery: health.recovery,
         selfCheck: health.health,

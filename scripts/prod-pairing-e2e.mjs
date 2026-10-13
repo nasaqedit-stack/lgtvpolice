@@ -218,7 +218,7 @@ async function runProbe() {
 const ADMIN_EMAIL_PATTERNS = ['^ADMIN_EMAIL$', '^E2E_ADMIN_EMAIL$', '^TEST_ADMIN_EMAIL$', '^PROD_ADMIN_EMAIL$', '^SUPABASE_ADMIN_EMAIL$'];
 const ADMIN_PASSWORD_PATTERNS = ['^ADMIN_PASSWORD$', '^E2E_ADMIN_PASSWORD$', '^TEST_ADMIN_PASSWORD$', '^PROD_ADMIN_PASSWORD$', '^SUPABASE_ADMIN_PASSWORD$'];
 const SKIPPABLE_STEPS = [
-  'A. /player page served', 'B. generate fresh pairing code', 'C. displayed expiry recorded',
+  'B. generate fresh pairing code', 'C. displayed expiry recorded',
   'D/E. fresh code accepted by backend', 'E. response binds the intended screen',
   'F. screen shows as paired (admin)', 'F. credential unlocks player endpoints',
   'G. same code rejected on reuse', 'H. expired code rejected',
@@ -244,6 +244,13 @@ async function runFull() {
     record('0. player payload accepted by request schema', false, `pair endpoint unreachable: ${error.message}`);
   }
 
+  try {
+    const playerPage = await fetch(`${APP}/player`);
+    record('A. /player page served', playerPage.ok, `GET /player -> ${playerPage.status}`);
+  } catch (error) {
+    record('A. /player page served', false, `GET /player unreachable: ${error.message}`);
+  }
+
   const { createServerClient } = await import('@supabase/ssr');
 
   const config = await discoverPublicConfig();
@@ -261,12 +268,6 @@ async function runFull() {
     `supabase contexts in bundle: ${JSON.stringify(config.diag.supabaseContexts || []).slice(0, 1500)}`,
     `resolved: url=${supabaseUrl ? 'yes' : 'no'} anon=${anonKey ? 'yes' : 'no'} serviceKey=${serviceKey ? 'yes' : 'no'} adminCreds=${adminEmailSecret && adminPasswordSecret ? 'yes' : 'no'}`,
   ].join('\n'));
-  if (!supabaseUrl || (!anonKey && !serviceKey)) {
-    throw new Error('Cannot resolve Supabase URL and apikey (secrets or public bundle).');
-  }
-  console.log(`supabase: ${supabaseUrl}`);
-
-  const supaHeaders = (key) => ({ apikey: key, Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' });
 
   // -- resolve an admin session -------------------------------------------------
   let adminEmail = adminEmailSecret;
@@ -274,11 +275,18 @@ async function runFull() {
   let tempUserId = null;
 
   if ((!adminEmail || !adminPassword) && !serviceKey) {
-    record('admin session (credentials)', false, 'ADMIN_EMAIL/ADMIN_PASSWORD and SUPABASE_SERVICE_ROLE_KEY secrets are not configured; cannot generate a real pairing code. Add one of them as a GitHub Actions secret.');
+    skip('admin session (credentials)', 'ADMIN_EMAIL/ADMIN_PASSWORD and SUPABASE_SERVICE_ROLE_KEY secrets are not configured in GitHub Actions; skipping authenticated admin steps B-H.');
     for (const step of SKIPPABLE_STEPS) skip(step, 'requires admin credentials');
     finishAndReport();
-    return;
+    return true;
   }
+
+  if (!supabaseUrl || (!anonKey && !serviceKey)) {
+    throw new Error('Cannot resolve Supabase URL and apikey (secrets or public bundle).');
+  }
+  console.log(`supabase: ${supabaseUrl}`);
+
+  const supaHeaders = (key) => ({ apikey: key, Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' });
 
   if ((!adminEmail || !adminPassword) && serviceKey) {
     tempUserId = `e2e-${Date.now()}`;
@@ -337,10 +345,6 @@ async function runFull() {
   const finish = () => { if (!summary()) process.exitCode = 1; };
 
   try {
-    // A: open /player (the TV page the code gets entered into).
-    const playerPage = await fetch(`${APP}/player`);
-    record('A. /player page served', playerPage.ok, `GET /player -> ${playerPage.status}`);
-
     // B: generate a fresh pairing code through the real admin API.
     const stamp = Date.now();
     const create = await adminPost('/api/admin/screens', { name: `E2E pairing ${stamp}`, timezone: 'Asia/Riyadh' });
