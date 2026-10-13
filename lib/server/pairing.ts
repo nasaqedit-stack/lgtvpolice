@@ -17,6 +17,11 @@ export const deviceInfoSchema = z.object({
   // fix ever reached the screen (it can only be seen from the device's own heartbeat).
   playerVersion: z.string().max(40).optional(),
   runtimeVersion: z.string().max(40).optional(),
+  // Which storage the television actually got (idb / cache / memory) and what the player is doing
+  // right now. Without these, "cachedMediaCount: 0" cannot be told apart from "the television has
+  // no persistent storage at all" or "the player never got as far as running a synchronization".
+  storageBackend: z.string().max(40).optional(),
+  phase: z.string().max(40).optional(),
 });
 export const pairRequestSchema = z.object({
   code: z.string().min(6).max(16),

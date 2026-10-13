@@ -80,8 +80,8 @@ function summarize(status) {
     if (!reportedPlayer) adoption = 'UNKNOWN (a build predating version telemetry)';
     else if (reportedPlayer === servedPlayer) adoption = `current (${reportedPlayer})`;
     else adoption = `STALE (running ${reportedPlayer}, serving ${servedPlayer})`;
-    const issued = screen.commands?.issued || {};
-    const applied = screen.commands?.applied || {};
+    const issued = h.commands?.issued || {};
+    const applied = h.commands?.applied || {};
     const reloadPending = Math.max(0, Number(issued.reload || 0) - Number(applied.reload || 0));
     lines.push(`  adoption: ${adoption} | reload command pending=${reloadPending} (a pending reload upgrades a build that cannot upgrade itself)`);
     lines.push(`  device: ${device.userAgent || 'unknown UA'} | ${device.screenWidth}x${device.screenHeight} ${device.language || ''}`);

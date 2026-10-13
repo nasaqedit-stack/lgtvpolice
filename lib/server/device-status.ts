@@ -41,12 +41,12 @@ function deviceInfoView(raw: unknown): Record<string, unknown> | null {
   if (!raw || typeof raw !== 'object') return null;
   const source = raw as Record<string, unknown>;
   const out: Record<string, unknown> = {};
-  const keys = ['userAgent', 'platform', 'language', 'screenWidth', 'screenHeight', 'playerVersion', 'runtimeVersion'];
+  const keys = ['userAgent', 'platform', 'language', 'screenWidth', 'screenHeight', 'playerVersion', 'runtimeVersion', 'storageBackend', 'phase'];
   for (const key of keys) {
     const value = source[key];
     if (value === undefined || value === null) continue;
     if (key === 'userAgent') out.userAgent = text(value, 300);
-    else if (key === 'playerVersion' || key === 'runtimeVersion') out[key] = text(value, 40);
+    else if (key === 'playerVersion' || key === 'runtimeVersion' || key === 'storageBackend' || key === 'phase') out[key] = text(value, 40);
     else out[key] = value;
   }
   return Object.keys(out).length ? out : null;

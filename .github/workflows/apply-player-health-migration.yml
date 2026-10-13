@@ -1,0 +1,37 @@
+name: Apply player-health migration
+
+# Until this migration is applied, a television's own state has nowhere to land: `player_state`,
+# `boot_count`, `recovery_count` and the command versions the screen actually executed are all
+# written to columns this migration adds. The application degrades gracefully without them, which
+# is exactly why they can stay missing for weeks — nothing errors, the device is just unreadable.
+#
+# The migration is written with `add column if not exists`, so it is safe to run twice and the
+# script verifies the columns afterwards instead of trusting the exit code.
+#
+# Manual: Actions -> Apply player-health migration -> Run workflow.
+# Pushing the script (or this workflow) to an arena/** branch re-runs the check, because
+# workflow_dispatch needs a token permission this project does not grant to CI.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['arena/**']
+    paths:
+      - 'scripts/apply-player-health-migration.mjs'
+      - '.github/workflows/apply-player-health-migration.yml'
+
+concurrency:
+  group: apply-player-health-migration
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    environment: Production
+    steps:
+      - uses: actions/checkout@v5
+      - name: Apply the migration
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: node scripts/apply-player-health-migration.mjs

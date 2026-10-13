@@ -131,6 +131,28 @@ describe('player version telemetry', () => {
       expect(beat.deviceInfo.runtimeVersion).toBe(PLAYER_RUNTIME_VERSION);
     }
   });
+
+  it('every heartbeat also says which storage the television got and what it is doing', async () => {
+    // "cachedMediaCount: 0" on a real screen was unreadable: it can mean nothing was downloaded,
+    // nothing was stored, or the player never ran a synchronization at all. These two fields tell
+    // those apart from the device itself, which is the only place the answer exists.
+    const fixture = buildFixture();
+    const plan = createTransport(fixture);
+    const page = tv({ transport: plan.transport });
+    await pairTv(page, fixture);
+    await bootTv(page);
+    await waitFor(page.win, page.clock, () => heartbeatCalls(page, plan).length > 0, 200);
+    await settle(page.win, page.clock, 60);
+
+    const beats = heartbeatCalls(page, plan);
+    expect(beats.length).toBeGreaterThan(0);
+    for (const beat of beats) {
+      expect(typeof beat.deviceInfo.storageBackend).toBe('string');
+      expect(beat.deviceInfo.storageBackend.length).toBeGreaterThan(0);
+      expect(typeof beat.deviceInfo.phase).toBe('string');
+      expect(beat.deviceInfo.phase.length).toBeGreaterThan(0);
+    }
+  });
 });
 
 describe('deploy adoption', () => {

@@ -103,7 +103,7 @@
    * which build a television is really running, and so the player can tell when the deployment has
    * moved on and adopt the new build.
    */
-  var PLAYER_VERSION = '3.0.0-6';
+  var PLAYER_VERSION = '3.0.0-7';
 
   function logLine(entry) {
     var when = '';
@@ -1510,7 +1510,14 @@
         storageUsageBytes: isFiniteNumber(state.stats.usage) ? state.stats.usage : null,
         storageQuotaBytes: isFiniteNumber(state.stats.quota) ? state.stats.quota : null,
         lastSyncAt: state.lastSyncAt || null,
-        deviceInfo: runtime.deviceInfo(win, { playerVersion: PLAYER_VERSION }),
+        deviceInfo: runtime.deviceInfo(win, {
+          playerVersion: PLAYER_VERSION,
+          // "cachedMediaCount: 0" alone cannot distinguish a television with no persistent storage
+          // from one that simply has not synchronized yet. Say which adapter is actually in use and
+          // what the player is doing, so the next heartbeat answers that from the device itself.
+          storageBackend: String((state.stats && state.stats.backend) || (storage && storage.backend) || 'unknown').slice(0, 40),
+          phase: String(state.phase || 'unknown').slice(0, 40)
+        }),
         // --- 24/7 self-healing telemetry -------------------------------------------------------
         // `playerState` is derived locally but is only ever PESSIMISTIC here: the server ignores it
         // for "online" and computes that from this authenticated heartbeat's own timestamp.
