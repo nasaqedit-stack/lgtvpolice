@@ -70,6 +70,20 @@ function summarize(status) {
     lines.push(`  credentials active=${screen.credentials?.active} revoked=${screen.credentials?.revoked} lastUsed=${screen.credentials?.lastUsedAt || 'never'}`);
     lines.push(`  manifest v${screen.manifest?.latestVersion ?? '-'} age=${age(screen.manifest?.ageMs)} assets=${screen.manifest?.assetCount ?? '-'}`);
     const device = screen.deviceInfo || {};
+    // Adoption: a television keeps running the build it loaded, so the version it reports is the
+    // only honest answer to "is my fix on the screen yet?". A screen that reports no version at
+    // all is running a build from before version telemetry existed — it can only be upgraded by a
+    // reload command (or by restarting the app), never by its own logic.
+    const servedPlayer = status.deployment?.playerVersion;
+    const reportedPlayer = screen.reportedPlayerVersion;
+    let adoption;
+    if (!reportedPlayer) adoption = 'UNKNOWN (a build predating version telemetry)';
+    else if (reportedPlayer === servedPlayer) adoption = `current (${reportedPlayer})`;
+    else adoption = `STALE (running ${reportedPlayer}, serving ${servedPlayer})`;
+    const issued = screen.commands?.issued || {};
+    const applied = screen.commands?.applied || {};
+    const reloadPending = Math.max(0, Number(issued.reload || 0) - Number(applied.reload || 0));
+    lines.push(`  adoption: ${adoption} | reload command pending=${reloadPending} (a pending reload upgrades a build that cannot upgrade itself)`);
     lines.push(`  device: ${device.userAgent || 'unknown UA'} | ${device.screenWidth}x${device.screenHeight} ${device.language || ''}`);
     if (screen.heartbeatTotals) lines.push(`  heartbeats stored: total=${screen.heartbeatTotals.total} last24h=${screen.heartbeatTotals.last24h}`);
     for (const code of (screen.pairingCodes || []).slice(0, 5)) {
