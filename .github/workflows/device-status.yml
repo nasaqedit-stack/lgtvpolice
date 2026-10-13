@@ -29,10 +29,13 @@ on:
   # This matters because dispatch needs a token permission the project does not grant to CI: the
   # check has to be runnable without any stored secret.
   push:
-    branches: ['arena/**']
+    branches: ['main', 'arena/**']
     paths:
       - 'scripts/device-status.mjs'
       - '.github/workflows/device-status.yml'
+      - 'app/api/diag/device/**'
+      - 'lib/server/device-status.ts'
+      - 'lib/server/schema-migration.ts'
 
 concurrency:
   group: device-status
