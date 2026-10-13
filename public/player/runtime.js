@@ -26,7 +26,7 @@
 })(typeof self !== 'undefined' ? self : (typeof window !== 'undefined' ? window : this), function (root) {
   'use strict';
 
-  var VERSION = '2.1.1';
+  var VERSION = '2.2.0';
   var DB_NAME = 'digital-signage-player';  // unchanged: TVs already paired keep their data
   var DB_VERSION = 1;
   var DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024;
@@ -372,20 +372,68 @@
    *   already paired and cached media keeps its credential and assets after this update.
    * ------------------------------------------------------------------------------------------ */
 
+  /**
+   * Converts a native IndexedDB failure into a PlayerError that says WHICH operation on WHICH store
+   * failed and the native DOMException name. A bare "transaction failed" tells an operator nothing;
+   * the diagnostic panel and the heartbeat need `idb_<op>_failed` plus the store to be actionable.
+   * Quota failures keep the shared `storage_quota` code so the sync's GC-and-retry path still runs.
+   */
+  function idbFailure(op, store, cause) {
+    var name = cause && cause.name ? safeString(cause.name, 60) : 'UnknownError';
+    var isQuota = name === 'QuotaExceededError' || Number(cause && cause.code) === 22;
+    var code = isQuota ? 'storage_quota' : 'idb_' + op + '_failed';
+    var error = PlayerError(isQuota
+      ? 'المساحة المحلية غير كافية.'
+      : 'فشلت عملية التخزين المحلي (' + op + ' على ' + store + '): ' + name, code);
+    error.idbOp = op;
+    error.idbStore = store;
+    error.idbCause = name;
+    error.idbMessage = safeString(cause && cause.message, 160);
+    return error;
+  }
+
   function idbRequest(P, request) {
     return new P(function (resolve, reject) {
       var settled = false;
       request.onsuccess = function () { if (!settled) { settled = true; resolve(request.result); } };
-      request.onerror = function () { if (!settled) { settled = true; reject(request.error || PlayerError('تعذر تنفيذ عملية تخزين محلي.', 'idb_request_failed')); } };
+      request.onerror = function () {
+        if (!settled) { settled = true; reject(request.error ? idbFailure('request', 'store', request.error) : PlayerError('تعذر تنفيذ عملية تخزين محلي.', 'idb_request_failed')); }
+      };
     });
   }
 
-  function idbTransactionDone(P, transaction) {
+  function idbTransactionDone(P, transaction, store) {
     return new P(function (resolve, reject) {
       var settled = false;
       transaction.oncomplete = function () { if (!settled) { settled = true; resolve(true); } };
-      transaction.onabort = function () { if (!settled) { settled = true; reject(transaction.error || PlayerError('أُلغيت عملية التخزين المحلي.', 'idb_aborted')); } };
-      transaction.onerror = function () { if (!settled) { settled = true; reject(transaction.error || PlayerError('فشلت عملية التخزين المحلي.', 'idb_failed')); } };
+      transaction.onabort = function () { if (!settled) { settled = true; reject(idbFailure('commit_aborted', store || 'transaction', transaction.error)); } };
+      transaction.onerror = function () { if (!settled) { settled = true; reject(idbFailure('commit_failed', store || 'transaction', transaction.error)); } };
+    });
+  }
+
+  /**
+   * Walks a store (or an index) with openCursor() and resolves with the matching rows.
+   *
+   * Chromium 38 (webOS 3.5) has no IDBObjectStore.getAll and no IDBIndex.getAll (added in Chrome 48),
+   * so every "read the whole table" operation in this runtime goes through this cursor walk.
+   */
+  function cursorRows(P, db, store, indexName, keyRange, keep) {
+    return new P(function (resolve, reject) {
+      var request;
+      try {
+        var tx = db.transaction(store, 'readonly');
+        var source = tx.objectStore(store);
+        if (indexName) source = source.index(indexName);
+        request = keyRange ? source.openCursor(keyRange) : source.openCursor();
+      } catch (error) { reject(idbFailure('cursor_open', store, error)); return; }
+      var rows = [];
+      request.onsuccess = function () {
+        var cursor = request.result;
+        if (!cursor) { resolve(rows); return; }
+        if (!keep || keep(cursor.value)) rows.push(cursor.value);
+        try { cursor['continue'](); } catch (error) { reject(idbFailure('cursor_continue', store, error)); }
+      };
+      request.onerror = function () { reject(idbFailure('cursor_read', store, request.error)); };
     });
   }
 
@@ -449,13 +497,7 @@
     });
   };
   IdbAdapter.prototype._getAll = function (store) {
-    var self = this;
-    var P = this.P;
-    return new P(function (resolve, reject) {
-      var tx;
-      try { tx = self.db.transaction(store, 'readonly'); } catch (error) { reject(error); return; }
-      idbRequest(P, tx.objectStore(store).getAll()).then(function (rows) { resolve(rows || []); }, reject);
-    });
+    return cursorRows(this.P, this.db, store, null, null, null);
   };
   IdbAdapter.prototype._put = function (store, value) {
     var self = this;
@@ -463,8 +505,8 @@
     return new P(function (resolve, reject) {
       var tx;
       try { tx = self.db.transaction(store, 'readwrite'); } catch (error) { reject(error); return; }
-      try { tx.objectStore(store).put(value); } catch (error) { reject(error); return; }
-      idbTransactionDone(P, tx).then(function () { resolve(value); }, reject);
+      try { tx.objectStore(store).put(value); } catch (error) { reject(idbFailure('put', store, error)); return; }
+      idbTransactionDone(P, tx, store).then(function () { resolve(value); }, reject);
     });
   };
   IdbAdapter.prototype._delete = function (store, key) {
@@ -473,51 +515,25 @@
     return new P(function (resolve, reject) {
       var tx;
       try { tx = self.db.transaction(store, 'readwrite'); } catch (error) { reject(error); return; }
-      try { tx.objectStore(store).delete(key); } catch (error) { reject(error); return; }
-      idbTransactionDone(P, tx).then(function () { resolve(true); }, reject);
+      try { tx.objectStore(store).delete(key); } catch (error) { reject(idbFailure('delete', store, error)); return; }
+      idbTransactionDone(P, tx, store).then(function () { resolve(true); }, reject);
     });
   };
   IdbAdapter.prototype._partsOf = function (hash) {
     var self = this;
     var P = this.P;
-    function cursorWalk() {
-      return new P(function (resolve, reject) {
-        var tx;
-        try { tx = self.db.transaction('parts', 'readonly'); } catch (error) { reject(error); return; }
-        var rows = [];
-        var walk;
-        try { walk = tx.objectStore('parts').openCursor(); } catch (error) { reject(error); return; }
-        walk.onsuccess = function () {
-          var cursor = walk.result;
-          if (!cursor) {
-            rows.sort(function (a, b) { return a.index - b.index; });
-            resolve(rows);
-            return;
-          }
-          if (cursor.value && cursor.value.hash === hash) rows.push(cursor.value);
-          try { cursor['continue'](); } catch (error) { resolve(rows); }
-        };
-        walk.onerror = function () { reject(walk.error || PlayerError('تعذر قراءة الأجزاء المحلية.', 'idb_request_failed')); };
-      });
+    function byIndex() {
+      var keyRange = (typeof IDBKeyRange !== 'undefined' && IDBKeyRange) || self.win.IDBKeyRange;
+      if (!keyRange || !isFn(keyRange.only)) return P.reject(PlayerError('IDBKeyRange غير متاح.', 'no_key_range'));
+      return cursorRows(P, self.db, 'parts', 'by-hash', keyRange.only(hash), function (row) { return row && row.hash === hash; });
     }
-    return new P(function (resolve) {
-      var tx;
-      try { tx = self.db.transaction('parts', 'readonly'); } catch (error) { resolve([]); return; }
-      var request;
-      try {
-        var keyRange = (typeof IDBKeyRange !== 'undefined' && IDBKeyRange) || self.win.IDBKeyRange;
-        if (!keyRange || !isFn(keyRange.only)) throw PlayerError('IDBKeyRange غير متاح.', 'no_key_range');
-        request = tx.objectStore('parts').index('by-hash').getAll(keyRange.only(hash));
-      } catch (error) {
-        cursorWalk().then(resolve, function () { resolve([]); });
-        return;
-      }
-      idbRequest(P, request).then(function (rows) {
-        var list = (rows || []).filter(function (row) { return row && row.hash === hash; });
-        list.sort(function (a, b) { return a.index - b.index; });
-        resolve(list);
-      }, function () { cursorWalk().then(resolve, function () { resolve([]); }); });
-    });
+    function byFullWalk() {
+      return cursorRows(P, self.db, 'parts', null, null, function (row) { return row && row.hash === hash; });
+    }
+    return byIndex().then(null, byFullWalk).then(function (rows) {
+      rows.sort(function (a, b) { return a.index - b.index; });
+      return rows;
+    }, function () { return []; });
   };
   IdbAdapter.prototype._partBytes = function (part) {
     var P = this.P;
@@ -660,8 +676,16 @@
           chunkSize: Number(meta.chunkSize),
           updatedAt: nowIso()
         });
-      } catch (error) { reject(error); return; }
-      idbTransactionDone(P, tx).then(function () { resolve(true); }, reject);
+      } catch (error) { reject(idbFailure('put', 'parts', error)); return; }
+      idbTransactionDone(P, tx, 'parts').then(function () {
+        // A chunk counts as stored only once it can be read back at the size that was written.
+        return self._get('parts', hash + ':' + index).then(function (row) {
+          if (!row || !row.buffer || row.buffer.byteLength !== buffer.byteLength) {
+            throw idbFailure('readback', 'parts', { name: 'ReadbackMismatch', message: 'chunk ' + index + ' missing or resized' });
+          }
+          resolve(true);
+        });
+      }).then(null, reject);
     });
   };
   IdbAdapter.prototype.finalizeAsset = function (hash, expectedSize, mimeType, chunkCount, chunkSize) {
@@ -684,8 +708,8 @@
             chunkSize: Number(chunkSize), verifiedAt: nowIso(), complete: true
           });
           tx.objectStore('partials').delete(hash);
-        } catch (error) { reject(error); return; }
-        idbTransactionDone(P, tx).then(function () { resolve(true); }, reject);
+        } catch (error) { reject(idbFailure('put', 'assets', error)); return; }
+        idbTransactionDone(P, tx, 'assets').then(function () { resolve(true); }, reject);
       });
     });
   };
@@ -1511,44 +1535,6 @@
     });
   }
 
-  function fetchRequest(win, spec) {
-    var P = resolvePromise(spec.Promise, win);
-    var url = spec.url;
-    var init = { method: spec.method || 'GET', headers: spec.headers || {} };
-    if (spec.body !== undefined && spec.body !== null) init.body = spec.body;
-    // AbortController is deliberately not used anywhere in this runtime: the timeout is enforced by
-    // racing the promise and ignoring a late response, which works on Chrome < 66.
-    return new P(function (resolve, reject) {
-      var settled = false;
-      var timer = null;
-      if (spec.timeoutMs) {
-        timer = win.setTimeout(function () {
-          if (!settled) { settled = true; reject(PlayerError('انتهت مدة الطلب قبل الرد.', 'timeout')); }
-        }, spec.timeoutMs);
-      }
-      win.fetch(url, init).then(function (response) {
-        if (settled) return null;
-        if (timer) { win.clearTimeout(timer); timer = null; }
-        var wantsBinary = spec.responseType === 'arraybuffer';
-        return (wantsBinary ? response.arrayBuffer() : response.text()).then(function (body) {
-          if (settled) return;
-          settled = true;
-          resolve(normalizeResponse({
-            status: response.status, url: url,
-            bytes: wantsBinary ? new Uint8Array(body) : null,
-            text: wantsBinary ? null : body,
-            headers: { get: function (name) { try { return response.headers.get(name); } catch (error) { return null; } } }
-          }));
-        });
-      }).then(null, function (error) {
-        if (settled) return;
-        if (timer) win.clearTimeout(timer);
-        settled = true;
-        reject(PlayerError(message(error, 'تعذر الاتصال بالشبكة.'), 'network_error'));
-      });
-    });
-  }
-
   function createHttp(win, options) {
     var opts = options || {};
     var log = isFn(opts.log) ? opts.log : noop;
@@ -1559,15 +1545,9 @@
       var finalSpec = extend({ Promise: P, timeoutMs: opts.timeoutMs || 60000 }, spec);
       if (transport) return transport(finalSpec);
       if (isFn(win.XMLHttpRequest)) {
-        return xhrRequest(win, finalSpec)['catch'](function (error) {
-          if (errorCode(error) === 'network_error' && isFn(win.fetch)) {
-            log('xhr_network_error_fetch_retry', { url: safeString(spec.url, 120) });
-            return fetchRequest(win, finalSpec);
-          }
-          throw error;
-        });
+        // XHR only: the legacy TV transport never falls back to fetch (not present on Chromium 38).
+        return xhrRequest(win, finalSpec);
       }
-      if (isFn(win.fetch)) return fetchRequest(win, finalSpec);
       return P.reject(PlayerError('المتصفح لا يدعم أي طريقة اتصال معتمدة.', 'no_http_transport'));
     };
     api.json = function (url, options2) {
@@ -1858,6 +1838,16 @@
     return hashes;
   }
 
+  /** Parses `Content-Range: bytes start-end/total`. Returns null when absent or not understood. */
+  function parseContentRange(value) {
+    var match = /^\s*bytes\s+(\d+)-(\d+)\/(\d+|\*)\s*$/i.exec(String(value === null || value === undefined ? '' : value));
+    if (!match) return null;
+    return { start: Number(match[1]), end: Number(match[2]), total: match[3] === '*' ? null : Number(match[3]) };
+  }
+
+  /** Stage names reported to the operator: which step of the synchronization failed. */
+  var PHASE_STAGE = { manifest: 'manifest', checking: 'storage', downloading: 'download', verifying: 'verify', activating: 'activate', ready: 'ready' };
+
   function createSync(options) {
     var win = options.win;
     var storage = options.storage;
@@ -1897,7 +1887,9 @@
       return hashes.concat(activeHashes());
     }
 
+    var currentStage = 'manifest';
     function progress(phase, text, values) {
+      if (PHASE_STAGE[phase]) currentStage = PHASE_STAGE[phase];
       var payload = { phase: phase, message: text, totalBytes: 0, downloadedBytes: 0 };
       if (values) {
         if (typeof values.totalBytes === 'number') payload.totalBytes = values.totalBytes;
@@ -1935,9 +1927,32 @@
       });
     }
 
+    /**
+     * Bounded retry for the small JSON calls (manifest, media URLs): two attempts in total.
+     * A transient transport failure or a 5xx answer gets one immediate second attempt. There is
+     * deliberately no delay here: a failing manifest must surface to the operator promptly, and
+     * longer outages are handled by the sync scheduler's own backoff. 401/403 are never retried,
+     * because repeating a refused credential only delays the diagnosis.
+     */
+    var JSON_ATTEMPTS = 2;
+    function authorizedRetrying(spec) {
+      var attempts = 0;
+      function once() {
+        attempts += 1;
+        return authorizedRequest(spec).then(function (response) {
+          if (response.status >= 500 && attempts < JSON_ATTEMPTS) return once();
+          return response;
+        }, function (error) {
+          if (errorCode(error) !== 'network_offline' || attempts >= JSON_ATTEMPTS) throw error;
+          return once();
+        });
+      }
+      return once();
+    }
+
     function mediaUrls(mediaIds) {
       if (!mediaIds.length) return P.resolve({});
-      return authorizedRequest({
+      return authorizedRetrying({
         method: 'POST', url: '/api/player/media-urls', responseType: 'text', timeoutMs: 15000,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ mediaIds: mediaIds })
@@ -2096,10 +2111,22 @@
               if (response.status === 401) throw authorizationResponseError(response);
               if (response.status === 403) throw PlayerError('رفض الخادم تنزيل الوسيط لهذه الشاشة.', 'download_rejected');
               if (response.status === 206) {
+                // When the origin reports the window it served, it must be the window we asked for.
+                // A mislabelled window would otherwise be stored as the wrong bytes at this offset.
+                var reported = parseContentRange(response.header('Content-Range'));
+                if (reported && (reported.start !== offset || reported.end !== end || (reported.total !== null && reported.total !== asset.size))) {
+                  failures += 1;
+                  if (failures >= maxRetries) throw PlayerError('الخادم أرجع نطاقاً لا يطابق الطلب (' + offset + '-' + end + ').', 'range_mismatch');
+                  return backoff(failures, 'range_mismatch').then(step);
+                }
                 var bytes = response.bytes ? toUint8(response.bytes) : new Uint8Array(0);
                 var expected = end - offset + 1;
                 if (bytes.length > expected) bytes = sliceBytes(bytes, 0, expected);
-                if (bytes.length !== expected) throw PlayerError('حجم جزء التنزيل غير مطابق.', 'range_size_mismatch');
+                if (bytes.length !== expected) {
+                  failures += 1;
+                  if (failures >= maxRetries) throw PlayerError('حجم جزء التنزيل غير مطابق.', 'range_size_mismatch');
+                  return backoff(failures, 'range_size_mismatch').then(step);
+                }
                 return persistChunk(asset, index, bytes, {
                   expectedSize: asset.size, mimeType: asset.mimeType, chunkSize: chunkSize
                 }).then(function () {
@@ -2228,6 +2255,7 @@
 
     function preflightManifestAssets(assets) {
       if (!preflightAsset) return P.resolve(true);
+      currentStage = 'render';
       function next(index) {
         if (index >= assets.length) return P.resolve(true);
         var asset = assets[index];
@@ -2252,6 +2280,14 @@
     }
 
     function run() {
+      currentStage = 'manifest';
+      return runPhases().then(null, function (error) {
+        if (error && typeof error === 'object' && !error.stage) error.stage = currentStage;
+        throw error;
+      });
+    }
+
+    function runPhases() {
       progress('manifest', 'التحقق من تحديثات المحتوى…');
       var previous = null;
       var incomingHashes = [];
@@ -2262,7 +2298,9 @@
           try { return P.resolve(writeOperation()); }
           catch (error) { return P.reject(error); }
         }
-        return write()['catch'](function (error) {
+        return writeWithQuotaRetry()['catch'](storageStage);
+
+        function writeWithQuotaRetry() { return write()['catch'](function (error) {
           if (!isQuotaError(error)) throw error;
           if (quotaRecoveryTried) throw storageQuotaError();
           quotaRecoveryTried = true;
@@ -2273,11 +2311,17 @@
               throw retryError;
             });
           }, function () { throw storageQuotaError(); });
-        });
+        }); }
       }
 
       function persistChunk(asset, index, bytes, meta) {
         return writeWithQuotaRecovery(function () { return storage.saveChunk(asset.hash, index, bytes, meta); });
+      }
+
+      // Every local-write failure is reported as stage "storage" (not as a download failure).
+      function storageStage(error) {
+        if (error && typeof error === 'object' && !error.stage) error.stage = 'storage';
+        throw error;
       }
 
       return storage.getActiveManifest().then(function (saved) {
@@ -2285,7 +2329,7 @@
         if (saved && !previous) log('cached_manifest_rejected', { reason: 'integrity_or_schema' });
         var headers = {};
         if (previous && previous.manifestHash) headers['If-None-Match'] = '"' + previous.manifestHash + '"';
-        return authorizedRequest({ method: 'GET', url: '/api/player/manifest', responseType: 'text', timeoutMs: 20000, headers: headers });
+        return authorizedRetrying({ method: 'GET', url: '/api/player/manifest', responseType: 'text', timeoutMs: 20000, headers: headers });
       }).then(function (response) {
         if (response.status === 304 && previous) {
           return verifyManifestAssets(previous).then(function (invalidAssets) {

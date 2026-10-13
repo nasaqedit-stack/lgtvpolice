@@ -52,7 +52,7 @@ export async function GET(request: NextRequest, context: Context) {
       }
     }
     const object = await getS3Client().send(new GetObjectCommand(command));
-    const body = object.Body ? Buffer.from(await object.Body.transformToByteArray()) : Buffer.alloc(0);
+    let body = object.Body ? Buffer.from(await object.Body.transformToByteArray()) : Buffer.alloc(0);
     const headers: Record<string, string> = {
       'Content-Type': media.mime_type,
       'Cache-Control': 'private, max-age=3600',
@@ -60,9 +60,21 @@ export async function GET(request: NextRequest, context: Context) {
       'X-Content-Type-Options': 'nosniff',
     };
     if (start !== null && end !== null) {
+      // Never label a body as a 206 unless it is exactly the window that was asked for. Some
+      // storage backends ignore Range and return the whole object: slice it here. Anything else is
+      // an upstream fault and is reported as such instead of being cached as corrupt media.
+      const wanted = end - start + 1;
+      if (body.length === size && size !== wanted) {
+        body = body.subarray(start, end + 1);
+      } else if (body.length !== wanted) {
+        throw new HttpError(502, 'تعذر قراءة الجزء المطلوب من التخزين.', 'upstream_range_mismatch');
+      }
       headers['Content-Range'] = `bytes ${start}-${end}/${size}`;
-      return new NextResponse(body, { status: 206, headers });
+      headers['Content-Length'] = String(body.length);
+      return new NextResponse(new Uint8Array(body), { status: 206, headers });
     }
-    return new NextResponse(body, { status: 200, headers });
+    if (body.length !== size) throw new HttpError(502, 'حجم الوسيط المخزن لا يطابق السجل.', 'upstream_size_mismatch');
+    headers['Content-Length'] = String(body.length);
+    return new NextResponse(new Uint8Array(body), { status: 200, headers });
   } catch (error) { return errorResponse(error); }
 }
