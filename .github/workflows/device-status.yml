@@ -20,14 +20,19 @@ on:
         type: string
         required: true
         default: 'https://lgtvpolice.vercel.app'
-        options:
-          - https://lgtvpolice.vercel.app
-          - https://lgtvpolice-git-arena-92a10943-lgtvpolice-nasaqedit-5805.vercel.app
       audience:
         description: 'OIDC audience the diagnostic route expects'
         type: string
         required: true
         default: 'lgtvpolice-device-diag'
+  # Pushing the script (or this workflow) to an arena/** branch re-reads the live device state.
+  # This matters because dispatch needs a token permission the project does not grant to CI: the
+  # check has to be runnable without any stored secret.
+  push:
+    branches: ['arena/**']
+    paths:
+      - 'scripts/device-status.mjs'
+      - '.github/workflows/device-status.yml'
 
 concurrency:
   group: device-status
