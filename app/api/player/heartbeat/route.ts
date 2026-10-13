@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { errorResponse, HttpError, readJson, requireScreen } from '@/lib/server/http';
 import { deviceInfoSchema } from '@/lib/server/pairing';
 import { isPlayerState, updateScreenHeartbeat } from '@/lib/server/screen-health';
+import { PLAYER_VERSION } from '@/lib/player/standalone/shell';
 
 export const runtime = 'nodejs';
 
@@ -125,6 +126,13 @@ export async function POST(request: NextRequest) {
       });
       if (insertError) throw insertError;
     }
-    return NextResponse.json({ ok: true, serverTime: nowIso }, { headers: { 'Cache-Control': 'no-store' } });
+    // `playerVersion` is the build this deployment serves (it is the cache-buster on every player
+    // asset). The player compares it with the build it is executing and, when they differ, adopts
+    // the new build once with a controlled reload — otherwise a television would keep running
+    // whatever it loaded for as long as it stays powered on.
+    return NextResponse.json(
+      { ok: true, serverTime: nowIso, playerVersion: PLAYER_VERSION },
+      { headers: { 'Cache-Control': 'no-store' } },
+    );
   } catch (error) { return errorResponse(error); }
 }

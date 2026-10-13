@@ -1,0 +1,52 @@
+name: Device status
+
+# Reads the LIVE state of the paired televisions from the database — heartbeat age, player state,
+# the `syncError` stage, the player/runtime build the TV is actually running, the cached media
+# count and the item currently on screen — and prints it into the run annotations.
+#
+# This is the only automated path that can prove a player fix reached a real device: unit tests use
+# mocks and the HTTP probes can only see that the deployment answers. The database is unreachable
+# from CI (RLS denies every public read), so the workflow authenticates to the deployment's
+# read-only diagnostic route with the OIDC identity token GitHub issues to this run. No secret is
+# stored in the repository and none has to be configured.
+#
+# Manual: Actions -> Device status -> Run workflow (pick the origin you want to inspect).
+
+on:
+  workflow_dispatch:
+    inputs:
+      origin:
+        description: 'Deployment to inspect'
+        type: string
+        required: true
+        default: 'https://lgtvpolice.vercel.app'
+        options:
+          - https://lgtvpolice.vercel.app
+          - https://lgtvpolice-git-arena-92a10943-lgtvpolice-nasaqedit-5805.vercel.app
+      audience:
+        description: 'OIDC audience the diagnostic route expects'
+        type: string
+        required: true
+        default: 'lgtvpolice-device-diag'
+
+concurrency:
+  group: device-status
+  cancel-in-progress: false
+
+jobs:
+  device-status:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: Read the live device status
+        env:
+          APP_ORIGIN: ${{ inputs.origin }}
+          DEVICE_DIAG_AUDIENCE: ${{ inputs.audience }}
+        run: node scripts/device-status.mjs

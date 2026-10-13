@@ -346,7 +346,22 @@ export type TransportPlan = {
   /** Transient failures that only affect media requests (signed and same-origin). */
   failMediaTimes?: number;
   corruptedImage?: boolean;
+  /**
+   * The build the deployment answers with in the heartbeat (`playerVersion`). Defaults to the
+   * build the shipped player.js declares, so existing tests see no version change at all.
+   * Set it to something else to exercise deploy adoption.
+   */
+  servedPlayerVersion?: string;
 };
+
+/** The build the shipped player.js declares (read from the file itself, never copied by hand). */
+function servedPlayerVersion(): string | undefined {
+  try {
+    const source = readFileSync(path.join(PLAYER_DIR, 'player.js'), 'utf8');
+    const match = /var\s+PLAYER_VERSION\s*=\s*'([^']+)'/.exec(source);
+    return match ? match[1] : undefined;
+  } catch { return undefined; }
+}
 
 export function createTransport(fixture: Fixture, plan: TransportPlan = {}) {
   const calls: TransportCall[] = [];
@@ -439,7 +454,12 @@ export function createTransport(fixture: Fixture, plan: TransportPlan = {}) {
           code: plan.heartbeatStatus === 401 ? 'screen_unauthorized' : 'temporary_error'
         }));
       }
-      return Promise.resolve(jsonResponse(200, { ok: true, serverTime: '2026-10-08T00:00:00.000Z' }));
+      // The heartbeat answers with the build this deployment serves so a television can adopt it.
+      return Promise.resolve(jsonResponse(200, {
+        ok: true,
+        serverTime: '2026-10-08T00:00:00.000Z',
+        playerVersion: plan.servedPlayerVersion === undefined ? servedPlayerVersion() : plan.servedPlayerVersion
+      }));
     }
 
     return Promise.resolve(emptyResponse(404));

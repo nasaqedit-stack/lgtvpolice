@@ -572,7 +572,9 @@ describe('pairing and heartbeat', () => {
       'cachedMediaCount', 'currentItemId', 'currentPlaylistId', 'currentPlaylistVersion',
       'deviceInfo', 'lastSyncAt', 'storageQuotaBytes', 'storageUsageBytes', 'syncError', 'syncStatus'
     ].sort());
-    expect(Object.keys(payload.deviceInfo).sort()).toEqual(['language', 'platform', 'screenHeight', 'screenWidth', 'userAgent']);
+    // `runtimeVersion` is the build this device is executing: without it nobody can tell whether a
+    // television ever picked up a deployed player fix.
+    expect(Object.keys(payload.deviceInfo).sort()).toEqual(['language', 'platform', 'runtimeVersion', 'screenHeight', 'screenWidth', 'userAgent']);
   });
 });
 

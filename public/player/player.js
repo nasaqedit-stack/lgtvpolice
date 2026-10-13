@@ -96,6 +96,15 @@
     return typeof value === 'function';
   }
 
+  /*
+   * The build this file belongs to. It MUST equal PLAYER_VERSION in lib/player/standalone/shell.ts
+   * (the cache-buster the HTML shell appends to every player asset); tests/player-standalone-boot.test.ts
+   * fails otherwise. The heartbeat carries it so the server — and therefore an operator — can see
+   * which build a television is really running, and so the player can tell when the deployment has
+   * moved on and adopt the new build.
+   */
+  var PLAYER_VERSION = '3.0.0-5';
+
   function logLine(entry) {
     var when = '';
     try { when = new Date(entry.at).toISOString().slice(11, 19); } catch (error) { when = ''; }
@@ -573,7 +582,7 @@
       requestFullscreen(win);
       paint();
       record('pair_start', null);
-      runtime.pairScreen(win, http, storage, code).then(function (result) {
+      runtime.pairScreen(win, http, storage, code, { playerVersion: PLAYER_VERSION }).then(function (result) {
         if (disposed) return false;
         state.pairing = false;
         state.token = result.credential;
@@ -1273,6 +1282,61 @@
       }, function () { return false; });
     }
 
+    /*
+     * Deploy adoption.
+     *
+     * A television runs the build it loaded — it has no service worker and never re-fetches
+     * /player on its own, so a deployment can be live for weeks without the device ever seeing it.
+     * When the server answers a heartbeat with a build different from the one executing here, the
+     * player adopts it with ONE controlled reload. Guards, in order:
+     *   - never while a synchronization is downloading (it waits and re-checks instead);
+     *   - at most one attempt per served build per browsing session (30 minutes), so a build that
+     *     cannot be fetched cannot turn into a reload loop;
+     *   - through `reloadNow`, the same rate-limited last-resort path the watchdog uses.
+     */
+    var deployAdoptionInFlight = false;
+
+    function deployAttemptKey(version) {
+      return 'signage.deployAdopt.' + String(version).replace(/[^0-9A-Za-z._-]/g, '').slice(0, 40);
+    }
+
+    function deployAlreadyAttempted(version) {
+      try {
+        if (!win.sessionStorage) return false;
+        var raw = win.sessionStorage.getItem(deployAttemptKey(version));
+        if (!raw) return false;
+        var at = Number(raw);
+        return isFinite(at) && at > 0 && Date.now() - at < 1800000;
+      } catch (error) { return false; }
+    }
+
+    function deployMarkAttempted(version) {
+      try {
+        if (win.sessionStorage) win.sessionStorage.setItem(deployAttemptKey(version), String(Date.now()));
+      } catch (error) { /* storage is optional; the in-flight flag still applies */ }
+    }
+
+    function adoptDeployedVersion(servedVersion) {
+      if (disposed || !servedVersion || servedVersion === PLAYER_VERSION) return false;
+      // Never interrupt a download. The next beat (30 s later) simply checks again, so the player
+      // converges on the deployed build without a timer that could fire inside a synchronization.
+      if (syncLock) {
+        record('deploy_adoption_deferred', { served: String(servedVersion).slice(0, 40), local: PLAYER_VERSION });
+        return false;
+      }
+      // The durable guard: it survives the reload, so a build that cannot be fetched can never turn
+      // into a reload loop. Checked before the in-flight flag so the operator can see it happen.
+      if (deployAlreadyAttempted(servedVersion)) {
+        record('deploy_adoption_skipped', { served: String(servedVersion).slice(0, 40), local: PLAYER_VERSION });
+        return false;
+      }
+      if (deployAdoptionInFlight) return false;
+      deployAdoptionInFlight = true;
+      deployMarkAttempted(servedVersion);
+      record('deploy_adoption_reload', { served: String(servedVersion).slice(0, 40), local: PLAYER_VERSION });
+      return reloadNow('deploy_version_change');
+    }
+
     /**
      * The ONLY place that reloads the page. It is used for the last-resort watchdog recovery and
      * for an explicit reload command from the admin app — never for a failed API request. It is
@@ -1435,7 +1499,7 @@
         storageUsageBytes: isFiniteNumber(state.stats.usage) ? state.stats.usage : null,
         storageQuotaBytes: isFiniteNumber(state.stats.quota) ? state.stats.quota : null,
         lastSyncAt: state.lastSyncAt || null,
-        deviceInfo: runtime.deviceInfo(win),
+        deviceInfo: runtime.deviceInfo(win, { playerVersion: PLAYER_VERSION }),
         // --- 24/7 self-healing telemetry -------------------------------------------------------
         // `playerState` is derived locally but is only ever PESSIMISTIC here: the server ignores it
         // for "online" and computes that from this authenticated heartbeat's own timestamp.
@@ -1484,6 +1548,15 @@
           state.online = true;
           renderStatusBar();
         }
+        // The heartbeat answers with the build this deployment currently serves. A television keeps
+        // executing whatever it loaded, so without this a fix can be live in production for weeks
+        // and never reach the screen. Adoption is a single guarded reload (see adoptDeployedVersion).
+        var servedVersion = null;
+        try {
+          var beatBody = response.json();
+          if (beatBody && typeof beatBody.playerVersion === 'string') servedVersion = beatBody.playerVersion;
+        } catch (error) { servedVersion = null; }
+        if (servedVersion) adoptDeployedVersion(servedVersion);
         // Success: the server validated the credential and recorded this instant. The watchdog then
         // re-arms the next beat and, after an outage, drives RECONNECTING -> SYNC -> ONLINE.
         wd('markHeartbeat', []);
