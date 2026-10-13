@@ -103,7 +103,7 @@
    * which build a television is really running, and so the player can tell when the deployment has
    * moved on and adopt the new build.
    */
-  var PLAYER_VERSION = '3.0.0-6';
+  var PLAYER_VERSION = '3.0.0-7';
 
   function logLine(entry) {
     var when = '';
@@ -960,6 +960,14 @@
           state.manifest = previous;
           state.playing = Boolean(previous && runtime.hasPlayableContent(previous));
           if (state.playing) state.phase = 'playing';
+          else {
+            state.phase = 'error';
+            state.error = TEXTS.syncFailed;
+            state.lastSyncError = 'manifest_render_rejected';
+            state.lastErrorCode = 'manifest_render_rejected';
+            state.lastErrorStage = 'render';
+            wd('noteSyncFailure', ['manifest_render_rejected']);
+          }
           record('manifest_render_rejected', { manifestVersion: manifest.manifestVersion, hash: String(manifest.manifestHash || '').slice(0, 12) });
         }
         return P.resolve(applyCommands(manifest)).then(function () {
@@ -1165,16 +1173,19 @@
       state.error = '';
       record('sync_start', null);
       if (!state.playing) paint();
-      var activeSync;
-      try {
-        activeSync = syncFactory(syncOptions(token));
-      } catch (error) {
-        syncLock = false;
-        state.lastErrorCode = runtime.errorCode(error);
-        state.error = TEXTS.syncFailed;
-        record('sync_init_failed', { code: state.lastErrorCode });
-        wd('noteSyncFailure', ['sync_init_failed']);
-        return P.resolve(false);
+      var activeSync = sync && token === state.token ? sync : null;
+      if (!activeSync) {
+        try {
+          activeSync = syncFactory(syncOptions(token));
+          if (token === state.token) sync = activeSync;
+        } catch (error) {
+          syncLock = false;
+          state.lastErrorCode = runtime.errorCode(error);
+          state.error = TEXTS.syncFailed;
+          record('sync_init_failed', { code: state.lastErrorCode });
+          wd('noteSyncFailure', ['sync_init_failed']);
+          return P.resolve(false);
+        }
       }
       var syncOperation;
       try { syncOperation = activeSync.run(); }
@@ -1211,8 +1222,11 @@
         return P.resolve(applyManifest(result.manifest, result.lastSyncAt)).then(function (activated) {
           if (result.candidate && !activated) record('candidate_kept_pending', { hash: String(result.manifest.manifestHash || '').slice(0, 12) });
           syncLock = false;
-          return refreshStorageState(true);
-        }).then(function () { return true; });
+          return refreshStorageState(true).then(function () {
+            wd('scheduleBeat', [2000]);
+            return Boolean(activated);
+          });
+        });
       }, function (error) {
         syncLock = false;
         if (disposed) return false;
@@ -1257,10 +1271,14 @@
           state.phase = 'playing';
           state.playing = true;
           paint();
-          return P.resolve(refreshStorageState()).then(function () { return false; });
+          return P.resolve(refreshStorageState()).then(function () {
+            if (code !== 'network_offline') wd('scheduleBeat', [2000]);
+            return false;
+          });
         }
         state.phase = code === 'no_published_content' ? 'no_content' : 'error';
         paint();
+        if (code !== 'network_offline') wd('scheduleBeat', [2000]);
         return false;
       })['catch'](function (error) {
         // The promise chain itself must never produce an unhandled rejection.
@@ -1496,21 +1514,35 @@
         }
       }
       var watch = wd('snapshot', []) || {};
+      var effectiveSyncStatus = 'syncing';
+      if (syncLock) effectiveSyncStatus = 'syncing';
+      else if (state.error || state.phase === 'error' || state.phase === 'no_content') effectiveSyncStatus = 'failed';
+      else if (state.manifest && hasPlayableContent()) effectiveSyncStatus = 'ready';
+      var effectiveSyncError = null;
+      if (state.error) {
+        effectiveSyncError = String((state.lastErrorStage ? state.lastErrorStage + ':' : '') + (state.lastErrorCode || 'sync_failed')).slice(0, 80);
+      } else if (state.phase === 'no_content') {
+        effectiveSyncError = 'manifest:no_published_content';
+      } else if (state.degradedReason) {
+        effectiveSyncError = String('degraded:' + state.degradedReason).slice(0, 80);
+      }
       var payload = {
         currentPlaylistId: playlistId || null,
         currentPlaylistVersion: playlistVersion,
         currentItemId: item && item.id ? item.id : null,
-        syncStatus: syncLock ? 'syncing' : (state.error ? 'failed' : 'ready'),
+        syncStatus: effectiveSyncStatus,
         // `syncError` carries a warning too: a playlist that plays with assets left out is not a
         // failure (playback continues) but it is also not healthy, and the operator must see it.
-        syncError: state.error
-          ? String((state.lastErrorStage ? state.lastErrorStage + ':' : '') + (state.lastErrorCode || 'sync_failed')).slice(0, 80)
-          : (state.degradedReason ? String('degraded:' + state.degradedReason).slice(0, 80) : null),
+        syncError: effectiveSyncError,
         cachedMediaCount: state.cachedCount,
         storageUsageBytes: isFiniteNumber(state.stats.usage) ? state.stats.usage : null,
         storageQuotaBytes: isFiniteNumber(state.stats.quota) ? state.stats.quota : null,
         lastSyncAt: state.lastSyncAt || null,
-        deviceInfo: runtime.deviceInfo(win, { playerVersion: PLAYER_VERSION }),
+        deviceInfo: runtime.deviceInfo(win, {
+          playerVersion: PLAYER_VERSION,
+          storageBackend: storage && storage.backend ? String(storage.backend) : '',
+          phase: String(state.phase || '')
+        }),
         // --- 24/7 self-healing telemetry -------------------------------------------------------
         // `playerState` is derived locally but is only ever PESSIMISTIC here: the server ignores it
         // for "online" and computes that from this authenticated heartbeat's own timestamp.
@@ -1770,6 +1802,7 @@
         state.storage = adapter;
         state.online = false; // network hints never claim a confirmed heartbeat or authenticated sync
         record('storage', { backend: adapter.backend });
+        try { refreshStorageState(true); } catch (error) { record('storage_state_failed', { code: runtime.errorCode(error) }); }
 
         // Credentials and command bookkeeping are read in parallel with the cached playlist, but
         // neither can delay local playback. Only the cached manifest + a bounded resume lookup are

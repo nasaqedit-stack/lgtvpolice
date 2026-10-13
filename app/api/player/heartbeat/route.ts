@@ -88,20 +88,57 @@ export async function POST(request: NextRequest) {
     };
     const claimedSyncAt = clampPast(value.lastSyncAt ?? value.lastSyncOkAt, 30 * 24 * 60 * 60_000, now);
     if (claimedSyncAt) base.last_sync_at = claimedSyncAt;
-    if (value.deviceInfo) base.device_info = value.deviceInfo;
-
     const reportedState = isPlayerState(value.playerState) ? value.playerState : null;
+    const prevDeviceInfo = screen && screen.device_info && typeof screen.device_info === 'object'
+      ? (screen.device_info as Record<string, unknown>)
+      : {};
+    const prevTelemetry = prevDeviceInfo.telemetry && typeof prevDeviceInfo.telemetry === 'object'
+      ? (prevDeviceInfo.telemetry as Record<string, unknown>)
+      : {};
+    const playerStateSince = reportedState
+      ? (reportedState !== (screen.player_state ?? prevTelemetry.playerState) ? nowIso : (screen.player_state_since ?? prevTelemetry.playerStateSince ?? nowIso))
+      : (screen.player_state_since ?? prevTelemetry.playerStateSince ?? null);
+    const recoveryAt = clampPast(value.recovery?.lastAt, 30 * 24 * 60 * 60_000, now) ?? (prevTelemetry.lastRecoveryAt as string | null) ?? null;
+    const healthCheckedAt = clampPast(value.healthCheckedAt, 30 * 24 * 60 * 60_000, now) ?? (prevTelemetry.lastHealthCheckedAt as string | null) ?? null;
+    const bootAt = clampPast(value.bootAt, 30 * 24 * 60 * 60_000, now) ?? (prevTelemetry.lastBootAt as string | null) ?? null;
+
+    // Mirror self-healing and storage telemetry inside `device_info.telemetry` so command ACKs,
+    // storage usage, and recovery diagnostics are preserved even when the optional
+    // `20261008010000_player_health.sql` columns have not yet been applied to `screens`.
+    const telemetry: Record<string, unknown> = {
+      ...prevTelemetry,
+      playerState: reportedState ?? prevTelemetry.playerState ?? null,
+      playerStateSince,
+      appliedSyncVersion: value.appliedSyncVersion ?? prevTelemetry.appliedSyncVersion ?? null,
+      appliedReloadVersion: value.appliedReloadVersion ?? prevTelemetry.appliedReloadVersion ?? null,
+      consecutiveFailures: value.consecutiveFailures ?? prevTelemetry.consecutiveFailures ?? 0,
+      recoveryCount: value.recovery?.count ?? prevTelemetry.recoveryCount ?? 0,
+      lastRecoveryAt: recoveryAt,
+      lastRecoveryReason: safeReason(value.recovery?.reason) ?? prevTelemetry.lastRecoveryReason ?? null,
+      lastRecoveryState: safeReason(value.recovery?.state)?.slice(0, 40) ?? prevTelemetry.lastRecoveryState ?? null,
+      lastHealthStatus: safeReason(value.healthStatus) ?? prevTelemetry.lastHealthStatus ?? null,
+      lastHealthCheckedAt: healthCheckedAt,
+      lastBootAt: bootAt,
+      storageUsageBytes: value.storageUsageBytes ?? prevTelemetry.storageUsageBytes ?? null,
+      storageQuotaBytes: value.storageQuotaBytes ?? prevTelemetry.storageQuotaBytes ?? null,
+    };
+    base.device_info = {
+      ...prevDeviceInfo,
+      ...(value.deviceInfo || {}),
+      telemetry,
+    };
+
     const extended: Record<string, unknown> = {
       player_state: reportedState,
       last_applied_sync_version: value.appliedSyncVersion ?? undefined,
       last_applied_reload_version: value.appliedReloadVersion ?? undefined,
       recovery_count: value.recovery?.count,
-      last_recovery_at: clampPast(value.recovery?.lastAt, 30 * 24 * 60 * 60_000, now) ?? undefined,
+      last_recovery_at: recoveryAt ?? undefined,
       last_recovery_reason: safeReason(value.recovery?.reason),
       last_recovery_state: safeReason(value.recovery?.state)?.slice(0, 40),
       last_health_status: safeReason(value.healthStatus),
-      last_health_checked_at: clampPast(value.healthCheckedAt, 30 * 24 * 60 * 60_000, now) ?? undefined,
-      last_boot_at: clampPast(value.bootAt, 30 * 24 * 60 * 60_000, now) ?? undefined,
+      last_health_checked_at: healthCheckedAt ?? undefined,
+      last_boot_at: bootAt ?? undefined,
     };
     // Only move `player_state_since` when the reported state actually changed.
     if (reportedState && reportedState !== screen.player_state) extended.player_state_since = nowIso;
@@ -110,7 +147,15 @@ export async function POST(request: NextRequest) {
 
     const { data: recentHeartbeat, error: recentError } = await db.from('screen_heartbeats').select('received_at').eq('screen_id', screen.id).order('received_at', { ascending: false }).limit(1).maybeSingle();
     if (recentError) throw recentError;
-    if (!recentHeartbeat || Date.now() - new Date(recentHeartbeat.received_at).getTime() >= 5 * 60_000) {
+    const recentAgeMs = recentHeartbeat ? now - new Date(recentHeartbeat.received_at).getTime() : Number.POSITIVE_INFINITY;
+    const stateTransitioned = recentAgeMs >= 5_000 && (
+      value.syncStatus !== (screen.last_sync_status ?? null)
+      || (value.syncError ?? null) !== (screen.last_sync_error ?? null)
+      || value.cachedMediaCount !== Number(screen.cached_media_count ?? 0)
+      || (value.currentPlaylistId ?? null) !== (screen.current_playlist_id ?? null)
+      || (value.currentItemId ?? null) !== (screen.current_item_id ?? null)
+    );
+    if (!recentHeartbeat || recentAgeMs >= 5 * 60_000 || stateTransitioned) {
       const { error: insertError } = await db.from('screen_heartbeats').insert({
         screen_id: screen.id,
         received_at: nowIso,

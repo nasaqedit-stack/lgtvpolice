@@ -26,7 +26,7 @@
 })(typeof self !== 'undefined' ? self : (typeof window !== 'undefined' ? window : this), function (root) {
   'use strict';
 
-  var VERSION = '2.2.1';
+  var VERSION = '2.2.2';
   var DB_NAME = 'digital-signage-player';  // unchanged: TVs already paired keep their data
   var DB_VERSION = 1;
   var DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024;
@@ -663,6 +663,7 @@
   IdbAdapter.prototype.saveChunk = function (hash, index, bytes, meta) {
     var P = this.P;
     var self = this;
+    if (this._verifiedAssetHashes) delete this._verifiedAssetHashes[hash];
     var buffer = copyBuffer(bytes);
     return new P(function (resolve, reject) {
       var tx;
@@ -738,6 +739,7 @@
   IdbAdapter.prototype.clearAsset = function (hash) {
     var self = this;
     var P = this.P;
+    if (this._verifiedAssetHashes) delete this._verifiedAssetHashes[hash];
     return this._partsOf(hash).then(function (parts) {
       return new P(function (resolve) {
         var tx;
@@ -848,6 +850,7 @@
     }, function () { return 0; });
   };
   IdbAdapter.prototype.getStats = function () {
+    var self = this;
     var win = this.win;
     var P = this.P;
     var stats = { usage: null, quota: null, persisted: null, backend: this.backend, notes: this.notes };
@@ -872,8 +875,22 @@
         } catch (error) { resolve(false); }
       }));
     }
-    if (!pending.length) return P.resolve(stats);
-    return P.all(pending).then(function () { return stats; }, function () { return stats; });
+    var base = pending.length ? P.all(pending).then(function () { return stats; }, function () { return stats; }) : P.resolve(stats);
+    return base.then(function (resolved) {
+      if (resolved.usage !== null) return resolved;
+      return self._getAll('assets').then(function (rows) {
+        var bytes = 0;
+        var found = false;
+        for (var i = 0; i < rows.length; i += 1) {
+          if (rows[i] && rows[i].complete && typeof rows[i].size === 'number' && rows[i].size > 0) {
+            bytes += rows[i].size;
+            found = true;
+          }
+        }
+        if (found) resolved.usage = bytes;
+        return resolved;
+      }, function () { return resolved; });
+    });
   };
   IdbAdapter.prototype.requestPersistence = function () {
     var win = this.win;
@@ -1035,6 +1052,7 @@
   };
   CacheAdapter.prototype.saveChunk = function (hash, index, bytes, meta) {
     var self = this;
+    if (this._verifiedAssetHashes) delete this._verifiedAssetHashes[hash];
     var view = toUint8(bytes);
     return this._putBytes(this._url(hash, 'part-' + index + '.bin'), view, 'application/octet-stream').then(function () {
       return self._assetRecord(hash);
@@ -1093,6 +1111,7 @@
   };
   CacheAdapter.prototype.clearAsset = function (hash) {
     var self = this;
+    if (this._verifiedAssetHashes) delete this._verifiedAssetHashes[hash];
     var prefix = this.prefix + hash + '/';
     return new this.P(function (resolve) {
       self.cache.keys().then(function (requests) {
@@ -1193,7 +1212,40 @@
     });
   };
   CacheAdapter.prototype.getStats = function () {
-    return this.P.resolve({ usage: null, quota: null, persisted: null, backend: this.backend, notes: this.notes });
+    var self = this;
+    return new this.P(function (resolve) {
+      self.cache.keys().then(function (requests) {
+        var recordUrls = [];
+        for (var i = 0; i < requests.length; i += 1) {
+          var text = typeof requests[i] === 'string' ? requests[i] : (requests[i].url || '');
+          if (text.indexOf('/record.json') === -1) continue;
+          if (text.indexOf(self.prefix + 'meta/') !== -1) continue;
+          recordUrls.push(text);
+        }
+        if (!recordUrls.length) {
+          resolve({ usage: null, quota: null, persisted: null, backend: self.backend, notes: self.notes });
+          return;
+        }
+        var bytes = 0;
+        var found = false;
+        function readNext(index) {
+          if (index >= recordUrls.length) {
+            resolve({ usage: found ? bytes : null, quota: null, persisted: null, backend: self.backend, notes: self.notes });
+            return;
+          }
+          self._getJson(recordUrls[index]).then(function (record) {
+            if (record && record.complete && typeof record.size === 'number' && record.size > 0) {
+              bytes += record.size;
+              found = true;
+            }
+            readNext(index + 1);
+          }, function () { readNext(index + 1); });
+        }
+        readNext(0);
+      }, function () {
+        resolve({ usage: null, quota: null, persisted: null, backend: self.backend, notes: self.notes });
+      });
+    });
   };
   CacheAdapter.prototype.requestPersistence = function () { return this.P.resolve(null); };
   CacheAdapter.prototype.close = function () { return this.P.resolve(true); };
@@ -1279,6 +1331,7 @@
     return this.P.resolve(out);
   };
   MemoryAdapter.prototype.saveChunk = function (hash, index, bytes, meta) {
+    if (this._verifiedAssetHashes) delete this._verifiedAssetHashes[hash];
     var record = this.assets[hash];
     if (!record) { record = { hash: hash, parts: [], complete: false }; this.assets[hash] = record; }
     record.mimeType = meta.mimeType;
@@ -1321,6 +1374,7 @@
     try { return this.P.resolve(new this.win.Blob(pieces, { type: record.mimeType })); } catch (error) { return this.P.resolve(null); }
   };
   MemoryAdapter.prototype.clearAsset = function (hash) {
+    if (this._verifiedAssetHashes) delete this._verifiedAssetHashes[hash];
     var record = this.assets[hash];
     if (record) {
       for (var i = 0; i < record.parts.length; i += 1) if (record.parts[i]) this.usage -= record.parts[i].bytes.length;
@@ -1727,9 +1781,18 @@
   function manifestBase(value) {
     var base = {};
     for (var key in value) {
-      if (hasOwn(value, key) && key !== 'manifestVersion' && key !== 'manifestHash' && key !== 'generatedAt') base[key] = value[key];
+      if (hasOwn(value, key) && key !== 'manifestVersion' && key !== 'manifestHash' && key !== 'generatedAt'
+        && key !== 'sourceManifestHash' && key !== 'skippedAssetHashes') {
+        base[key] = value[key];
+      }
     }
     return base;
+  }
+
+  function computeManifestHash(value, shaModule) {
+    var digest = createHasher(root, shaModule);
+    digest.update(utf8Bytes(stableJson(manifestBase(value))));
+    return digest.digestHex();
   }
 
   function isManifest(value) {
@@ -1798,9 +1861,7 @@
 
   function verifyManifestHash(value, shaModule) {
     try {
-      var digest = createHasher(root, shaModule);
-      digest.update(utf8Bytes(stableJson(manifestBase(value))));
-      return digest.digestHex() === value.manifestHash;
+      return computeManifestHash(value, shaModule) === value.manifestHash;
     } catch (error) { return false; }
   }
 
@@ -2199,10 +2260,15 @@
         verifiedAssetOrder.push(hash);
       }
       while (verifiedAssetOrder.length > 2048) delete verifiedAssetHashes[verifiedAssetOrder.shift()];
+      if (storage && typeof storage === 'object') {
+        if (!storage._verifiedAssetHashes) storage._verifiedAssetHashes = {};
+        storage._verifiedAssetHashes[hash] = true;
+      }
     }
 
     function verifyAsset(asset) {
-      if (verifiedAssetHashes[asset.hash] && !integrityFailures[asset.hash]) return P.resolve(true);
+      if ((verifiedAssetHashes[asset.hash] || (storage && storage._verifiedAssetHashes && storage._verifiedAssetHashes[asset.hash]))
+          && !integrityFailures[asset.hash]) return P.resolve(true);
       // Incremental SHA-256 over the stored parts, yielding to the event loop between parts so the
       // TV never freezes while a large video is verified. This also audits bytes restored from IDB.
       var digest = createHasher(win, shaModule);
@@ -2332,6 +2398,9 @@
       var stillPresent = false;
       for (var d = 0; d < playlists.length; d += 1) if (playlists[d].id === manifest.defaultPlaylistId) stillPresent = true;
       out.defaultPlaylistId = stillPresent ? manifest.defaultPlaylistId : fallback;
+      out.sourceManifestHash = manifest.sourceManifestHash || manifest.manifestHash;
+      out.skippedAssetHashes = unavailableHashes.slice(0);
+      out.manifestHash = computeManifestHash(out, shaModule);
       return out;
     }
 
@@ -2386,7 +2455,9 @@
      * already showing everything it can show, so re-committing it is not a regression.
      */
     function isReducedCopyOf(previous, incoming) {
-      if (!previous || !previous.manifestHash || previous.manifestHash !== incoming.manifestHash) return false;
+      if (!previous || !incoming) return false;
+      var previousSourceHash = previous.sourceManifestHash || previous.manifestHash;
+      if (!previousSourceHash || previousSourceHash !== incoming.manifestHash) return false;
       var have = {};
       var lists = Array.isArray(previous.playlists) ? previous.playlists : [];
       for (var i = 0; i < lists.length; i += 1) {
@@ -2445,7 +2516,7 @@
         previous = saved && isManifest(saved) && verifyManifestHash(saved, shaModule) ? saved : null;
         if (saved && !previous) log('cached_manifest_rejected', { reason: 'integrity_or_schema' });
         var headers = {};
-        if (previous && previous.manifestHash) headers['If-None-Match'] = '"' + previous.manifestHash + '"';
+        if (previous && previous.manifestHash && !previous.sourceManifestHash) headers['If-None-Match'] = '"' + previous.manifestHash + '"';
         return authorizedRetrying({ method: 'GET', url: '/api/player/manifest', responseType: 'text', timeoutMs: 20000, headers: headers });
       }).then(function (response) {
         if (response.status === 304 && previous) {
@@ -2671,9 +2742,10 @@
             element.onload = null;
             element.onerror = null;
             element.oncanplay = null;
+            element.onloadeddata = null;
             element.onloadedmetadata = null;
             try { if (element.tagName && element.tagName.toLowerCase() === 'video') element.pause(); } catch (pauseError) { noop(); }
-            try { element.removeAttribute('src'); if (isFn(element.load)) element.load(); } catch (loadError) { noop(); }
+            try { element.src = ''; element.removeAttribute('src'); if (isFn(element.load)) element.load(); } catch (loadError) { noop(); }
             if (element.parentNode) { try { element.parentNode.removeChild(element); } catch (removeError) { noop(); } }
           }
           try { urlApi.revokeObjectURL(url); } catch (revokeError) { noop(); }
@@ -2685,12 +2757,14 @@
             element = win.document.createElement('img');
             element.className = 'sp-preflight-image';
             element.alt = '';
-            element.style.position = 'absolute';
-            element.style.left = '-10000px';
+            element.style.position = 'fixed';
+            element.style.left = '0';
             element.style.top = '0';
             element.style.width = '1px';
             element.style.height = '1px';
-            element.style.opacity = '0';
+            element.style.opacity = '0.01';
+            element.style.pointerEvents = 'none';
+            element.style.zIndex = '-1';
             element.onload = function () {
               var width = Number(element.naturalWidth || element.width || 0);
               if (width <= 0) { finish(PlayerError('تعذر فك ترميز الصورة الجديدة.', 'render_preflight_failed')); return; }
@@ -2705,27 +2779,30 @@
             element.playsInline = true;
             element.setAttribute('playsinline', 'playsinline');
             element.setAttribute('webkit-playsinline', 'webkit-playsinline');
-            element.style.position = 'absolute';
-            element.style.left = '-10000px';
+            element.style.position = 'fixed';
+            element.style.left = '0';
             element.style.top = '0';
             element.style.width = '1px';
             element.style.height = '1px';
-            element.style.opacity = '0';
+            element.style.opacity = '0.01';
+            element.style.pointerEvents = 'none';
+            element.style.zIndex = '-1';
             var canPlay = '';
             try { if (isFn(element.canPlayType)) canPlay = element.canPlayType(asset.mimeType) || ''; } catch (canPlayError) { canPlay = ''; }
             if (asset.mimeType === 'video/mp4' && canPlay === '') {
               finish(PlayerError('هذا المتصفح لا يعلن دعمه لصيغة الفيديو المطلوبة.', 'render_preflight_failed'));
               return;
             }
+            element.onloadeddata = function () { finish(null); };
             element.oncanplay = function () { finish(null); };
             element.onloadedmetadata = function () {
-              if (Number(element.readyState) >= 3) finish(null);
+              if (Number(element.videoWidth) > 0 || Number(element.readyState) >= 1 || Number(element.duration) > 0) finish(null);
             };
             element.onerror = function () { finish(PlayerError('تعذر فك ترميز الفيديو الجديد.', 'render_preflight_failed')); };
           }
           timeout = win.setTimeout(function () {
             finish(PlayerError('انتهت مهلة تجهيز الوسيط الجديد؛ بقي المحتوى الحالي نشطاً.', 'render_preflight_failed'));
-          }, settings.timeoutMs || (asset.mimeType && asset.mimeType.indexOf('video/') === 0 ? 30000 : 15000));
+          }, settings.timeoutMs || 15000);
           win.document.body.appendChild(element);
           element.src = url;
           if (element.tagName && element.tagName.toLowerCase() === 'video' && isFn(element.load)) element.load();
@@ -2923,6 +3000,8 @@
     }
     function clearVideoSource(video) {
       if (!video) return;
+      video.onloadedmetadata = null;
+      video.onloadeddata = null;
       video.oncanplay = null;
       video.oncanplaythrough = null;
       video.onplay = null;
@@ -2990,7 +3069,8 @@
         previous: previous,
         commitStarted: false,
         resolve: null,
-        startedAt: Date.now()
+        startedAt: Date.now(),
+        triedCount: 0
       };
       var result = new P(function (resolve) { next.resolve = resolve; });
       state.pendingManifestSwitch = next;
@@ -3160,9 +3240,27 @@
         mount(item, source);
       }, function () { state.stallAttempts = 0; advance(); });
     }
+    function tryAdvanceColdCandidate(reason) {
+      var pending = state.pendingManifestSwitch;
+      if (!pending || pending.commitStarted) return false;
+      var prev = pending.previous;
+      if (prev && (prev.mounted || prev.manifest)) return false;
+      var current = activeItem(state.manifest, state.playlistId, state.index);
+      var total = current && current.count ? Number(current.count) : 0;
+      if (total <= 1) return false;
+      pending.triedCount = (Number(pending.triedCount) || 0) + 1;
+      if (pending.triedCount >= total) return false;
+      pending.startedAt = Date.now();
+      state.pendingMediaSince = pending.startedAt;
+      state.stallAttempts = 0;
+      log('candidate_cold_fallback_next_item', { reason: reason, triedCount: pending.triedCount, total: total });
+      advance();
+      return true;
+    }
     function handleStall(reason) {
       if (state.pendingManifestSwitch && !state.pendingManifestSwitch.commitStarted) {
         if (Date.now() - state.pendingManifestSwitch.startedAt >= renderTimeoutMs) {
+          if (tryAdvanceColdCandidate('candidate_render_timeout')) return;
           rollbackManifestSwitch('candidate_render_timeout');
           return;
         }
@@ -3252,6 +3350,16 @@
           if (isAutoplayBlocked(error) && !preferMuted) reportAudioBlocked(error, video, generation);
           else { log('video_play_failed', { message: message(error, 'play failed') }); armStall('video_play_failed'); }
         });
+      } else if (!preferMuted) {
+        // Chromium 38 HTMLMediaElement.play() returns undefined instead of a Promise. If audible
+        // autoplay is blocked by the TV browser without throwing, the video stays paused; fall back
+        // to muted autoplay automatically after a short grace period.
+        win.setTimeout(function () {
+          if (generation !== state.playbackGeneration || preferMuted) return;
+          if (video.paused && !video.ended && !state.suppressMediaEvents) {
+            reportAudioBlocked({ name: 'NotAllowedError', message: 'autoplay_paused_without_promise' }, video, generation);
+          }
+        }, 350);
       }
     }
 
@@ -3399,7 +3507,7 @@
       video.volume = 1;
       if (item.loop) video.setAttribute('loop', 'loop');
       else video.removeAttribute('loop');
-      video.oncanplay = function () {
+      function onVideoReady() {
         if (generation !== state.playbackGeneration) return;
         commitPendingManifestSwitch(function () {
           applyPendingSeek(video, item);
@@ -3407,7 +3515,13 @@
           armStall('video');
           tryPlay(video, generation);
         });
+      }
+      video.onloadedmetadata = function () {
+        if (generation !== state.playbackGeneration) return;
+        if (Number(video.videoWidth) > 0 || Number(video.readyState) >= 1) onVideoReady();
       };
+      video.onloadeddata = onVideoReady;
+      video.oncanplay = onVideoReady;
       video.oncanplaythrough = function () {
         if (generation !== state.playbackGeneration) return;
         if (video.paused && !video.ended) resumeVideo(video, generation, 'canplaythrough');
@@ -3466,6 +3580,14 @@
       if (generation !== state.playbackGeneration) return;
       log('media_error', { hash: safeString(item.hash, 12), kind: kind, source: source && source.kind });
       if (state.pendingManifestSwitch && !state.pendingManifestSwitch.commitStarted && failedElement !== state.element) {
+        if (failedElement === state.pendingImage) {
+          removeImage(failedElement);
+          state.pendingImage = null;
+          state.pendingImageUrl = null;
+        } else if (failedElement && failedElement.tagName && failedElement.tagName.toLowerCase() === 'video') {
+          clearVideoSource(failedElement);
+        }
+        if (tryAdvanceColdCandidate('candidate_media_error')) return;
         rollbackManifestSwitch('candidate_media_error');
         return;
       }
@@ -3513,7 +3635,10 @@
     }
 
     function verifyLocalAsset(item) {
-      if (locallyVerified[item.hash]) return P.resolve(true);
+      if (locallyVerified[item.hash] || (storage && storage._verifiedAssetHashes && storage._verifiedAssetHashes[item.hash])) {
+        locallyVerified[item.hash] = true;
+        return P.resolve(true);
+      }
       var digest;
       try { digest = createHasher(win, shaModule); } catch (error) { return P.reject(error); }
       return storage.getAssetParts(item.hash).then(function (parts) {
@@ -3526,6 +3651,10 @@
             locallyVerified[item.hash] = true;
             locallyVerifiedOrder.push(item.hash);
             while (locallyVerifiedOrder.length > 2048) delete locallyVerified[locallyVerifiedOrder.shift()];
+            if (storage && typeof storage === 'object') {
+              if (!storage._verifiedAssetHashes) storage._verifiedAssetHashes = {};
+              storage._verifiedAssetHashes[item.hash] = true;
+            }
             return P.resolve(true);
           }
           var part = parts[index];

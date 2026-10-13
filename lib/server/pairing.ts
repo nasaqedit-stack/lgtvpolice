@@ -17,6 +17,8 @@ export const deviceInfoSchema = z.object({
   // fix ever reached the screen (it can only be seen from the device's own heartbeat).
   playerVersion: z.string().max(40).optional(),
   runtimeVersion: z.string().max(40).optional(),
+  storageBackend: z.string().max(40).optional(),
+  phase: z.string().max(40).optional(),
 });
 export const pairRequestSchema = z.object({
   code: z.string().min(6).max(16),

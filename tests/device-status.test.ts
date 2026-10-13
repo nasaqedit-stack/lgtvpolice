@@ -178,8 +178,67 @@ describe('buildDeviceStatus', () => {
     expect(serialized).not.toContain('token_hash');
     expect(serialized).not.toContain('credential-');
     for (const key of Object.keys(buildDeviceStatus(baseInput(), NOW).screens[0].deviceInfo || {})) {
-      expect(['userAgent', 'platform', 'language', 'screenWidth', 'screenHeight', 'playerVersion', 'runtimeVersion']).toContain(key);
+      expect(['userAgent', 'platform', 'language', 'screenWidth', 'screenHeight', 'playerVersion', 'runtimeVersion', 'storageBackend', 'phase']).toContain(key);
     }
+  });
+
+  it('recovers self-healing and storage telemetry from device_info.telemetry when player-health columns are unmigrated', () => {
+    const status = buildDeviceStatus(baseInput({
+      screen: {
+        player_state: undefined,
+        player_state_since: undefined,
+        last_applied_sync_version: undefined,
+        last_applied_reload_version: undefined,
+        recovery_count: undefined,
+        last_recovery_at: undefined,
+        last_recovery_reason: undefined,
+        last_recovery_state: undefined,
+        last_health_status: undefined,
+        last_health_checked_at: undefined,
+        last_boot_at: undefined,
+        boot_count: undefined,
+        sync_command_version: 2,
+        reload_command_version: 1,
+        device_info: {
+          userAgent: 'Mozilla/5.0 (Web0S; Linux/SmartTV) Chrome/38.0.2125.122',
+          platform: 'Linux',
+          playerVersion: '3.0.0-7',
+          runtimeVersion: '2.2.2',
+          storageBackend: 'indexeddb',
+          phase: 'playing',
+          telemetry: {
+            playerState: 'online',
+            playerStateSince: RECENT,
+            appliedSyncVersion: 2,
+            appliedReloadVersion: 1,
+            recoveryCount: 1,
+            lastRecoveryAt: RECENT,
+            lastRecoveryReason: 'sync_ok',
+            lastRecoveryState: 'online',
+            lastHealthStatus: 'ok',
+            lastHealthCheckedAt: RECENT,
+            lastBootAt: OLD,
+            storageUsageBytes: 13_892_859,
+            storageQuotaBytes: null,
+          },
+        },
+      },
+      heartbeats: { [SCREEN_ID]: [] },
+    }), NOW);
+    const tv = status.screens[0];
+    expect(tv.health.playerState).toBe('online');
+    expect(tv.health.commands.applied).toEqual({ sync: 2, reload: 1 });
+    expect(tv.health.commands.pending).toBe(0);
+    expect(tv.health.storageUsageBytes).toBe(13_892_859);
+    expect(tv.health.recovery.count).toBe(1);
+    expect(tv.health.selfCheck.status).toBe('ok');
+    expect(tv.deviceInfo).toMatchObject({
+      playerVersion: '3.0.0-7',
+      runtimeVersion: '2.2.2',
+      storageBackend: 'indexeddb',
+      phase: 'playing',
+    });
+    expect(tv.deviceInfo).not.toHaveProperty('telemetry');
   });
 
   it('reports a screen that has never connected without inventing a heartbeat', () => {
