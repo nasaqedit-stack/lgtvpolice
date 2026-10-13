@@ -184,7 +184,9 @@
       lastSyncAttemptAt: 0,
       lastSyncError: '',
       lastErrorCode: '',
-      lastErrorStage: ''
+      lastErrorStage: '',
+      // Set when a synchronization succeeded but had to leave assets out (see `skipped`).
+      degradedReason: ''
     };
     var nodes = {};
     var storage = null;
@@ -1195,6 +1197,11 @@
         state.lastSyncError = '';
         state.lastErrorCode = '';
         state.lastErrorStage = '';
+        // A degraded synchronization still plays: some assets could not be stored or prepared and
+        // were left out of the playlist. The screen keeps working, and the heartbeat carries the
+        // warning so the operator sees it instead of a screen that looks fine but is not.
+        state.degradedReason = Number(result.skipped) > 0 ? 'skipped_assets:' + Number(result.skipped) : '';
+        if (state.degradedReason) record('sync_degraded', { skipped: Number(result.skipped) });
         state.latestManifest = result.manifest || state.latestManifest;
         if (result.lastSyncAt) state.lastSyncAt = result.lastSyncAt;
         record('sync_ok', { changed: Boolean(result.changed), candidate: Boolean(result.candidate) });
@@ -1494,7 +1501,11 @@
         currentPlaylistVersion: playlistVersion,
         currentItemId: item && item.id ? item.id : null,
         syncStatus: syncLock ? 'syncing' : (state.error ? 'failed' : 'ready'),
-        syncError: state.error ? String((state.lastErrorStage ? state.lastErrorStage + ':' : '') + (state.lastErrorCode || 'sync_failed')).slice(0, 80) : null,
+        // `syncError` carries a warning too: a playlist that plays with assets left out is not a
+        // failure (playback continues) but it is also not healthy, and the operator must see it.
+        syncError: state.error
+          ? String((state.lastErrorStage ? state.lastErrorStage + ':' : '') + (state.lastErrorCode || 'sync_failed')).slice(0, 80)
+          : (state.degradedReason ? String('degraded:' + state.degradedReason).slice(0, 80) : null),
         cachedMediaCount: state.cachedCount,
         storageUsageBytes: isFiniteNumber(state.stats.usage) ? state.stats.usage : null,
         storageQuotaBytes: isFiniteNumber(state.stats.quota) ? state.stats.quota : null,
